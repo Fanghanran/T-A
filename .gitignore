@@ -1,0 +1,29 @@
+# 依赖
+node_modules
+.pnp
+.pnp.js
+
+# 构建产物
+dist
+dist-ssr
+*.local
+
+# 编辑器/系统
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.user
+*.log
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 知识库持久化（JSON / 原始文档）
+server/data/
+data/knowledge/
+*.json.tmp
+*.json.corrupt.*

@@ -1,0 +1,30 @@
+{
+  "name": "interview-agent-rag-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Interview-Agent 知识库 RAG 示例后端：上传→切片→embedding→向量检索→流式调 LLM",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env index.js",
+    "dev": "node --env-file-if-exists=.env --watch index.js",
+    "test": "node --test test/**/*.test.mjs",
+    "check:layers": "node scripts/check-layers.mjs"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^1.0.0",
+    "@zilliz/milvus2-sdk-node": "^3.0.5",
+    "ai": "^3.4.0",
+    "better-sqlite3": "12.10.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.19.2",
+    "iconv-lite": "^0.7.3",
+    "jschardet": "^3.1.4",
+    "mammoth": "^1.12.2",
+    "multer": "^2.0.1",
+    "pdfjs-dist": "^6.3.289",
+    "pino": "^10.3.1",
+    "pino-http": "^11.0.0",
+    "turndown": "^7.2.0"
+  }
+}

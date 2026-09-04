@@ -1,0 +1,171 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* shadcn/ui CSS 变量主题方案 —— 浅色 / 深色双模式
+ * 简约专业调性：slate 中性色阶 + 单一靛蓝（indigo）强调色，柔和圆角与描边。 */
+@layer base {
+  :root {
+    /* 冷灰中性底色（slate），比纯黑纯白更柔和 */
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    /* 单一强调色：靛蓝 */
+    --primary: 243 75% 59%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 210 40% 94%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 226 100% 97%;
+    --accent-foreground: 243 75% 45%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 243 75% 59%;
+    --radius: 0.75rem;
+    /* 柔和阴影 token */
+    --shadow-sm: 0 1px 2px 0 rgb(15 23 42 / 0.04);
+    --shadow-md: 0 4px 16px -4px rgb(15 23 42 / 0.08);
+  }
+
+  .dark {
+    --background: 222 47% 9%;
+    --foreground: 210 40% 98%;
+    --card: 222 44% 12%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222 44% 12%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 234 89% 74%;
+    --primary-foreground: 224 65% 15%;
+    --secondary: 217 33% 18%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217 33% 17%;
+    --muted-foreground: 215 20% 65%;
+    --accent: 220 40% 20%;
+    --accent-foreground: 226 100% 88%;
+    --destructive: 0 63% 50%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 33% 22%;
+    --input: 217 33% 22%;
+    --ring: 234 89% 74%;
+    --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.3);
+    --shadow-md: 0 6px 20px -6px rgb(0 0 0 / 0.45);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    /* 简约无衬线字体栈，优先系统字体 */
+    font-family:
+      ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'PingFang SC',
+      'Microsoft YaHei', Roboto, Helvetica, Arial, sans-serif;
+    letter-spacing: -0.011em;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings:
+      'rlig' 1,
+      'calt' 1;
+  }
+}
+
+@layer utilities {
+  /* 统一的柔和阴影 */
+  .shadow-soft {
+    box-shadow: var(--shadow-sm);
+  }
+  .shadow-soft-md {
+    box-shadow: var(--shadow-md);
+  }
+}
+
+/* 自定义滚动条，符合极简专业调性 */
+@layer utilities {
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    @apply bg-muted-foreground/25 rounded-full;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    @apply bg-muted-foreground/40;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/* Markdown 排版（消息气泡内） */
+@layer components {
+  .prose-chat {
+    @apply text-sm leading-relaxed;
+  }
+  .prose-chat p {
+    @apply my-1.5 first:mt-0 last:mb-0;
+  }
+  .prose-chat ul,
+  .prose-chat ol {
+    @apply my-1.5 pl-5;
+  }
+  .prose-chat ul {
+    @apply list-disc;
+  }
+  .prose-chat ol {
+    @apply list-decimal;
+  }
+  .prose-chat li {
+    @apply my-0.5;
+  }
+  .prose-chat a {
+    @apply font-medium text-primary underline underline-offset-2;
+  }
+  .prose-chat h1,
+  .prose-chat h2,
+  .prose-chat h3,
+  .prose-chat h4 {
+    @apply font-semibold mt-3 mb-1;
+  }
+  .prose-chat h1 {
+    @apply text-base;
+  }
+  .prose-chat h2 {
+    @apply text-[15px];
+  }
+  .prose-chat h3 {
+    @apply text-sm;
+  }
+  .prose-chat blockquote {
+    @apply my-2 border-l-2 border-primary/40 pl-3 italic text-muted-foreground;
+  }
+  .prose-chat code {
+    @apply rounded bg-foreground/10 px-1 py-0.5 text-[12px] font-mono;
+  }
+  .prose-chat pre {
+    @apply my-2 overflow-auto rounded-md bg-foreground/5 p-3 scrollbar-thin;
+  }
+  .prose-chat pre code {
+    @apply bg-transparent p-0 text-[12px];
+  }
+  .prose-chat table {
+    @apply my-2 w-full border-collapse text-[12px];
+  }
+  .prose-chat th,
+  .prose-chat td {
+    @apply border border-border px-2 py-1 text-left;
+  }
+  .prose-chat th {
+    @apply bg-muted font-semibold;
+  }
+  .prose-chat hr {
+    @apply my-3 border-border;
+  }
+}

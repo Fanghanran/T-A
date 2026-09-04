@@ -1,0 +1,81 @@
+# Local Milvus standalone dependencies. Values may be overridden from the
+# project-root .env or the shell; defaults keep a fresh checkout runnable.
+services:
+  etcd:
+    image: quay.io/coreos/etcd:${ETCD_VERSION:-v3.5.18}
+    container_name: milvus-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: '1000'
+      ETCD_QUOTA_BACKEND_BYTES: '4294967296'
+      ETCD_SNAPSHOT_COUNT: '50000'
+    volumes:
+      - etcd_data:/etcd
+    command: >-
+      etcd --advertise-client-urls=http://etcd:${MILVUS_ETCD_PORT:-2379}
+      --listen-client-urls=http://0.0.0.0:${MILVUS_ETCD_PORT:-2379}
+      --data-dir=/etcd
+    ports:
+      - '${MILVUS_ETCD_PORT:-2379}:${MILVUS_ETCD_PORT:-2379}'
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'etcdctl', '--endpoints=http://127.0.0.1:2379', 'endpoint', 'health']
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  minio:
+    image: minio/minio:${MINIO_VERSION:-RELEASE.2024-06-13T22-53-53Z}
+    container_name: milvus-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-milvusadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-local-only}
+    ports:
+      - '${MINIO_API_PORT:-9000}:9000'
+      - '${MINIO_CONSOLE_PORT:-9001}:9001'
+    volumes:
+      - minio_data:/minio_data
+    command: minio server /minio_data --console-address ':9001'
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://127.0.0.1:9000/minio/health/live']
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  standalone:
+    image: milvusdb/milvus:${MILVUS_VERSION:-v2.5.10}
+    container_name: milvus-standalone
+    command: ['milvus', 'run', 'standalone']
+    environment:
+      ETCD_ENDPOINTS: etcd:${MILVUS_ETCD_PORT:-2379}
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-milvusadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change-me-local-only}
+    ports:
+      - '${MILVUS_GRPC_PORT:-19530}:19530'
+      - '${MILVUS_HTTP_PORT:-9091}:9091'
+    volumes:
+      - milvus_data:/var/lib/milvus
+    # 被 OOM/重启杀后自动拉起，配合后端「写完即 flush」把「文档在、切片丢」的概率降到最低。
+    # 注意：若反复出现退出码 137(OOM)，根因通常是 Docker Desktop 分配内存不足——请在
+    # Docker Desktop → Settings → Resources 调高 Memory（建议 ≥ 8GB），而不是在此设更小的 mem_limit。
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://127.0.0.1:9091/healthz']
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+volumes:
+  etcd_data:
+    driver: local
+  minio_data:
+    driver: local
+  milvus_data:
+    driver: local

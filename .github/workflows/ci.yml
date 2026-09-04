@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+
+      # 前端：依赖 + 质量门禁（build + vitest + eslint + prettier + server 测试/分层）
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Install server deps
+        run: npm ci --prefix server
+
+      - name: check:all (build + test + lint + format + server)
+        run: npm run check:all
