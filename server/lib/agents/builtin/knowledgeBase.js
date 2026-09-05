@@ -19,7 +19,7 @@ export const knowledgeBaseAgent = {
   aliases: ['知识库'],
 
   async handler(ctx) {
-    const { query, history, res, sessionId, onAssistantDone, pipeStream, dbg } = ctx
+    const { query, history, res, sessionId, onAssistantDone, pipeStream, dbg, agentId, memoryBlock } = ctx
 
     dbg(`[RAG] 触发知识库检索 | 问题: ${query.slice(0, 50)}...`)
     const t0 = performance.now()
@@ -48,7 +48,7 @@ export const knowledgeBaseAgent = {
     })
     return pipeStream(
       res,
-      await streamRagAnswer({ query, chunks, searchMs, history }),
+      await streamRagAnswer({ query, chunks, searchMs, history, agentId, memoryBlock }),
       { sessionId, onAssistantText: onAssistantDone },
     )
   },

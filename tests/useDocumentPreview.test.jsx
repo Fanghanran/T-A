@@ -55,7 +55,12 @@ describe('useDocumentPreview', () => {
       if (docId === 'slowDoc') {
         return new Promise((resolve) => {
           resolveSlow = () =>
-            resolve({ items: [{ id: 'stale-chunk' }], total: 1, page: 1, pageSize: 20 })
+            resolve({
+              items: [{ id: 'stale-chunk' }],
+              total: 1,
+              page: 1,
+              pageSize: 20,
+            })
         })
       }
       return Promise.resolve({

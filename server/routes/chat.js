@@ -33,6 +33,7 @@ import { defaultChatAgent } from '../lib/agents/builtin/defaultChat.js'
 import { resumeAnalysisAgent } from '../lib/agents/builtin/resumeAnalysis.js'
 import { mockInterviewAgent } from '../lib/agents/builtin/mockInterview.js'
 import { validateChatBody, rateLimiters } from '../lib/security.js'
+import { recallBlock, onTurnEnd } from '../lib/memoryService.js'
 
 /**
  * routes/chat —— 通用对话入口（前端 useChat 调用）
@@ -173,10 +174,17 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
       }
       try {
         sessionStore.appendMessage(sid, writeObj)
+        // M2 会话记忆：回答成功落库后触发轮末处理（滚动摘要 + 事实提炼）。
+        // 异步执行不阻塞响应；同一会话进行中自动去重；失败只 warn，游标不前进下轮重试。
+        onTurnEnd({ sessionId: sid, agentName: safeAgentName })
       } catch (err) {
         log.error({ msg: err.message, stack: err.stack }, `[Chat] 会话 ${sid} 追加 assistant 消息失败`)
       }
     }
+
+    // M2 会话记忆：dispatch 前召回（滚动摘要 + 长期事实）→ 注入 ctx.memoryBlock。
+    // 召回异常已被 recallBlock 吞为 warn + 空串，记忆缺失不阻断对话主链路。
+    const memoryBlock = await recallBlock({ sessionId: sid, agentName: safeAgentName, query })
 
     // ---------- 通过 agentRegistry 分发 ----------
     const agentDef = agentRegistry.resolveAgent(safeAgentName)
@@ -184,7 +192,7 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
       log.warn(`[Chat] 未找到智能体 "${safeAgentName}"，使用默认对话`)
       return pipeStream(
         res,
-        await streamChat({ query, techStack: techStackArr, history }),
+        await streamChat({ query, techStack: techStackArr, history, memoryBlock }),
         { sessionId: sid, onAssistantText: onAssistantDone },
       )
     }
@@ -192,6 +200,7 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
     // 构造共享 ctx，供 agent handler 消费
     const ctx = {
       query, history, techStack: techStackArr, sessionId: sid, onAssistantDone,
+      agentId: agentDef.id, memoryBlock,
       req, res, pipeStream, dbg,
       // L5+ 依赖（仅 doc-processor 需要，按需传入不影响其他 agent）
       workflowRegistry: undefined, runDocAgent: undefined, runDocPlanAgent: undefined,

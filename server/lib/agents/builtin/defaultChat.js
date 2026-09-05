@@ -14,12 +14,12 @@ export const defaultChatAgent = {
   aliases: [],
 
   async handler(ctx) {
-    const { query, history, techStack, res, sessionId, onAssistantDone, pipeStream, dbg } = ctx
+    const { query, history, techStack, res, sessionId, onAssistantDone, pipeStream, dbg, agentId, memoryBlock } = ctx
 
     dbg(`[Chat] 通用对话`)
     return pipeStream(
       res,
-      await streamChat({ query, techStack, history }),
+      await streamChat({ query, techStack, history, agentId, memoryBlock }),
       { sessionId, onAssistantText: onAssistantDone },
     )
   },

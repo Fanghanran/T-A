@@ -2,8 +2,18 @@
 
 ## 状态
 
-**已接受设计 · 暂缓实施（Proposed — 未开工）**（2026-09-03）
+**已实施（Accepted & Implemented）**（2026-09-05，里程碑 M2 交付）
 落地路线见 `docs/ROADMAP.md` §3.2 / §4（里程碑 M2，**依赖 ADR-006 模型管理**）。
+
+实施记录（与设计稿的差异以本节为准）：
+- 短期层表名 `session_memory`（`summary` / `summary_until_seq` / `extract_until_seq` / `updated_at`），摘要与提炼两游标同表管理；会话删除时级联清理（该表无外键，`deleteSession` 显式删行）。
+- 长期层 `kb_memory` 字段 `mem_id(PK)/scope/session_id/agent_name/kind/text(8192)/content_hash/ts/text_vector`，随知识库 init 同维度创建；换 embedding 模型同样需重建（init `verifyDim` 强校验，Fail-Fast）。
+- 去重：`sha256(scope|text)` content_hash 强一致查重（设计稿中的「相似度 ≥0.95 跳过」未实现，相近措辞变体允许重复入库，语义级合并留待后续）；写入后 flush（同 ADR-004 写耐久策略）。
+- 模型路由：摘要/提炼走 `chat.general` 角色 + 按智能体绑定的三级路由（ADR-006）；设计稿的 `memory.extract`/`memory.summarize` 独立角色暂未拆分，需要时可加。
+- 全部参数入 `tunables.memory` 组（管理页在线热改，见设计稿配置节）。
+- 失败语义按 ADR-009「无增强有效实现」：召回失败 warn 后本轮不带记忆继续；提炼失败游标不前进、下轮自动重试（content_hash 保证幂等）；embedding 不可用时不推进提炼游标、恢复后自动补跑积压。
+- 管理端点：`GET /api/management/memory/stats`（总数/按 scope/最近 50 条）、`POST /api/management/memory/clear`（scope=all/global/session，审计 `memory.clear`）。
+- 端到端实测（2026-09-05，qwen2.5-coder:14b + bge-m3）：两轮对话后摘要滚动 + 事实入库（跨会话 hash 去重生效，日志见「跳过重复 N 条」）；新会话提问「你还记得我是谁吗」回答命中全部注入事实。
 
 ## 背景
 

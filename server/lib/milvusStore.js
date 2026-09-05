@@ -6,6 +6,7 @@ const log = childLogger('milvusStore')
 const ADDRESS = process.env.MILVUS_ADDRESS || 'localhost:19530'
 const DOC_COL = process.env.MILVUS_DOC_COLLECTION || 'kb_documents'
 const CHUNK_COL = process.env.MILVUS_CHUNK_COLLECTION || 'kb_chunks'
+const MEM_COL = process.env.MILVUS_MEMORY_COLLECTION || 'kb_memory'
 const METRIC = 'COSINE'
 
 // VarChar 长度上限（Milvus 硬限制 65535）
@@ -31,7 +32,7 @@ export function getDim() {
   return dim
 }
 export function getCollections() {
-  return { doc: DOC_COL, chunk: CHUNK_COL }
+  return { doc: DOC_COL, chunk: CHUNK_COL, memory: MEM_COL }
 }
 
 function getClient() {
@@ -99,6 +100,21 @@ function chunkFields(d) {
   ]
 }
 
+/** 记忆集合字段（ADR-007：跨会话事实记忆；scope=global 跨会话共享，session 会话内） */
+function memoryFields(d) {
+  return [
+    { name: 'mem_id', data_type: DataType.VarChar, max_length: LEN.id, is_primary_key: true },
+    { name: 'scope', data_type: DataType.VarChar, max_length: LEN.short },
+    { name: 'session_id', data_type: DataType.VarChar, max_length: LEN.id },
+    { name: 'agent_name', data_type: DataType.VarChar, max_length: LEN.short },
+    { name: 'kind', data_type: DataType.VarChar, max_length: LEN.short },
+    { name: 'text', data_type: DataType.VarChar, max_length: LEN.ctx },
+    { name: 'content_hash', data_type: DataType.VarChar, max_length: LEN.id },
+    { name: 'ts', data_type: DataType.Int64 },
+    { name: 'text_vector', data_type: DataType.FloatVector, dim: d },
+  ]
+}
+
 async function ensureCollection(name, fields, vectorFields, scalarIndexes) {
   const c = getClient()
   const { collection_names = [] } = await c.listCollections()
@@ -156,6 +172,7 @@ export async function init(embedFn) {
     await c.checkHealth()
     const { collection_names = [] } = await c.listCollections()
     if (collection_names.includes(CHUNK_COL)) await verifyDim(CHUNK_COL)
+    if (collection_names.includes(MEM_COL)) await verifyDim(MEM_COL)
 
     await ensureCollection(DOC_COL, docFields(dim), ['title_vector'], ['doc_id', 'category', 'status'])
     await ensureCollection(
@@ -164,8 +181,15 @@ export async function init(embedFn) {
       ['text_vector', 'question_vector'],
       ['chunk_id', 'doc_id', 'category', 'status'],
     )
+    // 记忆集合（ADR-007）：随知识库同维度初始化，换 embedding 模型同样需要重建
+    await ensureCollection(
+      MEM_COL,
+      memoryFields(dim),
+      ['text_vector'],
+      ['mem_id', 'scope', 'session_id', 'content_hash'],
+    )
     ready = true
-    log.info(`[milvus] 就绪 ${ADDRESS} · ${DOC_COL} + ${CHUNK_COL} · dim=${dim}`)
+    log.info(`[milvus] 就绪 ${ADDRESS} · ${DOC_COL} + ${CHUNK_COL} + ${MEM_COL} · dim=${dim}`)
     return { dim }
   })().catch((e) => {
     initPromise = null
@@ -325,7 +349,7 @@ export async function insertChunks(chunks) {
  * 可能随 growing 段一起丢失（WAL 恢复不一定接回），导致「文档在、切片没了」的孤儿。
  * commit 后主动 flush，把「已接受」升级为「已落盘」。
  */
-export async function flush(collections = [DOC_COL, CHUNK_COL]) {
+export async function flush(collections = [DOC_COL, CHUNK_COL, MEM_COL]) {
   await getClient().flush({ collection_names: collections })
 }
 
@@ -572,4 +596,113 @@ export async function dropAll() {
   ready = false
   initPromise = null
   log.warn(`[milvus] 已删除集合 ${DOC_COL} / ${CHUNK_COL}`)
+}
+
+// ============ 会话记忆（ADR-007：长期层事实记忆） ============
+
+/** 记忆对象转 Milvus 行 */
+function memToRow(m) {
+  return {
+    mem_id: m.id,
+    scope: m.scope ?? 'global',
+    session_id: m.sessionId ?? '',
+    agent_name: (m.agentName ?? '').slice(0, LEN.short - 1),
+    kind: m.kind ?? 'fact',
+    text: (m.text ?? '').slice(0, LEN.ctx - 1),
+    content_hash: m.contentHash ?? '',
+    ts: m.ts ?? Date.now(),
+    text_vector: m.vector,
+  }
+}
+
+/**
+ * 写入记忆事实（batch 64）。调用方负责先做 content_hash 去重与向量化。
+ * 写完应由调用方 flush([MEM_COL])，与切片写耐久（ADR-004）同一策略。
+ */
+export async function insertMemories(items) {
+  if (!items?.length) return
+  const BATCH = 64
+  for (let i = 0; i < items.length; i += BATCH) {
+    await getClient().insert({
+      collection_name: MEM_COL,
+      data: items.slice(i, i + BATCH).map(memToRow),
+    })
+  }
+}
+
+/**
+ * 语义检索记忆：召回「跨会话全局事实」+「本会话事实」。
+ * @param {number[]} vector 查询向量
+ * @param {{topK?: number, sessionId?: string}} opts
+ */
+export async function searchMemories(vector, { topK = 4, sessionId } = {}) {
+  const c = getClient()
+  const filter = sessionId
+    ? `(scope == "global" || session_id == "${esc(sessionId)}")`
+    : 'scope == "global"'
+  const r = await c.search({
+    collection_name: MEM_COL,
+    data: [vector],
+    anns_field: 'text_vector',
+    limit: Math.max(1, topK),
+    // Strong：刚提炼写入的记忆立刻可召回
+    consistency_level: 'Strong',
+    filter,
+    output_fields: ['mem_id', 'scope', 'session_id', 'agent_name', 'kind', 'text', 'ts'],
+  })
+  const out = []
+  for (const hit of r?.results ?? []) {
+    out.push({
+      id: hit.mem_id,
+      scope: hit.scope ?? 'global',
+      sessionId: hit.session_id ?? '',
+      agentName: hit.agent_name ?? '',
+      kind: hit.kind ?? 'fact',
+      text: hit.text ?? '',
+      score: Math.max(0, Math.min(1, Number(hit.score ?? 0))),
+      ts: Number(hit.ts ?? 0),
+    })
+  }
+  return out
+}
+
+/**
+ * 强一致统计记忆条数。
+ * @param {string} [filter] 附加过滤表达式（如 scope == "global"），缺省统计全部
+ */
+export async function countMemories(filter) {
+  const r = await getClient().query({
+    collection_name: MEM_COL,
+    filter: filter ? `mem_id != "" && (${filter})` : 'mem_id != ""',
+    output_fields: ['mem_id'],
+    limit: 16384,
+    consistency_level: 'Strong',
+  })
+  return (r?.data ?? []).length
+}
+
+/** 按过滤表达式删除记忆（管理页清空用） */
+export async function deleteMemoriesByFilter(filter) {
+  await getClient().delete({ collection_name: MEM_COL, filter })
+}
+
+/** 列出记忆（管理页展示 / 按 content_hash 查重用，强一致） */
+export async function listMemories({ limit = 200, filter } = {}) {
+  const r = await getClient().query({
+    collection_name: MEM_COL,
+    filter: filter || 'mem_id != ""',
+    output_fields: ['mem_id', 'scope', 'session_id', 'agent_name', 'kind', 'text', 'content_hash', 'ts'],
+    limit: Math.min(16384, Math.max(1, limit)),
+    consistency_level: 'Strong',
+  })
+  return (r?.data ?? []).map((row) => ({
+    id: row.mem_id,
+    scope: row.scope ?? 'global',
+    sessionId: row.session_id ?? '',
+    agentName: row.agent_name ?? '',
+    kind: row.kind ?? 'fact',
+    text: row.text ?? '',
+    contentHash: row.content_hash ?? '',
+    ts: Number(row.ts ?? 0),
+  }))
 }

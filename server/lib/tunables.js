@@ -72,6 +72,20 @@ const GROUPS = [
       historyTurns: 3,
     },
   },
+  {
+    key: 'memory',
+    label: '会话记忆',
+    description: '两层记忆参数：短期滚动摘要 + 长期事实提炼（memoryService.js / ADR-007）',
+    defaults: {
+      enabled: true,
+      summaryEveryTurns: 6,
+      extractEveryTurns: 4,
+      recallTopK: 4,
+      summaryBudgetChars: 600,
+      factBudgetChars: 800,
+      maxFactsPerExtract: 5,
+    },
+  },
 ]
 
 /** 每个参数的元数据（label / range / 说明），key 扁平化为 "group.key" */
@@ -95,6 +109,12 @@ const META = {
   'rewrite.rewriteEnabled': { label: '启用改写', type: 'bool', description: '总开关，关闭后走纯原始 query 检索' },
   'rewrite.queriesPerRequest': { label: '生成查询数', type: 'int', min: 1, max: 8, description: '每次检索生成几个查询（含主查询）' },
   'rewrite.historyTurns': { label: '历史轮数', type: 'int', min: 1, max: 10, description: '改写参考的对话历史窗口轮数' },
+  'memory.enabled': { label: '启用记忆', type: 'bool', description: '总开关：关闭后不召回、不摘要、不提炼' },
+  'memory.summaryEveryTurns': { label: '摘要触发轮数', type: 'int', min: 1, max: 30, description: '新增用户消息达到此轮数后滚动一次会话摘要' },
+  'memory.extractEveryTurns': { label: '提炼触发轮数', type: 'int', min: 1, max: 30, description: '新增用户消息达到此轮数后提炼一次长期事实' },
+  'memory.recallTopK': { label: '召回条数', type: 'int', min: 1, max: 10, description: '每轮检索召回的长期事实条数上限' },
+  'memory.summaryBudgetChars': { label: '摘要字数上限', type: 'int', min: 100, max: 2000, description: '滚动摘要的最大字符数' },
+  'memory.factBudgetChars': { label: '事实字数上限', type: 'int', min: 100, max: 2000, description: '单条长期事实注入 prompt 的最大字符数' },
 }
 
 // ---------- 活对象（导出给消费方，调用时读属性 → 原地改值热生效） ----------

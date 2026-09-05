@@ -16,7 +16,7 @@ export const interviewRetrievalAgent = {
   aliases: ['面试题检索'],
 
   async handler(ctx) {
-    const { query, history, techStack, res, sessionId, onAssistantDone, pipeStream, dbg } = ctx
+    const { query, history, techStack, res, sessionId, onAssistantDone, pipeStream, dbg, agentId, memoryBlock } = ctx
     const LIMIT = 5
 
     dbg(`[面试检索] 触发统一检索 | query: ${query.slice(0, 50)}... | techStack: ${JSON.stringify(techStack)}`)
@@ -54,6 +54,8 @@ export const interviewRetrievalAgent = {
         ragChunks,
         ragSearchMs,
         history,
+        agentId,
+        memoryBlock,
       }),
       { sessionId, onAssistantText: onAssistantDone },
     )

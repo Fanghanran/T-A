@@ -45,7 +45,7 @@ const LAYERS = {
   // L3 LLM
   'lib/llm.js': 3,
   // L4 领域
-  'lib/docProcessor.js': 4, 'lib/unifiedSearch.js': 4, 'lib/chunkAudit.js': 4,
+  'lib/docProcessor.js': 4, 'lib/unifiedSearch.js': 4, 'lib/chunkAudit.js': 4, 'lib/memoryService.js': 4,
   'lib/agents/builtin/knowledgeBase.js': 4, 'lib/agents/builtin/interviewRetrieval.js': 4, 'lib/agents/builtin/defaultChat.js': 4,
   'lib/agents/builtin/resumeAnalysis.js': 4, 'lib/agents/builtin/mockInterview.js': 4,
   // L5 注册表

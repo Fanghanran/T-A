@@ -16,7 +16,7 @@ export const mockInterviewAgent = {
   aliases: ['模拟面试'],
 
   async handler(ctx) {
-    const { query, techStack, history, req, res, sessionId, onAssistantDone, pipeStream, dbg } = ctx
+    const { query, techStack, history, req, res, sessionId, onAssistantDone, pipeStream, dbg, agentId, memoryBlock } = ctx
     const finish = req.body?.interviewFinish === true
 
     let results = []
@@ -32,7 +32,7 @@ export const mockInterviewAgent = {
     dbg(`[mock-interview] finish=${finish} | techStack=${JSON.stringify(techStack)} | 参考题=${results.length}`)
     return pipeStream(
       res,
-      await streamMockInterview({ query, techStack, history, results, finish }),
+      await streamMockInterview({ query, techStack, history, results, finish, agentId, memoryBlock }),
       { sessionId, onAssistantText: onAssistantDone },
     )
   },

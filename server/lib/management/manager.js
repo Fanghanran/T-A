@@ -223,4 +223,68 @@ router.post('/models/test', async (req, res) => {
   }
 })
 
+/* ---------- 会话记忆管理（M2 / ADR-007：长期层事实库） ---------- */
+import {
+  isReady as milvusReady,
+  getCollections,
+  countMemories,
+  listMemories,
+  deleteMemoriesByFilter,
+  flush,
+} from '../milvusStore.js'
+
+/** 记忆统计：GET /api/management/memory/stats（总数 + 按 scope + 最近条目） */
+router.get('/memory/stats', async (_req, res) => {
+  if (!milvusReady()) {
+    return res.status(503).json({ error: 'Milvus 未就绪，记忆统计不可用' })
+  }
+  try {
+    const [total, global, session] = await Promise.all([
+      countMemories(),
+      countMemories('scope == "global"'),
+      countMemories('scope == "session"'),
+    ])
+    const recent = await listMemories({ limit: 50 })
+    recent.sort((a, b) => b.ts - a.ts)
+    res.json({ collection: getCollections().memory, total, global, session, recent })
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/**
+ * 清空记忆：POST /api/management/memory/clear
+ * Body: { scope?: 'all'|'global'|'session', sessionId? }
+ * scope=session 时 sessionId 必填（只清该会话的私有事实）
+ */
+router.post('/memory/clear', async (req, res) => {
+  if (!milvusReady()) {
+    return res.status(503).json({ error: 'Milvus 未就绪，记忆清理不可用' })
+  }
+  const scope = req.body?.scope ?? 'all'
+  const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : ''
+  if (!['all', 'global', 'session'].includes(scope)) {
+    return res.status(400).json({ error: `非法 scope：${scope}（允许 all / global / session）` })
+  }
+  if (scope === 'session') {
+    if (!sessionId) return res.status(400).json({ error: 'scope=session 时 sessionId 必填' })
+    // 会话 id 由服务端生成（字母数字下划线连字符），白名单校验后拼 filter，杜绝表达式注入
+    if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
+      return res.status(400).json({ error: 'sessionId 含非法字符' })
+    }
+  }
+  try {
+    const filter =
+      scope === 'global' ? 'scope == "global"'
+      : scope === 'session' ? `session_id == "${sessionId}"`
+      : 'mem_id != ""'
+    await deleteMemoriesByFilter(filter)
+    await flush([getCollections().memory])
+    appendAudit('memory.clear', { scope, sessionId: scope === 'session' ? sessionId : undefined })
+    res.json({ ok: true, scope })
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
 export default router

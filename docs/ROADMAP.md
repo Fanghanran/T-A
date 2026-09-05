@@ -55,12 +55,13 @@
 **要点**：新 `lib/models.js`(L0) `resolveProfile({agentId,role,kind,overrideId})` + keyed provider 缓存 + `resetProfileCache`；`ROLES` 常量映射 11 个调用点；密钥 `apiKeyRef` 优先 + 读取脱敏；熔断/降级**按 profile 独立**（坏模型只影响其角色）；管理端点挂 `/api/management/*`；前端 `ModelsSection` 仿 `TunablesSection`。
 **硬约束**：换 embedding 模型/维度 = **破坏性重建向量集合**（兄弟集合 → 重 embed → 校验计数 → 原子翻转 → 保留旧集合回滚，先 dry-run）。
 
-### 3.2 会话记忆 → 已落盘 [`adr/007-conversation-memory.md`](./adr/007-conversation-memory.md)
-**现状**：仅固定窗口（最近 6 轮 / 6000 字，`getContextWindow`），长对话遗忘、新会话不记人。
+### 3.2 会话记忆 → 已实施（M2 交付，2026-09-05） [`adr/007-conversation-memory.md`](./adr/007-conversation-memory.md)
+**原现状**：仅固定窗口（最近 6 轮 / 6000 字，`getContextWindow`），长对话遗忘、新会话不记人。
 **已确认决策**：两层、分阶段；写入用 **LLM 提炼事实 + 向量化**。
-- 短期层（会话内）：**滚动摘要**（`session_summary` 表，每 N 轮压缩被截轮次，注入 prompt）。
-- 长期层（跨会话）：**事实记忆库**（新 Milvus `kb_memory`，scope='session'|'global'，内容哈希+相似度去重，每轮检索 topK 注入）。
-- 全链路异步、绝不阻塞对话；降级矩阵（无 LLM 跳过提炼、embed=hash 跳过向量、异常 log.warn）；`tunables` 新增 `memory` 组热更新；管理端 stats/clear。
+- 短期层（会话内）：**滚动摘要**（`session_memory` 表，摘要/提炼双游标，每 N 轮压缩被截轮次，注入 prompt）。
+- 长期层（跨会话）：**事实记忆库**（Milvus `kb_memory`，scope='session'|'global'，`content_hash` 强一致去重，每轮检索 topK 注入）。
+- 全链路异步、绝不阻塞对话；失败语义按 ADR-009（召回失败 warn 继续、提炼失败游标不前进下轮重试）；`tunables.memory` 组热更新；管理端 `memory/stats` + `memory/clear`。
+- 实现与设计差异（如相似度去重未做、独立 memory 角色未拆）见 ADR-007 状态节「实施记录」。
 **依赖**：摘要/提炼要调 LLM → 依赖 M1 的模型选择能力（给提炼/摘要配「快/便宜」模型）。
 
 ### 3.3 多智能体并行 / 多用户 → 已落盘 [`adr/008-multi-agent-parallel-and-multiuser.md`](./adr/008-multi-agent-parallel-and-multiuser.md)
@@ -87,8 +88,8 @@ M0 工程地基 ─→ M0.5 落盘 ADR(006/007/008)
 |---|---|---|---|
 | **M0 工程地基** | `git init` + 首次提交（恢复 CI/回滚）；校准 ARCHITECTURE 与 docs Vectra 漂移；归档 `_e2e_*` 临时脚本；可补 `docs/adr/` 记录 vectra→Milvus 迁移 | 低 | — |
 | **M0.5 ADR 落盘** | ✅ 已完成：006/007/008 三份 ADR 已写入 `docs/adr/`，并接入 `ARCHITECTURE.md` 索引（本文 §3 互链） | 低（纯文档） | M0 |
-| **M1 模型管理** | `models.js`(L0) + keyed 缓存 + 11 调用点走 `getChatModel({role,agentId})` + 管理 CRUD + 前端 `ModelsSection`；env 种子零迁移 | 中 | M0.5 |
-| **M2 会话记忆** | `session_summary` 滚动摘要 + `kb_memory` 事实库（embed 走 M1 profile 选择）+ 降级 + 管理端点 | 中 | **M1** |
+| **M1 模型管理** | ✅ 已完成（2026-09-04）：`models.js`(L0) + keyed 缓存 + 调用点走 `getChatModel({role,agentId})` + 管理 CRUD + 前端 `ModelsSection`；env 种子零迁移 | 中 | M0.5 |
+| **M2 会话记忆** | ✅ 已完成（2026-09-05）：`memoryService`(L4) + `session_memory` 滚动摘要 + `kb_memory` 事实库（embed 走 M1 profile）+ ADR-009 失败语义 + `memory/stats`·`memory/clear` 端点 | 中 | **M1** |
 | **M3 残留债务** | `useUploadForm` 豁免正式化、~31 unused-vars 清理、Milvus commit-journal 评估(ADR-004 备选)、`GET /documents/:id/status` | 低 | 可与 M1/M2 并行 |
 | **M4 多智能体并行** | 前端 ChatRegistry 多实例 + 每流 abort + 熔断/限流按 profile(+caller) 分片 | 中高 | **M1** |
 | **M5 多用户/多实例** | principal 抽象 + owner_id + Milvus owner 过滤 + 共享限流/缓存失效/uploadJobs 外置/registry 外部化 + `PROTECT_SESSIONS` 默认开 | 高（安全关键，需专测） | M1 + M4；**条件性/暂缓** |
@@ -108,7 +109,7 @@ M0 工程地基 ─→ M0.5 落盘 ADR(006/007/008)
 ## 6. 每里程碑验证方式（开工时执行，本文件登记不执行）
 - 通用：`npm run check:all`（build + 前端测试 + lint + format + 后端测试 + `check-layers`）全绿；关键项补单测。
 - M1：`models` 解析优先级单测 + 本地多模型手测（rewrite 绑快模型、resume 绑强模型，按角色命中不同模型）。
-- M2：30+ 轮会话摘要不丢早期约定（curl 实测）；跨会话个性化 + `orphan`/`memory stats` 可见；全链路 stub 降级不崩。
+- M2：✅ 已实测（2026-09-05）：两轮对话后摘要滚动 + 事实入库（跨会话 hash 去重生效）；新会话「你还记得我是谁吗」命中全部注入事实；`memory/stats`·`memory/clear` 可用；`check:all` 全绿。30+ 轮长会话回归与 stub 降级演练留待日常使用观察。
 - M3：`check:all` 绿 + unused-vars 清零或收敛。
 - M4：并行多流互不打断、坏模型只熔断其角色、无僵尸流吃上游。
 - M5：越权/隔离专测（跨 user 读写 403）、公平调度、审计含 userId。

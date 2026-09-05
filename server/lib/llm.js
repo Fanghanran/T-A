@@ -101,16 +101,21 @@ function buildHistoryContext(history, currentQuery) {
   return `—— 历史对话上下文（最近几轮）——\n${rows.join('\n')}\n—— 以上为历史上下文，请基于其延续对话 ——\n\n`
 }
 
+/** 把会话记忆块拼进 system prompt 前部；无记忆时原样返回 */
+function withMemory(system, memoryBlock) {
+  return memoryBlock ? `${memoryBlock}\n\n${system}` : system
+}
+
 /**
  * 知识库 RAG 流式回答
  *
  * 与 streamInterviewAnswer 对称：先把"检索命中的 chunk 列表 + 耗时"作为 annotation 推到流头部，
  * 前端就能像截图那样画出「👁 显示运行过程」+ Recall slice N 卡片（含文件名 / Heading / Score 徽章 / 片段预览）。
  *
- * @param {{query:string, chunks:Array, searchMs?:number, history?:Array<{role:string,content:string}>}} param0
+ * @param {{query:string, chunks:Array, searchMs?:number, history?:Array<{role:string,content:string}>, agentId?:string, memoryBlock?:string}} param0
  * @returns {ReadableStream<Uint8Array>} AI SDK data-stream
  */
-export async function streamRagAnswer({ query, chunks, searchMs = 0, history, agentId }) {
+export async function streamRagAnswer({ query, chunks, searchMs = 0, history, agentId, memoryBlock }) {
   requireLLM()
   // 给前端 FallbackSlice 卡片准备字段：title(文件名badge) / heading(来源/大纲badge) / score(分数) / snippet(正文预览)
   const resultsForFrontend = chunks.map((c, idx) => ({
@@ -141,13 +146,15 @@ export async function streamRagAnswer({ query, chunks, searchMs = 0, history, ag
 
   const result = await streamText({
     model: getChatModel({ role: 'chat.rag', agentId }),
-    system:
+    system: withMemory(
       `你是面试知识助手。严格基于提供的知识库片段回答用户问题；若片段不足以回答，请如实说明，不要编造。\n\n` +
       `显示规则（UI 层已单独处理，请严格遵守以免重复）：\n` +
       `- 如果检索到知识库内容，请在回答开头加上【📚 已检索知识库】标记。\n` +
       `- 如果未检索到相关内容，请明确说明「未检索到相关内容」。` +
       NO_REF_RULE +
       (historyCtx ? `\n\n注意：如果提供了「历史对话上下文」段落，请务必结合前文语境延续对话（例如"它"指代上一轮用户提到的概念），不要当作孤立的单轮问答。` : ''),
+      memoryBlock,
+    ),
     prompt: `${historyCtx}知识库片段：\n${context}\n\n用户问题：${query}`,
   })
   return prependAnnotation(result.toDataStream(), annotation)
@@ -155,16 +162,18 @@ export async function streamRagAnswer({ query, chunks, searchMs = 0, history, ag
 
 /**
  * 通用对话流式回答（用于 /api/chat，非知识库智能体）
- * @param {{query:string, techStack?:string[], history?:Array<{role:string,content:string}>}} param0
+ * @param {{query:string, techStack?:string[], history?:Array<{role:string,content:string}>, agentId?:string, memoryBlock?:string}} param0
  */
-export async function streamChat({ query, techStack, history, agentId }) {
+export async function streamChat({ query, techStack, history, agentId, memoryBlock }) {
   requireLLM()
   const historyCtx = buildHistoryContext(history, query)
-  const system = (
-    techStack?.length
+  const system = withMemory(
+    (techStack?.length
       ? `你是一位资深面试官。结合以下技术栈作答：${techStack.join('、')}。`
-      : '你是一位资深面试官，回答清晰专业。'
-  ) + (historyCtx ? ' 如果提供了「历史对话上下文」段落，请结合前文语境延续对话，不要当作孤立单轮。' : '')
+      : '你是一位资深面试官，回答清晰专业。')
+    + (historyCtx ? ' 如果提供了「历史对话上下文」段落，请结合前文语境延续对话，不要当作孤立单轮。' : ''),
+    memoryBlock,
+  )
   const result = await streamText({
     model: getChatModel({ role: 'chat.general', agentId }),
     system,
@@ -245,7 +254,7 @@ export async function streamResumeAnalyze({ resumeText, jd, query, agentId }) {
  * @param {{query:string, techStack?:string[], history?:Array, results?:Array, finish?:boolean}} param0
  * @returns {ReadableStream} data-stream
  */
-export async function streamMockInterview({ query, techStack, history, results, finish, agentId }) {
+export async function streamMockInterview({ query, techStack, history, results, finish, agentId, memoryBlock }) {
   requireLLM()
   const stack = Array.isArray(techStack) && techStack.length
     ? techStack.join('、')
@@ -275,7 +284,7 @@ export async function streamMockInterview({ query, techStack, history, results, 
     )
   }
 
-  // 正常问答轮：AI 面试官逐题提问 + 对上一条回答即时点评
+  // 正常问答轮：AI 面试官逐题提问 + 对上一条回答即时点评（记忆块让面试官了解候选人背景，如目标岗位/技术方向）
   const sampleQs = Array.isArray(results) && results.length
     ? `\n可参考的候选题目（择一提问或据其延展，不要照搬全部）：\n${results.map((r, i) => `${i + 1}. ${r.title}`).join('\n')}`
     : ''
@@ -297,7 +306,11 @@ export async function streamMockInterview({ query, techStack, history, results, 
     `第一题：请讲讲 React 中 key 的作用，如果用数组索引作 key 会有什么问题？\n（考察点：列表 diff 机制与常见坑）\n` +
     `输出为自然语言，不要输出 JSON。` +
     sampleQs
-  const result = await streamText({ model: getChatModel({ role: 'chat.interview.qa', agentId }), system, prompt: `${historyCtx}候选人：${query}` })
+  const result = await streamText({
+    model: getChatModel({ role: 'chat.interview.qa', agentId }),
+    system: withMemory(system, memoryBlock),
+    prompt: `${historyCtx}候选人：${query}`,
+  })
   return result.toDataStream()
 }
 
@@ -325,6 +338,8 @@ export async function streamMockInterview({ query, techStack, history, results, 
  * @param {Array}  [opts.ragChunks=[]]      知识库语义检索命中 chunks（兜底用）
  * @param {number} [opts.ragSearchMs=0]     知识库检索耗时
  * @param {Array}  [opts.history=[]]        历史上下文窗口
+ * @param {string} [opts.agentId]           智能体 id（模型三级路由用）
+ * @param {string} [opts.memoryBlock]       会话记忆块（召回结果为空时不传）
  */
 export async function streamInterviewAnswer({
   query,
@@ -335,6 +350,7 @@ export async function streamInterviewAnswer({
   ragSearchMs = 0,
   history = [],
   agentId,
+  memoryBlock,
 }) {
   const hasInterview = results.length > 0
   const hasRag = ragChunks.length > 0
@@ -439,7 +455,11 @@ export async function streamInterviewAnswer({
     prompt = `${historyCtx}用户问题：${query}`
   }
 
-  const inner = await streamText({ model: getChatModel({ role: 'chat.interview', agentId }), system, prompt })
+  const inner = await streamText({
+    model: getChatModel({ role: 'chat.interview', agentId }),
+    system: withMemory(system, memoryBlock),
+    prompt,
+  })
   return prependAnnotation(inner.toDataStream(), annotations)
 }
 
@@ -544,6 +564,68 @@ export async function generateChunkAnnotations(chunks, { questionsPerChunk = 3, 
     log.warn(`[llm.generateChunkAnnotations] 生成失败（${err.message}），降级 heading/30字 兜底`)
     return results
   }
+}
+
+/* ===================== 会话记忆（M2 / ADR-007） ===================== */
+
+/** 把对话轮压成「角色：内容」的紧凑文本，单条截断防 prompt 膨胀 */
+function memoryDialog(turns, perTurnCap = 500) {
+  return (Array.isArray(turns) ? turns : [])
+    .map((m) => `${m.role === 'assistant' ? '助手' : '用户'}：${String(m.content ?? '').slice(0, perTurnCap)}`)
+    .join('\n')
+}
+
+/**
+ * 短期层：滚动摘要生成。把「已有摘要 + 新增对话」合并为一份连贯摘要（纯文本）。
+ * 失败向上抛（memoryService 记日志、游标不前进、下一轮重试），不做静默兜底。
+ */
+export async function summarizeSession({ prevSummary, turns, budgetChars = 600, role, agentId }) {
+  requireLLM()
+  const system =
+    '你负责维护一段对话的滚动摘要。把「已有摘要」与「新增对话」合并为一份连贯摘要：' +
+    '保留用户的目标、偏好、约束与关键结论，去掉寒暄与重复；只输出摘要正文，禁止任何前缀、解释或列表符号。'
+  const prompt =
+    `已有摘要（可能为空）：\n${prevSummary || '（无）'}\n\n新增对话：\n${memoryDialog(turns)}\n\n` +
+    `请输出合并后的摘要，不超过 ${Math.ceil(budgetChars)} 字。`
+  const { text } = await generateText({ model: getChatModel({ role, agentId }), system, prompt })
+  const out = String(text ?? '').trim()
+  if (!out) {
+    throw new ServiceUnavailableError(
+      '会话摘要生成失败：模型返回空内容，请重试或检查模型。',
+      'LLM_OUTPUT_INVALID',
+    )
+  }
+  return out.slice(0, budgetChars)
+}
+
+/**
+ * 长期层：事实提炼。从对话轮中提炼值得跨会话记住的用户事实，
+ * 输出 [{ text, scope }]；scope=global 跨会话共享，session 仅本会话。
+ * 没有值得记的内容时返回空数组（合法结果，非失败）。
+ */
+export async function extractMemories({ turns, maxFacts = 5, role, agentId }) {
+  requireLLM()
+  const system =
+    '你负责从对话中提炼值得长期记住的用户事实（如身份、目标、偏好、约束、项目背景）。\n' +
+    '**只输出一个 JSON 对象，禁止任何解释文字或 markdown 围栏**，格式严格如下：\n' +
+    '{ "memories": [ { "text": "一句独立可读的事实", "scope": "global或session" } ] }\n' +
+    `规则：每条事实必须自带主语、脱离上下文也能读懂；只记新信息，不记寒暄；最多 ${maxFacts} 条；没有值得记的就输出 { "memories": [] }。\n` +
+    'scope 判定：用户稳定的偏好/画像/长期目标用 global；只与当前话题/会话相关的事实用 session。'
+  const obj = await generateStructuredJSON({
+    system,
+    prompt: `对话内容：\n${memoryDialog(turns, 600) || '（无）'}`,
+    label: '记忆提炼',
+    role,
+    agentId,
+  })
+  const list = Array.isArray(obj?.memories) ? obj.memories : []
+  const out = []
+  for (const it of list) {
+    const t = typeof it?.text === 'string' ? it.text.trim().slice(0, 300) : ''
+    if (!t) continue
+    out.push({ text: t, scope: it?.scope === 'global' ? 'global' : 'session' })
+  }
+  return out.slice(0, maxFacts)
 }
 
 export { llmAvailable }

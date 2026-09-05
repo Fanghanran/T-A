@@ -147,6 +147,13 @@ if (db) {
       key TEXT PRIMARY KEY,
       value TEXT
     );
+    CREATE TABLE IF NOT EXISTS session_memory (
+      session_id TEXT PRIMARY KEY,
+      summary TEXT,
+      summary_until_seq INTEGER,
+      extract_until_seq INTEGER,
+      updated_at TEXT
+    );
     CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
     CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at);
   `)
@@ -358,6 +365,47 @@ export function getSession(id) {
 }
 
 /** 获取会话消息（浅拷贝；annotations 通过 LEFT JOIN 一并取回并 parse） */
+/* ---------- 会话记忆状态（M2：滚动摘要 / 事实提炼游标，ADR-007） ---------- */
+
+const stmtGetMemoryState = prepare('SELECT summary, summary_until_seq, extract_until_seq FROM session_memory WHERE session_id = ?')
+const stmtDeleteMemoryState = prepare('DELETE FROM session_memory WHERE session_id = ?')
+const stmtUpsertMemoryState = prepare(`
+  INSERT INTO session_memory(session_id, summary, summary_until_seq, extract_until_seq, updated_at)
+  VALUES(?, ?, ?, ?, ?)
+  ON CONFLICT(session_id) DO UPDATE SET
+    summary = excluded.summary,
+    summary_until_seq = excluded.summary_until_seq,
+    extract_until_seq = excluded.extract_until_seq,
+    updated_at = excluded.updated_at
+`)
+
+/**
+ * 读取会话记忆游标状态。
+ * @param {string} sessionId
+ * @returns {{summary: string, summaryUntilSeq: number, extractUntilSeq: number}}
+ */
+export function getMemoryState(sessionId) {
+  if (!db) return { summary: '', summaryUntilSeq: 0, extractUntilSeq: 0 }
+  try {
+    const r = stmtGetMemoryState.get(sessionId)
+    return r
+      ? { summary: r.summary || '', summaryUntilSeq: Number(r.summary_until_seq) || 0, extractUntilSeq: Number(r.extract_until_seq) || 0 }
+      : { summary: '', summaryUntilSeq: 0, extractUntilSeq: 0 }
+  } catch (err) {
+    log.warn({ details: err.message }, '[sessionStore] 记忆状态读取失败')
+    return { summary: '', summaryUntilSeq: 0, extractUntilSeq: 0 }
+  }
+}
+
+/**
+ * 写入会话记忆游标状态（只读库会抛 SESSION_DB_READONLY，由调用方决定是否吞掉）。
+ */
+export function setMemoryState(sessionId, { summary, summaryUntilSeq, extractUntilSeq } = {}) {
+  requireWritable()
+  const now = new Date().toISOString()
+  stmtUpsertMemoryState.run(sessionId, summary ?? '', summaryUntilSeq ?? 0, extractUntilSeq ?? 0, now)
+}
+
 export function getMessages(id) {
   const rows = stmtGetMessages.all(id)
   return rows.map((r) => {
@@ -416,13 +464,15 @@ export function renameSession(id, newTitle) {
 }
 
 /**
- * 删除会话（元数据 + 消息 + annotations，外键 CASCADE 自动级联）
+ * 删除会话（元数据 + 消息 + annotations，外键 CASCADE 自动级联；
+ * session_memory 无外键，需显式清理，防止孤儿摘要行累积）
  * @param {string} id
  * @returns {boolean}
  */
 export function deleteSession(id) {
   requireWritable()
   const info = stmtDeleteSession.run(id)
+  if (info.changes > 0) stmtDeleteMemoryState.run(id)
   return info.changes > 0
 }
 
