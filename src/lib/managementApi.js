@@ -117,3 +117,40 @@ export function setTunable(key, value) {
 export function resetTunables() {
   return postJson('/api/management/tunables/reset', {})
 }
+
+/* ---------- 模型管理（ADR-006） ---------- */
+
+/** 模型管理全量视图：{ profiles, routes, roles, agents }（密钥已脱敏） */
+export function fetchModels() {
+  return request('/api/management/models')
+}
+
+/**
+ * 新增/更新模型 profile（id 相同即覆盖）。
+ * @param {{id?:string, kind:'chat'|'embedding', label?:string, baseUrl?:string, apiKeyRef?:string, apiKeyInline?:string, model:string, enabled?:boolean}} profile
+ */
+export function saveModelProfile(profile) {
+  return postJson('/api/management/models', profile)
+}
+
+/** 删除 profile（被路由引用或内置播种的会被 400 拒绝） */
+export function deleteModelProfile(id) {
+  return request(`/api/management/models/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+/**
+ * 更新路由绑定（roles / agents / defaults 三级），热生效。
+ * @param {{roles?:object, agents?:object, defaults?:object}} partial
+ */
+export function updateModelRoutes(partial) {
+  return request('/api/management/models/routes', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(partial ?? {}),
+  })
+}
+
+/** 探活：对指定 profile 发最小请求（chat 回 1 token / embed 返回 dim） */
+export function testModelProfile(id) {
+  return postJson('/api/management/models/test', { id })
+}

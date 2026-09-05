@@ -110,7 +110,7 @@ function buildHistoryContext(history, currentQuery) {
  * @param {{query:string, chunks:Array, searchMs?:number, history?:Array<{role:string,content:string}>}} param0
  * @returns {ReadableStream<Uint8Array>} AI SDK data-stream
  */
-export async function streamRagAnswer({ query, chunks, searchMs = 0, history }) {
+export async function streamRagAnswer({ query, chunks, searchMs = 0, history, agentId }) {
   requireLLM()
   // 给前端 FallbackSlice 卡片准备字段：title(文件名badge) / heading(来源/大纲badge) / score(分数) / snippet(正文预览)
   const resultsForFrontend = chunks.map((c, idx) => ({
@@ -140,7 +140,7 @@ export async function streamRagAnswer({ query, chunks, searchMs = 0, history }) 
   const historyCtx = buildHistoryContext(history, query)
 
   const result = await streamText({
-    model: getChatModel(),
+    model: getChatModel({ role: 'chat.rag', agentId }),
     system:
       `你是面试知识助手。严格基于提供的知识库片段回答用户问题；若片段不足以回答，请如实说明，不要编造。\n\n` +
       `显示规则（UI 层已单独处理，请严格遵守以免重复）：\n` +
@@ -157,7 +157,7 @@ export async function streamRagAnswer({ query, chunks, searchMs = 0, history }) 
  * 通用对话流式回答（用于 /api/chat，非知识库智能体）
  * @param {{query:string, techStack?:string[], history?:Array<{role:string,content:string}>}} param0
  */
-export async function streamChat({ query, techStack, history }) {
+export async function streamChat({ query, techStack, history, agentId }) {
   requireLLM()
   const historyCtx = buildHistoryContext(history, query)
   const system = (
@@ -166,7 +166,7 @@ export async function streamChat({ query, techStack, history }) {
       : '你是一位资深面试官，回答清晰专业。'
   ) + (historyCtx ? ' 如果提供了「历史对话上下文」段落，请结合前文语境延续对话，不要当作孤立单轮。' : '')
   const result = await streamText({
-    model: getChatModel(),
+    model: getChatModel({ role: 'chat.general', agentId }),
     system,
     prompt: `${historyCtx}${query}`,
   })
@@ -187,11 +187,11 @@ function resumeNarrative(report) {
 }
 
 /** 严格 JSON 生成 + 解析（最多 2 次尝试；仍失败 → 显式 503，绝不降级为假报告） */
-async function generateStructuredJSON({ system, prompt, label }) {
+async function generateStructuredJSON({ system, prompt, label, role, agentId }) {
   let lastErr = null
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const { text: out } = await generateText({ model: getChatModel(), system, prompt })
+      const { text: out } = await generateText({ model: getChatModel({ role, agentId }), system, prompt })
       return JSON.parse(stripToJson(out))
     } catch (e) {
       lastErr = e
@@ -209,7 +209,7 @@ async function generateStructuredJSON({ system, prompt, label }) {
  * @param {{resumeText?:string, jd?:string, query:string}} param0
  * @returns {ReadableStream} data-stream（含 2: resume_report 注解）
  */
-export async function streamResumeAnalyze({ resumeText, jd, query }) {
+export async function streamResumeAnalyze({ resumeText, jd, query, agentId }) {
   requireLLM()
   const text = (resumeText || query || '').trim()
   const system =
@@ -228,6 +228,8 @@ export async function streamResumeAnalyze({ resumeText, jd, query }) {
     system,
     prompt,
     label: '简历分析',
+    role: 'chat.resume',
+    agentId,
   })
 
   return prependAnnotation(
@@ -243,7 +245,7 @@ export async function streamResumeAnalyze({ resumeText, jd, query }) {
  * @param {{query:string, techStack?:string[], history?:Array, results?:Array, finish?:boolean}} param0
  * @returns {ReadableStream} data-stream
  */
-export async function streamMockInterview({ query, techStack, history, results, finish }) {
+export async function streamMockInterview({ query, techStack, history, results, finish, agentId }) {
   requireLLM()
   const stack = Array.isArray(techStack) && techStack.length
     ? techStack.join('、')
@@ -264,6 +266,8 @@ export async function streamMockInterview({ query, techStack, history, results, 
       system,
       prompt: `面试记录：\n${transcript || '（无有效记录）'}`,
       label: '面试评分',
+      role: 'chat.interview.scorecard',
+      agentId,
     })
     return prependAnnotation(
       stubStream(`面试结束，综合评分 **${scores.overall}/100**。详见下方评分卡。`),
@@ -293,7 +297,7 @@ export async function streamMockInterview({ query, techStack, history, results, 
     `第一题：请讲讲 React 中 key 的作用，如果用数组索引作 key 会有什么问题？\n（考察点：列表 diff 机制与常见坑）\n` +
     `输出为自然语言，不要输出 JSON。` +
     sampleQs
-  const result = await streamText({ model: getChatModel(), system, prompt: `${historyCtx}候选人：${query}` })
+  const result = await streamText({ model: getChatModel({ role: 'chat.interview.qa', agentId }), system, prompt: `${historyCtx}候选人：${query}` })
   return result.toDataStream()
 }
 
@@ -330,6 +334,7 @@ export async function streamInterviewAnswer({
   ragChunks = [],
   ragSearchMs = 0,
   history = [],
+  agentId,
 }) {
   const hasInterview = results.length > 0
   const hasRag = ragChunks.length > 0
@@ -434,7 +439,7 @@ export async function streamInterviewAnswer({
     prompt = `${historyCtx}用户问题：${query}`
   }
 
-  const inner = await streamText({ model: getChatModel(), system, prompt })
+  const inner = await streamText({ model: getChatModel({ role: 'chat.interview', agentId }), system, prompt })
   return prependAnnotation(inner.toDataStream(), annotations)
 }
 
@@ -451,7 +456,7 @@ export async function streamInterviewAnswer({
  * @param {{questionsPerChunk?:number, timeoutMs?:number}} opts
  * @returns {Promise<Array<{topic:string, questions:string[]}>>} 长度与 chunks 一一对应
  */
-export async function generateChunkAnnotations(chunks, { questionsPerChunk = 3, timeoutMs = 8000 } = {}) {
+export async function generateChunkAnnotations(chunks, { questionsPerChunk = 3, timeoutMs = 8000, agentId = 'doc-processor' } = {}) {
   const safeChunks = Array.isArray(chunks) ? chunks : []
   // 默认降级结果（先占好位置，LLM 成功时再按 idx 覆盖）
   const fallback = (c) => ({
@@ -491,7 +496,7 @@ export async function generateChunkAnnotations(chunks, { questionsPerChunk = 3, 
     const timer = setTimeout(() => controller.abort(), timeoutMs)
 
     const llmPromise = generateText({
-      model: getChatModel(),
+      model: getChatModel({ role: 'chat.annotations', agentId }),
       temperature: 0,
       prompt,
       abortSignal: controller.signal,

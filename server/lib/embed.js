@@ -1,70 +1,36 @@
 import { embedMany } from 'ai'
-import { createOpenAI } from '@ai-sdk/openai'
-import { embeddingConfig, embedAvailable } from './config.js'
+import * as models from './models.js'
 import { childLogger } from './logger.js'
 import { ServiceUnavailableError } from './errors.js'
 
 const log = childLogger('embed')
 
 /**
- * embed —— 文本向量化（Fail-Fast，见 ADR-009）
+ * embed —— 文本向量化（Fail-Fast，见 ADR-009；模型路由见 ADR-006）
  *
- * 通过 config 接入任意 OpenAI 兼容 embedding 端点（OpenAI / 智谱 / 本地等）。
- *
+ * 模型实例与 profile 解析统一走 lib/models.js（routes.defaults.embedding 路由）。
  * **禁止降级**（2026-09-03 策略）：Embedding 未配置或断连时，显式抛出
  * ServiceUnavailableError（code=EMBED_UNAVAILABLE），绝不静默回退到
  * hash 假向量——那会让语义检索"看起来在工作、实际全是噪声"（隐性版本回退）。
  *
- * 熔断器仍然保留，但用途从「降级切换」变为「快速失败」：首次失败即熔断，
- * 冷却窗口内直接抛错不再打网络，冷却结束允许一次探测。
+ * 熔断器按 profile 分片（互不传染）：首次失败即熔断，冷却窗口内直接抛错
+ * 不再打网络，冷却结束允许一次探测（半开）。用途从「降级切换」变为「快速失败」。
  *
  * 本模块只负责「算向量」，不负责存储。向量持久化由 lib/milvusStore.js 承担。
  */
 
-// 缓存 provider 实例，避免每次请求重建
-let _model = null
-// 熔断器：失败后冷却，冷却结束允许一次探测请求（半开）
-let _circuitState = 'closed'
-let _circuitOpenedAt = 0
-let _circuitProbeInFlight = false
 const EMBED_COOLDOWN_MS = Math.max(1000, Number(process.env.EMBED_CIRCUIT_COOLDOWN_MS) || 30000)
 
-function canTryExternal() {
-  if (_circuitState === 'closed') return true
-  if (_circuitState === 'open' && Date.now() - _circuitOpenedAt >= EMBED_COOLDOWN_MS && !_circuitProbeInFlight) {
-    _circuitState = 'half-open'
-    _circuitProbeInFlight = true
-    return true
-  }
-  return false
-}
-function markEmbedSuccess() {
-  _circuitState = 'closed'
-  _circuitOpenedAt = 0
-  _circuitProbeInFlight = false
-}
-function markEmbedFailure() {
-  _circuitState = 'open'
-  _circuitOpenedAt = Date.now()
-  _circuitProbeInFlight = false
-}
+/** 熔断状态（按 profile 分片）：profileId -> { state, openedAt } */
+const circuits = new Map()
 
-function getEmbedModel() {
-  if (_model) return _model
-  const opts = { apiKey: embeddingConfig.apiKey }
-  if (embeddingConfig.baseUrl) opts.baseURL = embeddingConfig.baseUrl
-  const openai = createOpenAI(opts)
-  _model = openai.embedding(embeddingConfig.model)
-  return _model
-}
-
-function requireEmbed() {
-  if (!embedAvailable) {
-    throw new ServiceUnavailableError(
-      'Embedding 未配置：向量化与语义检索不可用。请在 server/.env 配置 EMBED_API_KEY / EMBED_BASE_URL / EMBED_MODEL 后重启后端。',
-      'EMBED_UNAVAILABLE',
-    )
+function circuitFor(profileId) {
+  let c = circuits.get(profileId)
+  if (!c) {
+    c = { state: 'closed', openedAt: 0 }
+    circuits.set(profileId, c)
   }
+  return c
 }
 
 /**
@@ -79,8 +45,9 @@ function requireEmbed() {
  */
 export async function embedTexts(texts) {
   if (!texts.length) return []
-  requireEmbed()
-  if (!canTryExternal()) {
+  const prof = models.getEmbedProfile()
+  const circ = circuitFor(prof.id)
+  if (circ.state === 'open' && Date.now() - circ.openedAt < EMBED_COOLDOWN_MS) {
     throw new ServiceUnavailableError(
       'Embedding 服务暂不可用（熔断冷却中，稍后自动探测恢复）。请检查 Embedding 服务（EMBED_BASE_URL / EMBED_MODEL）状态。',
       'EMBED_UNAVAILABLE',
@@ -88,13 +55,14 @@ export async function embedTexts(texts) {
   }
   try {
     const { embeddings } = await embedMany({
-      model: getEmbedModel(),
+      model: models.getEmbedModel(),
       values: texts,
     })
-    markEmbedSuccess()
+    circ.state = 'closed'
     return embeddings
   } catch (err) {
-    markEmbedFailure()
+    circ.state = 'open'
+    circ.openedAt = Date.now()
     log.error(`[embed] Embedding 调用失败：${err.message}`)
     throw new ServiceUnavailableError(
       `Embedding 调用失败：${err.message}。请检查 Embedding 服务（EMBED_BASE_URL / EMBED_MODEL）状态。`,
@@ -108,6 +76,7 @@ export async function embedTexts(texts) {
  * 行为与 embedTexts 完全一致：不可用即抛错。
  *
  *   const sentenceVecs = await embedSentences(sentences)
+ *   // 对相邻句子做余弦相似度找语义断点
  *   // 每个 chunk 最终向量 = chunk 内句子向量算术平均（零成本，不重复调用 embedding）
  *
  * @param {string[]} sentences
@@ -144,15 +113,20 @@ export function averageVectors(vectors) {
   return out
 }
 
-export { embedAvailable }
-
 /**
  * 当前实际生效的 embedding 模式：
  *  - 'external'：真实 embedding 端点（语义相似度可信）
  *  - 'unavailable'：未配置或熔断打开（此时 embedTexts 会抛 EMBED_UNAVAILABLE）
  *
- * 语义评分等调用方据此选择「无增强的有效实现」（如纯启发式评分，并如实标注 scoreMode）。
+ * 语义评分等依赖相似度可信度的调用方必须先检查此函数，
+ * 选择「无增强的有效实现」（如纯启发式评分）并如实标注 scoreMode。
  */
 export function embedMode() {
-  return embedAvailable && _circuitState !== 'open' ? 'external' : 'unavailable'
+  try {
+    const prof = models.getEmbedProfile()
+    const circ = circuits.get(prof.id)
+    return circ?.state === 'open' ? 'unavailable' : 'external'
+  } catch {
+    return 'unavailable'
+  }
 }

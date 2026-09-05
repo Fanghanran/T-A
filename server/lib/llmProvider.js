@@ -1,44 +1,28 @@
+import * as models from './models.js'
+
 /**
- * llmProvider —— LLM provider 单例工厂
+ * llmProvider —— LLM provider 获取入口（ADR-006 后为 models.js 的薄封装）
  *
- * 依赖层：L0（仅依赖 config）
+ * 依赖层：L0（仅依赖 config / models）
  *
- * 统一 4 处重复的 LLM provider 创建逻辑（原 llm.js / docProcessor.js /
- * queryRewriter.js / docWorkflowShared.js 各有一份完全相同的实现）。
- * 所有调用者共享同一 provider 实例，减少内存占用。
+ * 兼容说明：历史上这里是「单例 chat model 工厂」，所有调用点零参 getChatModel()。
+ * 现在支持可选 selector（{ role, agentId }）做三级模型解析（agent > role > 默认），
+ * 未配置模型时抛 LLM_NOT_CONFIGURED（Fail-Fast，ADR-009），绝不返回假实现。
  */
 
-import { createOpenAI } from '@ai-sdk/openai'
-import { ServiceUnavailableError } from './errors.js'
-import { llmConfig } from './config.js'
-
-/** @type {import('ai').LanguageModel | null} */
-let _model = null
-
 /**
- * 获取缓存的 chat model 实例。首次调用时创建并缓存。
- *
+ * 获取 chat model 实例。
+ * @param {{role?: string, agentId?: string}} [sel] 角色与智能体（用于三级解析）
  * @returns {import('ai').LanguageModel}
  */
-export function getChatModel() {
-  if (_model) return _model
-  // Fail-Fast（ADR-009）：未配置模型直接抛错，由上层路由转 503 提醒
-  if (!llmConfig.apiKey) {
-    throw new ServiceUnavailableError(
-      '模型未连接：请在 server/.env 配置 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 后重启后端。',
-      'LLM_NOT_CONFIGURED',
-    )
-  }
-  const opts = { apiKey: llmConfig.apiKey }
-  if (llmConfig.baseUrl) opts.baseURL = llmConfig.baseUrl
-  const openai = createOpenAI(opts)
-  _model = openai.chat(llmConfig.model)
-  return _model
+export function getChatModel(sel) {
+  return models.getChatModel(sel)
 }
 
 /**
- * 重置缓存的 model 实例（测试用，或配置热更新后需要重建 provider）。
+ * 重置缓存的 model 实例（配置热更新后调用）。
+ * @param {string} [profileId] 仅重置指定 profile；缺省清全部
  */
-export function resetChatModel() {
-  _model = null
+export function resetChatModel(profileId) {
+  models.resetProfileCache(profileId)
 }

@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { toolRegistry, workflowRegistry } from './registry.js'
+import { agentRegistry } from '../agents/agentRegistry.js'
 import { appendAudit, listAudit, isAuditEnabled, setAuditEnabled } from './audit.js'
 import { listTunables, setTunable, resetTunables } from '../tunables.js'
 import { childLogger } from '../logger.js'
@@ -157,6 +158,69 @@ router.post('/tunables/reset', (_req, res) => {
   const r = resetTunables()
   appendAudit('tunable.reset', {})
   res.json(r)
+})
+
+/* ---------- 模型管理（ADR-006：多模型路由 · 运行时热改） ---------- */
+import {
+  listModels,
+  upsertModelProfile,
+  deleteModelProfile,
+  setModelRoutes,
+  testModelProfile,
+} from '../models.js'
+
+/** 模型管理端点总览：GET /api/management/models（脱敏） */
+router.get('/models', (_req, res) => {
+  const view = listModels()
+  res.json({
+    profiles: view.profiles,
+    routes: view.routes,
+    roles: view.roles,
+    agents: agentRegistry.listAgents().map((a) => ({ id: a.id, name: a.name })),
+  })
+})
+
+/** 新增/更新 profile（id 相同即覆盖；apiKeyInline 只进不出） */
+router.post('/models', (req, res) => {
+  try {
+    const saved = upsertModelProfile(req.body ?? {})
+    appendAudit('model.profile.save', { id: saved.id, kind: saved.kind, model: saved.model })
+    res.json({ profile: saved })
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
+})
+
+/** 删除 profile（被路由引用或内置播种的会被 400 拒绝） */
+router.delete('/models/:id', (req, res) => {
+  try {
+    const r = deleteModelProfile(req.params.id)
+    appendAudit('model.profile.delete', { id: req.params.id })
+    res.json(r)
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
+})
+
+/** 更新路由绑定（roles / agents / defaults 三级），热生效 */
+router.put('/models/routes', (req, res) => {
+  try {
+    const r = setModelRoutes(req.body ?? {})
+    appendAudit('model.routes.update', { routes: r.routes })
+    res.json(r)
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
+})
+
+/** 探活：对指定 profile 发最小请求（chat 回 1 token / embed 返回 dim） */
+router.post('/models/test', async (req, res) => {
+  try {
+    const r = await testModelProfile(String(req.body?.id ?? ''))
+    res.json(r)
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
 })
 
 export default router

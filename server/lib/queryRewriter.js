@@ -174,7 +174,7 @@ export async function rewrite(query, history, overrideCfg = {}) {
       const timer = setTimeout(() => controller.abort(), timeoutMs)
       try {
         const result = await streamText({
-          model: getChatModel(),
+          model: getChatModel({ role: 'chat.rewrite' }),
           temperature: 0,
           prompt,
           abortSignal: controller.signal,

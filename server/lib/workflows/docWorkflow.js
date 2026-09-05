@@ -240,7 +240,7 @@ export async function runDocAgent({ query, docId = '', text = '', history = [] }
         for (let step = 1; step <= MAX_STEPS; step++) {
           const prompt = buildAgentPrompt({ ctx, history, steps, query, directive })
           const { text: llmOut } = await generateText({
-            model: getChatModel(),
+            model: getChatModel({ role: 'chat.doc.react', agentId: 'doc-processor' }),
             system: buildSystemPrompt(),
             prompt,
           })
@@ -512,7 +512,7 @@ export async function streamOpReport({ opReport, history = [] }) {
   if (llmAvailable) {
     try {
       const { text: out } = await generateText({
-        model: getChatModel(),
+        model: getChatModel({ role: 'chat.doc.react', agentId: 'doc-processor' }),
         system: OP_REPORT_SYSTEM_PROMPT,
         prompt: `${buildHistoryBlock(history)}\n\n## 操作结果\n${facts}\n\n请向用户简要汇报。`,
       })

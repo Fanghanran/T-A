@@ -37,6 +37,7 @@ const LAYERS = {
   // L0 基础设施
   'env.js': 0, 'lib/logger.js': 0, 'lib/config.js': 0, 'lib/errors.js': 0, 'lib/requestTrace.js': 0, 'lib/security.js': 0, 'lib/tunables.js': 0,
   'lib/mathUtils.js': 0, 'lib/textUtils.js': 0, 'lib/streamUtils.js': 0, 'lib/llmProvider.js': 0, 'lib/cache.js': 0,
+  'lib/models.js': 0,
   // L1 存储
   'lib/milvusStore.js': 1, 'lib/vectorStore.js': 1, 'lib/sessionStore.js': 1, 'lib/questionBank.js': 1,
   // L2 算法

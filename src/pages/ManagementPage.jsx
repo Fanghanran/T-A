@@ -23,6 +23,7 @@ import { SectionTitle } from '@/components/management/SectionTitle'
 import { RegistryRow } from '@/components/management/RegistryRow'
 import { ToggleSwitch } from '@/components/management/ToggleSwitch'
 import { TunablesSection } from '@/components/management/TunablesSection'
+import { ModelsSection } from '@/components/management/ModelsSection'
 
 /**
  * ManagementPage —— 系统管理独立菜单视图
@@ -288,6 +289,11 @@ export function ManagementPage({ onLoadingChange }) {
 
           {/* ===== 调优参数（默认折叠） ===== */}
           <TunablesSection onError={setError} />
+
+          {/* ===== 模型管理（多模型 profile + 角色路由，ADR-006） ===== */}
+          <div className="mt-6">
+            <ModelsSection />
+          </div>
 
           {loading && !overview && (
             <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">

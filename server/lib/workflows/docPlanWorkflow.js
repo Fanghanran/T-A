@@ -137,7 +137,7 @@ async function runCompoundPlan({ ctx, query, history, intents, emitText, emitAnn
   let summary = ''
   try {
     const { text } = await generateText({
-      model: getChatModel(),
+      model: getChatModel({ role: 'chat.doc.plan', agentId: 'doc-processor' }),
       system:
         '你是文档处理智能体。用户给了复合任务，各子任务已全部执行完毕。' +
         '请根据执行结果用中文写一段简要汇总（3 句以内）：每步做了什么、最终状态如何。' +

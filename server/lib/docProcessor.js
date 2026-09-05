@@ -352,7 +352,7 @@ export async function streamAnalyzeDoc({ text, features, title }) {
       `启发式推荐：strategy=${suggestedStrategy}, maxChars=${maxChars}\n\n` +
       `文档开头预览：\n${preview}\n\n` +
       `请用一段话向用户概述文档结构并推荐切片策略，引导用户回复"预览"或"入库"。`
-    const result = await streamText({ model: getChatModel(), system: sys, prompt })
+    const result = await streamText({ model: getChatModel({ role: 'chat.doc.analyze', agentId: 'doc-processor' }), system: sys, prompt })
     return result.toDataStream()
   }
   return stubStream(overview)
