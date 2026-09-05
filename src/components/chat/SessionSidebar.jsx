@@ -47,7 +47,6 @@ export function SessionSidebar({
   // 待删除会话（删除前二次确认，替代 window.confirm）
   const [confirmDeleteId, setConfirmDeleteId] = React.useState('')
   const [editingValue, setEditingValue] = React.useState('')
-  const inputRef = React.useRef(null)
   const renameInputRef = React.useRef(null)
 
   React.useEffect(() => {

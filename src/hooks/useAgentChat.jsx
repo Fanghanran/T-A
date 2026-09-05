@@ -122,7 +122,6 @@ export function useAgentChat({ agent, techStack, sessionId, onSessionId }) {
       setStableChatId(nextStable)
     }
     prevSidRef.current = newSid
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [safeSid, chat.messages.length, agent?.id])
 
   return {

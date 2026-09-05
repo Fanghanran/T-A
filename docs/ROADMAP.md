@@ -90,7 +90,7 @@ M0 工程地基 ─→ M0.5 落盘 ADR(006/007/008)
 | **M0.5 ADR 落盘** | ✅ 已完成：006/007/008 三份 ADR 已写入 `docs/adr/`，并接入 `ARCHITECTURE.md` 索引（本文 §3 互链） | 低（纯文档） | M0 |
 | **M1 模型管理** | ✅ 已完成（2026-09-04）：`models.js`(L0) + keyed 缓存 + 调用点走 `getChatModel({role,agentId})` + 管理 CRUD + 前端 `ModelsSection`；env 种子零迁移 | 中 | M0.5 |
 | **M2 会话记忆** | ✅ 已完成（2026-09-05）：`memoryService`(L4) + `session_memory` 滚动摘要 + `kb_memory` 事实库（embed 走 M1 profile）+ ADR-009 失败语义 + `memory/stats`·`memory/clear` 端点 | 中 | **M1** |
-| **M3 残留债务** | `useUploadForm` 豁免正式化、~31 unused-vars 清理、Milvus commit-journal 评估(ADR-004 备选)、`GET /documents/:id/status` | 低 | 可与 M1/M2 并行 |
+| **M3 残留债务** | ✅ 已完成（2026-09-05）：lint 警告 33→0、3 处 hook 豁免正式化、`GET /documents/:id/status` + API client、commit-journal 评估结论落盘 ADR-004 | 低 | 可与 M1/M2 并行 |
 | **M4 多智能体并行** | ✅ 已完成（2026-09-05）：前端 chatRegistry 常驻多窗格 + streamGate 上界(3) + 未读/脉点；后端每流 abort 上游 + 限流 per-(IP,agent) + 两级并发闸门 | 中高 | **M1** |
 | **M5 多用户/多实例** | principal 抽象 + owner_id + Milvus owner 过滤 + 共享限流/缓存失效/uploadJobs 外置/registry 外部化 + `PROTECT_SESSIONS` 默认开 | 高（安全关键，需专测） | M1 + M4；**条件性/暂缓** |
 
@@ -110,7 +110,7 @@ M0 工程地基 ─→ M0.5 落盘 ADR(006/007/008)
 - 通用：`npm run check:all`（build + 前端测试 + lint + format + 后端测试 + `check-layers`）全绿；关键项补单测。
 - M1：`models` 解析优先级单测 + 本地多模型手测（rewrite 绑快模型、resume 绑强模型，按角色命中不同模型）。
 - M2：✅ 已实测（2026-09-05）：两轮对话后摘要滚动 + 事实入库（跨会话 hash 去重生效）；新会话「你还记得我是谁吗」命中全部注入事实；`memory/stats`·`memory/clear` 可用；`check:all` 全绿。30+ 轮长会话回归与 stub 降级演练留待日常使用观察。
-- M3：`check:all` 绿 + unused-vars 清零或收敛。
+- M3：✅ 已完成（2026-09-05）：lint 警告清零（0 errors 0 warnings）、3 处 eslint-disable 豁免全部以稳定依赖正式化、status 端点实测（强一致 chunkCount + orphan 检测 + 404）、commit-journal 评估结论（不采用 + 重新评估触发条件）落盘 ADR-004；`check:all` 全绿。
 - M4：✅ 已实测（2026-09-05）：双/三智能体并行流互不打断（后台完成答案完整）、切换不打断、未读徽标与在途脉点生效、第 4 路发送被上界拦截提示、客户端断开 → 服务端日志确认 abort 到达 LLM、限流 per-(IP,agent) 独立计数；`check:all` 全绿。
 - M5：越权/隔离专测（跨 user 读写 403）、公平调度、审计含 userId。
 

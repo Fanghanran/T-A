@@ -28,10 +28,14 @@ export function useKnowledgeBase() {
   const preview = useDocumentPreview()
   const search = useDocumentSearch(list.filters)
 
+  // 先解构出 useCallback 稳定的函数引用，refreshAll 身份才稳定
+  const { refresh: refreshList } = list
+  const { loadFacets } = facets
+  const { loadStats } = stats
   /** 三合一刷新：列表 + facets + 统计（消除旧版 7 处重复的 Promise.all） */
   const refreshAll = React.useCallback(
-    () => Promise.all([list.refresh(), facets.loadFacets(), stats.loadStats()]),
-    [list.refresh, facets.loadFacets, stats.loadStats],
+    () => Promise.all([refreshList(), loadFacets(), loadStats()]),
+    [refreshList, loadFacets, loadStats],
   )
 
   const mutations = useDocumentMutations({
@@ -56,19 +60,17 @@ export function useKnowledgeBase() {
     refreshAll,
   })
 
-  // ---- 初始化 & 依赖变化刷新 ----
+  // ---- 初始化 & 依赖变化刷新（refreshList/loadFacets/loadStats 均为 useCallback 稳定引用） ----
   React.useEffect(() => {
-    list.refresh()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [list.filters, list.page, list.sort])
+    refreshList()
+  }, [list.filters, list.page, list.sort, refreshList])
 
   React.useEffect(() => {
-    facets.loadFacets().then(() => {
+    loadFacets().then(() => {
       // facets 与统计面板都含分类聚合，一次性把 stats 也拉一下
-      stats.loadStats()
+      loadStats()
     })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [loadFacets, loadStats])
 
   const busy =
     list.loading ||

@@ -71,8 +71,8 @@ export function useChatHistory({
     return () => {
       cancelled = true
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentSessionId, agentName])
+    // setMessages 由 AI SDK useCallback 提供（身份稳定），加入依赖不会引发重复拉取
+  }, [currentSessionId, agentName, setMessages, stableChatIdRef])
 
   return { loadingHistory }
 }

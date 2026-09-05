@@ -1,4 +1,3 @@
-import * as React from 'react'
 import { TriangleAlert } from 'lucide-react'
 import {
   Dialog,
@@ -39,7 +38,9 @@ export function ConfirmDialog({
       <DialogContent className="max-w-md">
         <div className="space-y-1.5">
           <DialogTitle className="flex items-center gap-2 text-base">
-            {destructive && <TriangleAlert className="h-4 w-4 text-destructive" />}
+            {destructive && (
+              <TriangleAlert className="h-4 w-4 text-destructive" />
+            )}
             {title}
           </DialogTitle>
           {description && (

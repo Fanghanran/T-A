@@ -1,4 +1,3 @@
-import * as React from 'react'
 import { Check, X, FileText } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -9,7 +8,7 @@ import {
   DialogFooter,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { cn } from '@/lib/utils'
+import {} from '@/lib/utils'
 
 /**
  * ChunkPreviewDialog —— 上传前切片预览弹窗

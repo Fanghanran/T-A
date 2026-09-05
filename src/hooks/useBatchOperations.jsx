@@ -25,7 +25,6 @@ export function useBatchOperations(deps) {
     setSelectedIds,
     getSelectedDoc,
     setSelectedDoc,
-    getChunksDocId,
     clearForDeleted,
     refreshAll,
   } = deps

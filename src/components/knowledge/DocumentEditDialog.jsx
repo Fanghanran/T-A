@@ -131,7 +131,7 @@ export function DocumentEditDialog({
   }
 
   // 比较 meta 与 initialDoc，只提交变更（避免后端把"相同字段"误判成脏写）
-  const computeMetaPatch = () => {
+  const computeMetaPatch = React.useCallback(() => {
     const patch = {}
     const nextTitle = title.trim()
     if (nextTitle && nextTitle !== (initialDoc?.title ?? ''))
@@ -147,7 +147,7 @@ export function DocumentEditDialog({
     const nextSource = source.trim()
     if (nextSource !== (initialDoc?.source ?? '')) patch.source = nextSource
     return patch
-  }
+  }, [title, category, tags, source, initialDoc])
 
   const canSubmitMeta = React.useMemo(() => {
     if (submitting) return false
@@ -156,7 +156,7 @@ export function DocumentEditDialog({
       Object.keys(patch).length > 0 &&
       (patch.title === undefined || patch.title.length > 0)
     )
-  }, [submitting, title, category, tags, source, initialDoc])
+  }, [submitting, computeMetaPatch])
 
   const contentLen = content.length
   const contentChanged = content !== (initialDoc?.content ?? '')

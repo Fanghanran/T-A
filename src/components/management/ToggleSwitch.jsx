@@ -1,4 +1,3 @@
-import * as React from 'react'
 import { cn } from '@/lib/utils'
 
 /** 轻量开关（无第三方依赖）：胶囊滑块，点击切换 */

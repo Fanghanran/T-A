@@ -1,12 +1,5 @@
 import * as React from 'react'
-import {
-  FileText,
-  Trash2,
-  Inbox,
-  ArrowUpDown,
-  ChevronLeft,
-  ChevronRight,
-} from 'lucide-react'
+import { Inbox, ArrowUpDown, ChevronLeft, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Checkbox } from './Checkbox'

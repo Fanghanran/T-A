@@ -1,4 +1,3 @@
-import * as React from 'react'
 import { Badge } from '@/components/ui/badge'
 
 /** 分区标题：图标 + 名称 + 统计徽标 */

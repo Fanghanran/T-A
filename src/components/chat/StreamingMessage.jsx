@@ -51,8 +51,12 @@ export function StreamingMessage({
 
   // ① useChat 可能会把 data-stream 中的 2: 行注入到 annotations；兼容 experimental_attachments
   // ② runtimeAnnotations 查到的（useChat 之外手动缓存的 search_results Recall 过程元数据）
-  const baseAnnotations =
-    message.annotations || message.experimental_attachments || []
+  // message.annotations 引用每轮稳定（useChat 原地更新同一数组），
+  // 包 useMemo 稳定下游 useMemo 的依赖，避免每次渲染重算
+  const baseAnnotations = React.useMemo(
+    () => message.annotations || message.experimental_attachments || [],
+    [message.annotations, message.experimental_attachments],
+  )
   const runtime = React.useMemo(
     () =>
       isUser ? null : getAnnotationForMessage(chatId, allMessages, msgIndex),
@@ -88,28 +92,33 @@ export function StreamingMessage({
   //  1. agent_workflow（工具调用时间线）→ AgentWorkflowPanel
   //  2. engine=doc-processor 的 search_results（切片结果）→ ChunkPreviewPanel
   //  3. 其余引擎（结构化题库 / 知识库语义）→ SearchProcessPanel
-  const { workflowAnnotations, docAnnotations, searchAnnotations, resumeAnnotations, interviewAnnotations } =
-    React.useMemo(() => {
-      const wf = []
-      const doc = []
-      const search = []
-      const resume = []
-      const interview = []
-      for (const a of annotations) {
-        if (a?.type === 'agent_workflow') wf.push(a)
-        else if (a?.type === 'resume_report') resume.push(a)
-        else if (a?.type === 'interview_scorecard') interview.push(a)
-        else if (a?.engine === 'doc-processor') doc.push(a)
-        else search.push(a)
-      }
-      return {
-        workflowAnnotations: wf,
-        docAnnotations: doc,
-        searchAnnotations: search,
-        resumeAnnotations: resume,
-        interviewAnnotations: interview,
-      }
-    }, [annotations])
+  const {
+    workflowAnnotations,
+    docAnnotations,
+    searchAnnotations,
+    resumeAnnotations,
+    interviewAnnotations,
+  } = React.useMemo(() => {
+    const wf = []
+    const doc = []
+    const search = []
+    const resume = []
+    const interview = []
+    for (const a of annotations) {
+      if (a?.type === 'agent_workflow') wf.push(a)
+      else if (a?.type === 'resume_report') resume.push(a)
+      else if (a?.type === 'interview_scorecard') interview.push(a)
+      else if (a?.engine === 'doc-processor') doc.push(a)
+      else search.push(a)
+    }
+    return {
+      workflowAnnotations: wf,
+      docAnnotations: doc,
+      searchAnnotations: search,
+      resumeAnnotations: resume,
+      interviewAnnotations: interview,
+    }
+  }, [annotations])
 
   // 回调包装：把本条预览注解里的 docId 一并回传给调用方。
   // 后端 adjust 用 `docId || '__ephemeral__'` 作切片缓存 key，指令不带 docId 会
@@ -118,7 +127,6 @@ export function StreamingMessage({
   const handleAdjust = React.useMemo(() => {
     if (typeof onAdjust !== 'function') return undefined
     return (instruction) => onAdjust(instruction, docId)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onAdjust, docId])
 
   // 调试日志：logger.debug 已内置 DEV 门控（生产构建会被剔除）

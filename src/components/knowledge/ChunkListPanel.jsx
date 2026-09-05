@@ -1,4 +1,3 @@
-import * as React from 'react'
 import { AlignJustify, Database, Loader2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -54,7 +53,13 @@ function cnTabs(active) {
  * @param {string} props.docId           当前文档 id（翻页回调用）
  * @param {(docId:string, params:{page:number})=>void} [props.onLoadChunks]
  */
-export function ChunkListPanel({ chunksLoading, sameDoc, chunks, docId, onLoadChunks }) {
+export function ChunkListPanel({
+  chunksLoading,
+  sameDoc,
+  chunks,
+  docId,
+  onLoadChunks,
+}) {
   const chunkItems = chunks?.items ?? []
   const chunkTotal = Number(chunks?.total ?? chunkItems.length)
   const chunkPage = Number(chunks?.page ?? 1)
@@ -80,7 +85,9 @@ export function ChunkListPanel({ chunksLoading, sameDoc, chunks, docId, onLoadCh
         </p>
       )}
       {sameDoc &&
-        chunkItems.map((c, i) => <ChunkCard key={c.id ?? i} chunk={c} index={i} />)}
+        chunkItems.map((c, i) => (
+          <ChunkCard key={c.id ?? i} chunk={c} index={i} />
+        ))}
 
       {/* 切片分页器（简单版：上一页/下一页） */}
       {sameDoc && chunkTotalPages > 1 && (

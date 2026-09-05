@@ -1,4 +1,3 @@
-import * as React from 'react'
 import {
   Files,
   Layers,
@@ -74,17 +73,15 @@ export function KbStatsPanel({ stats, loading }) {
                 value={`${orphansN} 篇缺切片`}
               />
             ) : (
-              <StatusPill
-                ok
-                label="数据一致性"
-                value="正常"
-              />
+              <StatusPill ok label="数据一致性" value="正常" />
             )}
           </div>
           {orphansN > 0 && !loading && (
             <p className="mt-2.5 flex items-start gap-1.5 text-[12px] text-amber-700 dark:text-amber-400">
               <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              检测到 {orphansN} 篇文档标记为已入库但没有切片（多为存储重启后未落盘丢失）。可在「文档管理」打开该文档编辑后保存，或调用 reconcile 接口用存量正文重新切片修复。
+              检测到 {orphansN}{' '}
+              篇文档标记为已入库但没有切片（多为存储重启后未落盘丢失）。可在「文档管理」打开该文档编辑后保存，或调用
+              reconcile 接口用存量正文重新切片修复。
             </p>
           )}
         </CardContent>
@@ -99,25 +96,41 @@ export function KbStatsPanel({ stats, loading }) {
           hint="已入库可检索文档"
         />
         <StatCard
-          icon={<Layers className="h-4 w-4 text-emerald-600 dark:text-emerald-500" />}
+          icon={
+            <Layers className="h-4 w-4 text-emerald-600 dark:text-emerald-500" />
+          }
           label="切片总数"
           value={loading ? '—' : chkN.toLocaleString('zh-CN')}
-          hint={docsN > 0 ? `每文档 ≈ ${Math.round(chkN / docsN)} 块` : '向量索引单元'}
+          hint={
+            docsN > 0
+              ? `每文档 ≈ ${Math.round(chkN / docsN)} 块`
+              : '向量索引单元'
+          }
         />
         <StatCard
-          icon={<Library className="h-4 w-4 text-violet-600 dark:text-violet-500" />}
+          icon={
+            <Library className="h-4 w-4 text-violet-600 dark:text-violet-500" />
+          }
           label="分类数"
           value={loading ? '—' : cats.length}
           hint="含「未分类」兜底"
         />
         <StatCard
-          icon={<MessageSquare className="h-4 w-4 text-sky-600 dark:text-sky-500" />}
+          icon={
+            <MessageSquare className="h-4 w-4 text-sky-600 dark:text-sky-500" />
+          }
           label="会话数"
           value={loading ? '—' : sessionsN.toLocaleString('zh-CN')}
-          hint={messagesN > 0 ? `${messagesN.toLocaleString('zh-CN')} 条消息` : '对话上下文'}
+          hint={
+            messagesN > 0
+              ? `${messagesN.toLocaleString('zh-CN')} 条消息`
+              : '对话上下文'
+          }
         />
         <StatCard
-          icon={<HelpCircle className="h-4 w-4 text-amber-600 dark:text-amber-500" />}
+          icon={
+            <HelpCircle className="h-4 w-4 text-amber-600 dark:text-amber-500" />
+          }
           label="题库条目"
           value={loading ? '—' : questionsN.toLocaleString('zh-CN')}
           hint="结构化面试题"

@@ -44,7 +44,6 @@ export function useDocumentSearch(filters = {}) {
         if (seq === searchSeq.current) setSearching(false)
       }
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [filters?.category, filters?.tag],
   )
 

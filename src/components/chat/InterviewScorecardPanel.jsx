@@ -1,5 +1,9 @@
-import * as React from 'react'
-import { Award, CheckCircle2, TriangleAlert, ClipboardCheck } from 'lucide-react'
+import {
+  Award,
+  CheckCircle2,
+  TriangleAlert,
+  ClipboardCheck,
+} from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { ChunkScoreBadge } from './ChunkPreviewPanel'
 import { cn } from '@/lib/utils'
@@ -15,7 +19,9 @@ function level(score) {
  * 消费 annotation.scores：overall / dimensions[{name,score,comment}] / highlights[] / improvements[] / verdict
  */
 export function InterviewScorecardPanel({ annotations }) {
-  const cards = (annotations || []).filter((a) => a?.type === 'interview_scorecard')
+  const cards = (annotations || []).filter(
+    (a) => a?.type === 'interview_scorecard',
+  )
   if (cards.length === 0) return null
 
   return (
@@ -32,8 +38,14 @@ export function InterviewScorecardPanel({ annotations }) {
                 <ClipboardCheck className="h-4 w-4 text-primary" />
                 <span className="text-sm font-medium">模拟面试评分报告</span>
                 <div className="ml-auto flex items-center gap-1.5">
-                  <span className="text-[11px] text-muted-foreground">综合</span>
-                  <ChunkScoreBadge score={s.overall} level={level(s.overall)} issues={['综合评分']} />
+                  <span className="text-[11px] text-muted-foreground">
+                    综合
+                  </span>
+                  <ChunkScoreBadge
+                    score={s.overall}
+                    level={level(s.overall)}
+                    issues={['综合评分']}
+                  />
                 </div>
               </div>
 
@@ -47,7 +59,9 @@ export function InterviewScorecardPanel({ annotations }) {
                         <div key={i} className="flex flex-col gap-1">
                           <div className="flex items-center gap-2 text-[13px]">
                             <span className="font-medium">{d.name}</span>
-                            <span className="ml-auto tabular-nums text-muted-foreground">{d.score}</span>
+                            <span className="ml-auto tabular-nums text-muted-foreground">
+                              {d.score}
+                            </span>
                           </div>
                           <div className="h-1.5 overflow-hidden rounded-full bg-muted">
                             <div
@@ -59,10 +73,16 @@ export function InterviewScorecardPanel({ annotations }) {
                                     ? 'bg-amber-500'
                                     : 'bg-rose-500',
                               )}
-                              style={{ width: `${Math.min(100, Math.max(0, val))}%` }}
+                              style={{
+                                width: `${Math.min(100, Math.max(0, val))}%`,
+                              }}
                             />
                           </div>
-                          {d.comment && <p className="text-xs text-muted-foreground">{d.comment}</p>}
+                          {d.comment && (
+                            <p className="text-xs text-muted-foreground">
+                              {d.comment}
+                            </p>
+                          )}
                         </div>
                       )
                     })}
@@ -79,7 +99,9 @@ export function InterviewScorecardPanel({ annotations }) {
                         </p>
                         <ul className="flex flex-col gap-1">
                           {highlights.map((h, i) => (
-                            <li key={i} className="text-xs text-foreground/80">· {h}</li>
+                            <li key={i} className="text-xs text-foreground/80">
+                              · {h}
+                            </li>
                           ))}
                         </ul>
                       </div>
@@ -91,7 +113,9 @@ export function InterviewScorecardPanel({ annotations }) {
                         </p>
                         <ul className="flex flex-col gap-1">
                           {improvements.map((im, i) => (
-                            <li key={i} className="text-xs text-foreground/80">· {im}</li>
+                            <li key={i} className="text-xs text-foreground/80">
+                              · {im}
+                            </li>
                           ))}
                         </ul>
                       </div>

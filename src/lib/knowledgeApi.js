@@ -115,6 +115,15 @@ export function deleteDocument(id) {
 }
 
 /**
+ * 单文档索引状态（轻量：不含正文，chunkCount 强一致核实）
+ * 上传/重建后轮询此端点精确跟踪单个文档的索引进度，无需整表刷新。
+ * GET /documents/:id/status
+ */
+export function getDocumentStatus(id) {
+  return get(`/documents/${encodeURIComponent(id)}/status`)
+}
+
+/**
  * 文档详情（含正文内容用于预览）
  * GET /documents/:id
  */

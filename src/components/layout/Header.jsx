@@ -1,4 +1,3 @@
-import * as React from 'react'
 import { Menu, Moon, Sun } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { AGENT_STATUS, AGENT_STATUS_LABEL } from '@/lib/constants'

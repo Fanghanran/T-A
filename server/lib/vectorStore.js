@@ -34,7 +34,9 @@ const contentHashes = new Map()
 
 /** sha256(hex) */
 function sha256(s) {
-  return createHash('sha256').update(String(s ?? ''), 'utf8').digest('hex')
+  return createHash('sha256')
+    .update(String(s ?? ''), 'utf8')
+    .digest('hex')
 }
 
 function _hashAdd(content, docId) {
@@ -84,7 +86,10 @@ export function whenLoaded() {
 export async function load() {
   if (_loadedPromise) return _loadedPromise
   _loadedPromise = (async () => {
-    const [docs, chs] = await Promise.all([milvus.listAllDocuments(), milvus.listAllChunks()])
+    const [docs, chs] = await Promise.all([
+      milvus.listAllDocuments(),
+      milvus.listAllChunks(),
+    ])
     documents.clear()
     chunks.clear()
     contentHashes.clear()
@@ -92,7 +97,9 @@ export async function load() {
     for (const c of chs) chunks.set(c.id, c)
     for (const d of documents.values()) _hashAdd(d.content, d.id)
     loaded = true
-    log.info(`[vectorStore] 已从 Milvus 加载：${documents.size} 篇文档 / ${chunks.size} 切片`)
+    log.info(
+      `[vectorStore] 已从 Milvus 加载：${documents.size} 篇文档 / ${chunks.size} 切片`,
+    )
     return stats()
   })().catch((e) => {
     _loadedPromise = null
@@ -167,15 +174,25 @@ export function getDocument(id) {
 }
 
 const SORTERS = {
-  uploadedAtDesc: (a, b) => String(b.uploadedAt ?? '').localeCompare(String(a.uploadedAt ?? '')),
-  uploadedAtAsc: (a, b) => String(a.uploadedAt ?? '').localeCompare(String(b.uploadedAt ?? '')),
-  titleAsc: (a, b) => String(a.title ?? '').localeCompare(String(b.title ?? ''), 'zh'),
-  titleDesc: (a, b) => String(b.title ?? '').localeCompare(String(a.title ?? ''), 'zh'),
-  categoryAsc: (a, b) => String(a.category ?? '').localeCompare(String(b.category ?? ''), 'zh'),
+  uploadedAtDesc: (a, b) =>
+    String(b.uploadedAt ?? '').localeCompare(String(a.uploadedAt ?? '')),
+  uploadedAtAsc: (a, b) =>
+    String(a.uploadedAt ?? '').localeCompare(String(b.uploadedAt ?? '')),
+  titleAsc: (a, b) =>
+    String(a.title ?? '').localeCompare(String(b.title ?? ''), 'zh'),
+  titleDesc: (a, b) =>
+    String(b.title ?? '').localeCompare(String(a.title ?? ''), 'zh'),
+  categoryAsc: (a, b) =>
+    String(a.category ?? '').localeCompare(String(b.category ?? ''), 'zh'),
   sizeDesc: (a, b) => toNum(b.size) - toNum(a.size),
 }
 
-export function listDocuments({ category, tag, q, sort = 'uploadedAtDesc' } = {}) {
+export function listDocuments({
+  category,
+  tag,
+  q,
+  sort = 'uploadedAtDesc',
+} = {}) {
   let list = [...documents.values()]
   if (category) list = list.filter((d) => d.category === category)
   if (tag) list = list.filter((d) => (d.tags ?? []).includes(tag))
@@ -183,8 +200,12 @@ export function listDocuments({ category, tag, q, sort = 'uploadedAtDesc' } = {}
     const kw = String(q).toLowerCase()
     list = list.filter(
       (d) =>
-        String(d.title ?? '').toLowerCase().includes(kw) ||
-        String(d.content ?? '').toLowerCase().includes(kw),
+        String(d.title ?? '')
+          .toLowerCase()
+          .includes(kw) ||
+        String(d.content ?? '')
+          .toLowerCase()
+          .includes(kw),
     )
   }
   list.sort(SORTERS[sort] ?? SORTERS.uploadedAtDesc)
@@ -194,7 +215,9 @@ export function listDocuments({ category, tag, q, sort = 'uploadedAtDesc' } = {}
 export function patchMeta(id, patch = {}) {
   void id
   void patch
-  throw new Error('[vectorStore] patchMeta 已改为异步，请改用 await patchMetaAsync(...)')
+  throw new Error(
+    '[vectorStore] patchMeta 已改为异步，请改用 await patchMetaAsync(...)',
+  )
 }
 
 /** patchMeta 的异步实现：改文档元数据的同时同步刷新其切片（修复历史不同步缺陷） */
@@ -210,7 +233,10 @@ export async function patchMetaAsync(id, patch = {}) {
 
   const needSync = patch.category !== undefined || patch.tags !== undefined
   if (needSync) {
-    const n = await milvus.syncMetaToChunks(id, { category: next.category, tags: next.tags })
+    const n = await milvus.syncMetaToChunks(id, {
+      category: next.category,
+      tags: next.tags,
+    })
     for (const ch of await milvus.listChunksOfDoc(id)) chunks.set(ch.id, ch)
     if (n) log.debug(`[vectorStore] 已同步 ${n} 个切片的分类/标签`)
   }
@@ -249,7 +275,10 @@ export async function deleteChunksByIds(ids) {
     for (const id of valid) chunks.delete(id)
     return { deleted: valid, failed }
   } catch (e) {
-    log.warn({ err: e.message }, `[vectorStore] 批量删切片失败（${valid.length} 个）`)
+    log.warn(
+      { err: e.message },
+      `[vectorStore] 批量删切片失败（${valid.length} 个）`,
+    )
     return { deleted: [], failed: all }
   }
 }
@@ -273,7 +302,9 @@ export async function batchDelete(ids) {
 export function batchPatchMeta(ids, opts = {}) {
   void ids
   void opts
-  throw new Error('[vectorStore] batchPatchMeta 已改为异步，请改用 await batchPatchMetaAsync(...)')
+  throw new Error(
+    '[vectorStore] batchPatchMeta 已改为异步，请改用 await batchPatchMetaAsync(...)',
+  )
 }
 
 export async function batchPatchMetaAsync(ids, opts = {}) {
@@ -287,8 +318,10 @@ export async function batchPatchMetaAsync(ids, opts = {}) {
       continue
     }
     let tags = [...(cur.tags ?? [])]
-    if (Array.isArray(opts.addTags)) tags = [...new Set([...tags, ...opts.addTags])]
-    if (Array.isArray(opts.removeTags)) tags = tags.filter((t) => !opts.removeTags.includes(t))
+    if (Array.isArray(opts.addTags))
+      tags = [...new Set([...tags, ...opts.addTags])]
+    if (Array.isArray(opts.removeTags))
+      tags = tags.filter((t) => !opts.removeTags.includes(t))
     const patch = {}
     if (opts.setCategory !== undefined) patch.category = opts.setCategory
     patch.tags = tags
@@ -318,6 +351,11 @@ export function listChunksOf(docId) {
  * @param {string} docId
  * @returns {Promise<Array<{id:string, docId:string, idx:number, heading:string, text:string, vector:number[]}>>}
  */
+/** 强一致统计某文档已落库切片数（状态端点/孤儿检测用） */
+export async function countChunksOfDoc(docId) {
+  return milvus.countChunksOfDoc(docId)
+}
+
 export async function listChunkVectorsOfDoc(docId) {
   await whenLoaded()
   const all = await milvus.listAllChunkVectors()
@@ -362,7 +400,9 @@ export async function addChunks(docId, chunkList, vectors, opts = {}) {
   if (!doc) throw new Error(`[vectorStore] 文档不存在：${docId}`)
   // 空切片不是「成功入库」：直接判错，绝不允许把 0 块的文档标成 indexed（正是孤儿成因之一）
   if (!chunkList?.length) {
-    throw new Error(`[vectorStore] 文档 ${docId} 切片为空，拒绝入库（正文可能无有效内容或切片策略不匹配）`)
+    throw new Error(
+      `[vectorStore] 文档 ${docId} 切片为空，拒绝入库（正文可能无有效内容或切片策略不匹配）`,
+    )
   }
   const category = opts.category ?? doc.category ?? ''
   const tags = opts.tags ?? doc.tags ?? []
@@ -370,7 +410,8 @@ export async function addChunks(docId, chunkList, vectors, opts = {}) {
 
   const rows = chunkList.map((ch, i) => {
     const tv = vectors?.[i]
-    if (!Array.isArray(tv)) throw new Error(`[vectorStore] 切片 ${i} 缺少 text 向量`)
+    if (!Array.isArray(tv))
+      throw new Error(`[vectorStore] 切片 ${i} 缺少 text 向量`)
     const qv = Array.isArray(questionVectors?.[i]) ? questionVectors[i] : tv
     return {
       id: `chk_${docId}_${i}_${Math.random().toString(36).slice(2, 8)}`,
@@ -411,18 +452,34 @@ export async function addChunks(docId, chunkList, vectors, opts = {}) {
   }
 
   // 核实通过后才把文档转为 indexed
-  const nextDoc = { ...doc, status: 'indexed', indexError: null, indexedAt: nowISO() }
+  const nextDoc = {
+    ...doc,
+    status: 'indexed',
+    indexError: null,
+    indexedAt: nowISO(),
+  }
   await milvus.upsertDocument(nextDoc)
   await milvus.flush([milvus.getCollections().doc])
   documents.set(docId, nextDoc)
   log.info(`[vectorStore] 文档 ${docId} 入库核实通过：${persisted} 块已落库`)
 }
 
-export async function updateContentWithPrepared(id, newContent = '', chunkList = [], vectors = [], opts = {}) {
+export async function updateContentWithPrepared(
+  id,
+  newContent = '',
+  chunkList = [],
+  vectors = [],
+  opts = {},
+) {
   await whenLoaded()
   const doc = documents.get(id)
   if (!doc) return null
-  const next = { ...doc, content: newContent, size: newContent.length, status: 'pending' }
+  const next = {
+    ...doc,
+    content: newContent,
+    size: newContent.length,
+    status: 'pending',
+  }
   await milvus.upsertDocument(next)
   documents.set(id, next)
   _hashRemove(doc.content, id)
@@ -446,7 +503,7 @@ export async function updateContent(id, newContent = '', embedFn, chunkFn) {
   const doc = documents.get(id)
   if (!doc) return null
   const splitRes = await chunkFn(newContent)
-  const list = Array.isArray(splitRes) ? splitRes : splitRes?.chunks ?? []
+  const list = Array.isArray(splitRes) ? splitRes : (splitRes?.chunks ?? [])
   const texts = list.map((c) => c.text ?? '')
   const vectors = texts.length ? await embedFn(texts) : []
   return updateContentWithPrepared(id, newContent, list, vectors)
@@ -512,7 +569,8 @@ export async function search(queryVector, opts = {}) {
       category: h.category ?? '',
       tags: h.tags ?? [],
       heading: h.heading ?? '',
-      displayTitle: h.displayTitle || (doc?.title ? `${doc.title} § ${h.idx ?? 1}` : ''),
+      displayTitle:
+        h.displayTitle || (doc?.title ? `${doc.title} § ${h.idx ?? 1}` : ''),
       topic: h.topic ?? '',
       questions: h.questions ?? [],
       preContext: h.preContext ?? '',

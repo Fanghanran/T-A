@@ -1,10 +1,6 @@
 import * as React from 'react'
 import { useChat } from 'ai/react'
-import {
-  appendChatAnnotation,
-  clearAnnotationsForChat,
-  finalizePending,
-} from '@/lib/runtimeAnnotations'
+import { appendChatAnnotation, finalizePending } from '@/lib/runtimeAnnotations'
 import {
   MAX_CONCURRENT_STREAMS,
   tryAcquireStream,
@@ -75,7 +71,9 @@ export function useChatWithAnnotations(options) {
 
       let resp
       try {
-        resp = userFetch ? await userFetch(input, init) : await fetch(input, init)
+        resp = userFetch
+          ? await userFetch(input, init)
+          : await fetch(input, init)
       } catch (err) {
         release()
         throw err
@@ -180,7 +178,6 @@ export function useChatWithAnnotations(options) {
 
     finalizePending(chatId, lastAssistant.id, assistantCount - 1)
     // chatId / messages 变化时都应该再判断一次
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatId, messages, isLoading])
 
   // 一轮对话完全结束（isLoading → false）：复位开关，下一轮回复可继续写 annotation。

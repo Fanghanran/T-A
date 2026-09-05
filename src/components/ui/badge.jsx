@@ -1,4 +1,3 @@
-import * as React from 'react'
 import { cva } from 'class-variance-authority'
 import { cn } from '@/lib/utils'
 
@@ -8,12 +7,9 @@ const badgeVariants = cva(
   {
     variants: {
       variant: {
-        default:
-          'border-transparent bg-primary/10 text-primary',
-        secondary:
-          'border-transparent bg-secondary text-secondary-foreground',
-        destructive:
-          'border-transparent bg-destructive/10 text-destructive',
+        default: 'border-transparent bg-primary/10 text-primary',
+        secondary: 'border-transparent bg-secondary text-secondary-foreground',
+        destructive: 'border-transparent bg-destructive/10 text-destructive',
         outline: 'border-border/70 text-muted-foreground',
       },
     },
