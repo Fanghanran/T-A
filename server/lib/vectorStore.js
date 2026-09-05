@@ -60,9 +60,15 @@ function _hashRemove(content, docId) {
  * @param {string} text 待检测的正文
  * @returns {string|null} 命中的 docId；无重复返回 null
  */
-export function findDocIdByContent(text) {
+export function findDocIdByContent(text, ownerId) {
+  if (!ownerId) throw new Error('findDocIdByContent 需要 ownerId（越权防护）')
   const s = contentHashes.get(sha256(String(text ?? '')))
-  return s && s.size > 0 ? [...s][0] : null
+  if (!s || s.size === 0) return null
+  // 内容哈希跨用户共享索引，但命中只算本 owner 的文档（不同用户传同一内容互不阻塞）
+  for (const docId of s) {
+    if (documents.get(docId)?.ownerId === ownerId) return docId
+  }
+  return null
 }
 
 let loaded = false
@@ -139,10 +145,13 @@ export async function createDocument({
   summary,
   content = '',
   source = 'upload',
+  ownerId,
 }) {
   await whenLoaded()
+  if (!ownerId) throw new Error('createDocument 需要 ownerId（越权防护）')
   const doc = {
     id: `doc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    ownerId,
     title: title ?? '',
     category: category ?? '',
     tags: Array.isArray(tags) ? tags : [],
@@ -169,8 +178,11 @@ function publicDoc(d) {
   return { ...rest }
 }
 
-export function getDocument(id) {
-  return publicDoc(documents.get(id))
+export function getDocument(id, ownerId) {
+  if (!ownerId) throw new Error('getDocument 需要 ownerId（越权防护）')
+  const d = documents.get(id)
+  // 归属他人 = 不存在（404 语义，不泄露存在性）
+  return d?.ownerId === ownerId ? publicDoc(d) : null
 }
 
 const SORTERS = {
@@ -192,8 +204,10 @@ export function listDocuments({
   tag,
   q,
   sort = 'uploadedAtDesc',
+  ownerId,
 } = {}) {
-  let list = [...documents.values()]
+  if (!ownerId) throw new Error('listDocuments 需要 ownerId（越权防护）')
+  let list = [...documents.values()].filter((d) => d.ownerId === ownerId)
   if (category) list = list.filter((d) => d.category === category)
   if (tag) list = list.filter((d) => (d.tags ?? []).includes(tag))
   if (q) {
@@ -221,10 +235,10 @@ export function patchMeta(id, patch = {}) {
 }
 
 /** patchMeta 的异步实现：改文档元数据的同时同步刷新其切片（修复历史不同步缺陷） */
-export async function patchMetaAsync(id, patch = {}) {
+export async function patchMetaAsync(id, patch = {}, ownerId) {
   await whenLoaded()
   const cur = documents.get(id)
-  if (!cur) return null
+  if (!cur || cur.ownerId !== ownerId) return null
   const next = { ...cur }
   for (const k of ['title', 'category', 'tags', 'source']) {
     if (patch[k] !== undefined) next[k] = patch[k]
@@ -236,21 +250,22 @@ export async function patchMetaAsync(id, patch = {}) {
     const n = await milvus.syncMetaToChunks(id, {
       category: next.category,
       tags: next.tags,
-    })
-    for (const ch of await milvus.listChunksOfDoc(id)) chunks.set(ch.id, ch)
+    }, ownerId)
+    for (const ch of await milvus.listChunksOfDoc(id, ownerId)) chunks.set(ch.id, ch)
     if (n) log.debug(`[vectorStore] 已同步 ${n} 个切片的分类/标签`)
   }
   documents.set(id, next)
   return publicDoc(next)
 }
 
-export async function deleteDocument(id) {
+export async function deleteDocument(id, ownerId) {
   await whenLoaded()
-  if (!documents.has(id)) return false
+  if (!ownerId) throw new Error('deleteDocument 需要 ownerId（越权防护）')
   const doc = documents.get(id)
+  if (!doc || doc.ownerId !== ownerId) return false
   // 先删切片再删文档：Milvus 侧任一步失败都会抛出，由调用方感知（不再静默留孤儿）
-  await milvus.deleteChunksOfDoc(id)
-  await milvus.deleteDoc(id)
+  await milvus.deleteChunksOfDoc(id, ownerId)
+  await milvus.deleteDoc(id, ownerId)
   for (const [cid, ch] of chunks) if (ch.docId === id) chunks.delete(cid)
   documents.delete(id)
   _hashRemove(doc?.content, id)
@@ -263,8 +278,11 @@ export async function deleteDocument(id) {
  * @param {string[]} ids chunk id 列表
  * @returns {{deleted:string[], failed:string[]}}
  */
-export async function deleteChunksByIds(ids) {
+export async function deleteChunksByIds(ids, ownerId) {
   await whenLoaded()
+  if (!ownerId) throw new Error('deleteChunksByIds 需要 ownerId（越权防护）')
+  // 只允许删除本 owner 的切片；他人/不存在的 id 计入 failed
+  ids = (ids ?? []).filter((id) => chunks.get(id)?.ownerId === ownerId)
   // 注意：Set 没有 .filter，先展开去重成数组再过滤（[...new Set(ids)].filter(...)）
   const all = [...new Set(ids ?? [])].filter((x) => typeof x === 'string' && x)
   const valid = all.filter((id) => chunks.has(id))
@@ -283,13 +301,14 @@ export async function deleteChunksByIds(ids) {
   }
 }
 
-export async function batchDelete(ids) {
+export async function batchDelete(ids, ownerId) {
   await whenLoaded()
+  if (!ownerId) throw new Error('batchDelete 需要 ownerId（越权防护）')
   const deleted = []
   const failed = []
   for (const id of ids ?? []) {
     try {
-      const ok = await deleteDocument(id)
+      const ok = await deleteDocument(id, ownerId)
       ok ? deleted.push(id) : failed.push(id)
     } catch (e) {
       log.warn({ err: e.message }, `[vectorStore] 删除文档失败 ${id}`)
@@ -309,11 +328,12 @@ export function batchPatchMeta(ids, opts = {}) {
 
 export async function batchPatchMetaAsync(ids, opts = {}) {
   await whenLoaded()
+  if (!opts.ownerId) throw new Error('batchPatchMetaAsync 需要 ownerId（越权防护）')
   const updated = []
   const failed = []
   for (const id of ids ?? []) {
     const cur = documents.get(id)
-    if (!cur) {
+    if (!cur || cur.ownerId !== opts.ownerId) {
       failed.push(id)
       continue
     }
@@ -326,7 +346,7 @@ export async function batchPatchMetaAsync(ids, opts = {}) {
     if (opts.setCategory !== undefined) patch.category = opts.setCategory
     patch.tags = tags
     try {
-      await patchMetaAsync(id, patch)
+      await patchMetaAsync(id, patch, opts.ownerId)
       updated.push(id)
     } catch (e) {
       log.warn({ err: e.message }, `[vectorStore] 批量改元数据失败 ${id}`)
@@ -338,7 +358,10 @@ export async function batchPatchMetaAsync(ids, opts = {}) {
 
 // ============ 切片 ============
 
-export function listChunksOf(docId) {
+export function listChunksOf(docId, ownerId) {
+  if (!ownerId) throw new Error('listChunksOf 需要 ownerId（越权防护）')
+  // 文档归属他人 → 视为无切片（404 语义，不泄露存在性）
+  if (documents.get(docId)?.ownerId !== ownerId) return []
   return [...chunks.values()]
     .filter((c) => c.docId === docId)
     .sort((a, b) => toNum(a.idx) - toNum(b.idx))
@@ -352,12 +375,13 @@ export function listChunksOf(docId) {
  * @returns {Promise<Array<{id:string, docId:string, idx:number, heading:string, text:string, vector:number[]}>>}
  */
 /** 强一致统计某文档已落库切片数（状态端点/孤儿检测用） */
-export async function countChunksOfDoc(docId) {
-  return milvus.countChunksOfDoc(docId)
+export async function countChunksOfDoc(docId, ownerId) {
+  return milvus.countChunksOfDoc(docId, ownerId)
 }
 
-export async function listChunkVectorsOfDoc(docId) {
+export async function listChunkVectorsOfDoc(docId, ownerId) {
   await whenLoaded()
+  if (documents.get(docId)?.ownerId !== ownerId) return []
   const all = await milvus.listAllChunkVectors()
   return all.filter((c) => c.docId === docId)
 }
@@ -397,7 +421,9 @@ export function listOrphanDocs() {
 export async function addChunks(docId, chunkList, vectors, opts = {}) {
   await whenLoaded()
   const doc = documents.get(docId)
-  if (!doc) throw new Error(`[vectorStore] 文档不存在：${docId}`)
+  if (!doc || doc.ownerId !== opts.ownerId) {
+    throw new Error(`[vectorStore] 文档不存在或无权写入切片：${docId}`)
+  }
   // 空切片不是「成功入库」：直接判错，绝不允许把 0 块的文档标成 indexed（正是孤儿成因之一）
   if (!chunkList?.length) {
     throw new Error(
@@ -415,6 +441,7 @@ export async function addChunks(docId, chunkList, vectors, opts = {}) {
     const qv = Array.isArray(questionVectors?.[i]) ? questionVectors[i] : tv
     return {
       id: `chk_${docId}_${i}_${Math.random().toString(36).slice(2, 8)}`,
+      ownerId: doc.ownerId,
       docId,
       idx: toNum(ch.idx, i),
       text: ch.text ?? '',
@@ -438,7 +465,7 @@ export async function addChunks(docId, chunkList, vectors, opts = {}) {
   await milvus.flush([milvus.getCollections().chunk])
 
   // 写完核实：强一致读回该文档切片数，必须 ≥ 本次写入数，否则视为持久化失败
-  const persisted = await milvus.countChunksOfDoc(docId)
+  const persisted = await milvus.countChunksOfDoc(docId, doc.ownerId)
   if (persisted < rows.length) {
     throw new Error(
       `[vectorStore] 文档 ${docId} 切片核实失败：期望 ≥${rows.length}，实际落库 ${persisted}，保持 pending 待重试`,
@@ -473,7 +500,7 @@ export async function updateContentWithPrepared(
 ) {
   await whenLoaded()
   const doc = documents.get(id)
-  if (!doc) return null
+  if (!doc || doc.ownerId !== opts.ownerId) return null
   const next = {
     ...doc,
     content: newContent,
@@ -485,7 +512,7 @@ export async function updateContentWithPrepared(
   _hashRemove(doc.content, id)
   _hashAdd(newContent, id)
 
-  await milvus.deleteChunksOfDoc(id)
+  await milvus.deleteChunksOfDoc(id, opts.ownerId)
   for (const [cid, ch] of chunks) if (ch.docId === id) chunks.delete(cid)
 
   if (chunkList.length) {
@@ -493,25 +520,45 @@ export async function updateContentWithPrepared(
       category: doc.category,
       tags: doc.tags,
       questionVectors: opts.questionVectors,
+      ownerId: opts.ownerId,
     })
   }
   return publicDoc(documents.get(id) ?? next)
 }
 
-export async function updateContent(id, newContent = '', embedFn, chunkFn) {
+export async function updateContent(id, newContent = '', embedFn, chunkFn, ownerId) {
   await whenLoaded()
   const doc = documents.get(id)
-  if (!doc) return null
+  if (!doc || doc.ownerId !== ownerId) return null
   const splitRes = await chunkFn(newContent)
   const list = Array.isArray(splitRes) ? splitRes : (splitRes?.chunks ?? [])
   const texts = list.map((c) => c.text ?? '')
   const vectors = texts.length ? await embedFn(texts) : []
-  return updateContentWithPrepared(id, newContent, list, vectors)
+  return updateContentWithPrepared(id, newContent, list, vectors, { ownerId })
 }
 
 // ============ 统计 ============
 
-export function statsByCategory() {
+export function statsByCategory(ownerId) {
+  if (!ownerId) throw new Error('statsByCategory 需要 ownerId（越权防护）')
+  const m = new Map()
+  for (const d of documents.values()) {
+    if (d.ownerId !== ownerId) continue
+    const k = d.category || '未分类'
+    if (!m.has(k)) m.set(k, { name: k, count: 0, chunks: 0 })
+    m.get(k).count += 1
+  }
+  for (const c of chunks.values()) {
+    if (c.ownerId !== ownerId) continue
+    const k = c.category || '未分类'
+    if (!m.has(k)) m.set(k, { name: k, count: 0, chunks: 0 })
+    m.get(k).chunks += 1
+  }
+  return [...m.values()].sort((a, b) => b.count - a.count)
+}
+
+/** 系统级分类统计（/api/health 遥测用，无 owner 过滤；不含内容数据） */
+export function statsByCategoryAll() {
   const m = new Map()
   for (const d of documents.values()) {
     const k = d.category || '未分类'
@@ -526,13 +573,15 @@ export function statsByCategory() {
   return [...m.values()].sort((a, b) => b.count - a.count)
 }
 
-export function listCategories() {
-  return statsByCategory().map(({ name, count }) => ({ name, count }))
+export function listCategories(ownerId) {
+  return statsByCategory(ownerId).map(({ name, count }) => ({ name, count }))
 }
 
-export function listTags() {
+export function listTags(ownerId) {
+  if (!ownerId) throw new Error('listTags 需要 ownerId（越权防护）')
   const m = new Map()
   for (const d of documents.values()) {
+    if (d.ownerId !== ownerId) continue
     for (const t of d.tags ?? []) m.set(t, (m.get(t) ?? 0) + 1)
   }
   return [...m.entries()]
@@ -553,8 +602,8 @@ export function listTags() {
  */
 export async function search(queryVector, opts = {}) {
   await whenLoaded()
-  const { topK = 5, category, tag, field = 'text' } = opts
-  const hits = await milvus.search(queryVector, { topK, category, tag, field })
+  const { topK = 5, category, tag, field = 'text', ownerId } = opts
+  const hits = await milvus.search(queryVector, { topK, category, tag, field, ownerId })
 
   // 补 title：Milvus 切片行不冗余文档标题，从内存缓存取
   return hits.map((h) => {

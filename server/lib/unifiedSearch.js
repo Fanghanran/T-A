@@ -32,14 +32,14 @@ const BOTH_HIT_BONUS = Number(process.env.BOTH_HIT_BONUS ?? 0.15)
  *   用「平均后小幅加成」而非累加，保证：① 双路命中一定不低于任一路单命中；
  *   ② 分数不会顶到 1.0 饱和（累加会让多条结果同分，排序失效）。
  */
-async function _searchOneQueryKB(query, { overK, topK }) {
+async function _searchOneQueryKB(query, { overK, topK, ownerId }) {
   if (typeof query !== 'string' || !query.trim()) return []
   const [qv] = await embedTexts([query])
   if (!qv || !qv.length) return []
 
   const [textHits, questionHits] = await Promise.all([
-    store.search(qv, { topK: overK, field: 'text' }).catch(() => []),
-    store.search(qv, { topK: overK, field: 'question' }).catch(() => []),
+    store.search(qv, { topK: overK, field: 'text', ownerId }).catch(() => []),
+    store.search(qv, { topK: overK, field: 'question', ownerId }).catch(() => []),
   ])
 
   const merged = new Map()
@@ -97,6 +97,8 @@ export async function unifiedSearch(opts = {}) {
   const history = Array.isArray(opts.history) ? opts.history : []
   // 并发闸门分片键（智能体 id），并行时保证各智能体公平占用改写并发（ADR-008）
   const caller = typeof opts.caller === 'string' && opts.caller.trim() ? opts.caller.trim() : ''
+  // M5a：检索按用户隔离（owner 过滤下推到 Milvus）
+  const ownerId = typeof opts.ownerId === 'string' && opts.ownerId ? opts.ownerId : ''
 
   const needQB = scope === 'all' || scope === 'question'
   const needKB = scope === 'all' || scope === 'knowledge'
@@ -152,7 +154,7 @@ export async function unifiedSearch(opts = {}) {
         const perQueryItemsArr = await Promise.all(
           queries.map(async (query, qi) => {
             try {
-              return await _searchOneQueryKB(query, { overK, topK })
+              return await _searchOneQueryKB(query, { overK, topK, ownerId })
             } catch (err) {
               if (err instanceof AppError) throw err // 能力不可用等结构性错误必须穿透提醒
               log.warn(`[unifiedSearch] KB query[${qi}] 检索失败：${err.message}，丢弃`)

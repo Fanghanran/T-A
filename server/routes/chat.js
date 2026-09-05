@@ -94,9 +94,9 @@ agentRegistry.registerAgent({
       let agentStream = null
       if (planOn && buildDocContext(agentDocId, agentText).resolveText().trim() && extractTaskIntents(query).length >= 2) {
         dbg(`[doc-processor] 复合任务 → 计划工作流（${DOC_PLAN_WORKFLOW_NAME}）`)
-        agentStream = await runDocPlanAgent({ query, docId: agentDocId, text: agentText, history, signal: ctx.signal })
+        agentStream = await runDocPlanAgent({ query, docId: agentDocId, text: agentText, history, signal: ctx.signal, ownerId: ctx.ownerId })
       } else if (reactOn) {
-        agentStream = await runDocAgent({ query, docId: agentDocId, text: agentText, history, signal: ctx.signal })
+        agentStream = await runDocAgent({ query, docId: agentDocId, text: agentText, history, signal: ctx.signal, ownerId: ctx.ownerId })
       }
       if (agentStream) {
         return pipeStream(res, agentStream, opts)
@@ -140,7 +140,7 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
     let sid = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : ''
     // 会话归属校验：sessionId 必须存在，且归属于同一 agentName（阻断跨智能体借用/劫持会话）
     if (sid) {
-      const meta = sessionStore.getSession(sid)
+      const meta = sessionStore.getSession(sid, req.principal.userId)
       const mismatch =
         !meta || (safeAgentName && meta.agentName && meta.agentName !== safeAgentName)
       if (mismatch) {
@@ -154,12 +154,12 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
       if (!safeAgentName) {
         return res.status(400).json({ message: 'sessionId 缺失时 agentName 必填' })
       }
-      const meta = sessionStore.createSession({ agentName: safeAgentName })
+      const meta = sessionStore.createSession({ agentName: safeAgentName, ownerId: req.principal.userId })
       sid = meta.id
       dbg(`[Chat] 新建会话 ${sid} (agent=${safeAgentName})`)
     }
 
-    if (query) sessionStore.appendMessage(sid, { role: 'user', content: query })
+    if (query) sessionStore.appendMessage(sid, { role: 'user', content: query }, req.principal.userId)
 
     // M4 并行：客户端断开（切走/停止按钮/关闭页面）→ abort 上游 LLM，
     // 防止僵尸流占满本地模型队列。正常结束后 writableEnded=true 不触发。
@@ -168,10 +168,11 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
       if (!res.writableEnded) upstreamAbort.abort()
     })
 
-    const history = sessionStore.getContextWindow(sid, { maxTurns: 6, maxChars: 6000 })
+    const history = sessionStore.getContextWindow(sid, { maxTurns: 6, maxChars: 6000 }, req.principal.userId)
     dbg(`[Chat] 会话 ${sid} 上下文窗口 ${history.length} 条 | agent=${safeAgentName || '(未知)'} | query: ${query.slice(0, 50)}...`)
 
-    // 流式结束回调
+    // 流式结束回调（闭包内使用当前主体 id）
+    const userId = req.principal.userId
     const onAssistantDone = (fullText, annotations) => {
       if (!fullText) return
       const hasAnnot = Array.isArray(annotations) && annotations.length > 0
@@ -181,10 +182,10 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
         ...(hasAnnot ? { annotations } : {}),
       }
       try {
-        sessionStore.appendMessage(sid, writeObj)
+        sessionStore.appendMessage(sid, writeObj, userId)
         // M2 会话记忆：回答成功落库后触发轮末处理（滚动摘要 + 事实提炼）。
         // 异步执行不阻塞响应；同一会话进行中自动去重；失败只 warn，游标不前进下轮重试。
-        onTurnEnd({ sessionId: sid, agentName: safeAgentName })
+        onTurnEnd({ sessionId: sid, agentName: safeAgentName, ownerId: userId })
       } catch (err) {
         log.error({ msg: err.message, stack: err.stack }, `[Chat] 会话 ${sid} 追加 assistant 消息失败`)
       }
@@ -192,7 +193,7 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
 
     // M2 会话记忆：dispatch 前召回（滚动摘要 + 长期事实）→ 注入 ctx.memoryBlock。
     // 召回异常已被 recallBlock 吞为 warn + 空串，记忆缺失不阻断对话主链路。
-    const memoryBlock = await recallBlock({ sessionId: sid, agentName: safeAgentName, query })
+    const memoryBlock = await recallBlock({ sessionId: sid, agentName: safeAgentName, query, ownerId: userId })
 
     // ---------- 通过 agentRegistry 分发 ----------
     const agentDef = agentRegistry.resolveAgent(safeAgentName)
@@ -209,6 +210,7 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
     const ctx = {
       query, history, techStack: techStackArr, sessionId: sid, onAssistantDone,
       agentId: agentDef.id, memoryBlock, signal: upstreamAbort.signal,
+      ownerId: req.principal.userId,
       req, res, pipeStream, dbg,
       // L5+ 依赖（仅 doc-processor 需要，按需传入不影响其他 agent）
       workflowRegistry: undefined, runDocAgent: undefined, runDocPlanAgent: undefined,

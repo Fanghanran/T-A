@@ -47,11 +47,11 @@ function factHash(scope, text) {
  * @param {{sessionId: string, agentName?: string, query?: string}} p
  * @returns {Promise<{summary: string, facts: Array<{text: string, scope: string, score: number}>}>}
  */
-export async function recall({ sessionId, agentName, query }) {
-  if (!sessionId) return { summary: '', facts: [] }
+export async function recall({ sessionId, agentName, query, ownerId }) {
+  if (!sessionId || !ownerId) return { summary: '', facts: [] }
   if (!tunables.memory?.enabled) return { summary: '', facts: [] }
 
-  const state = sessionStore.getMemoryState(sessionId)
+  const state = sessionStore.getMemoryState(sessionId, ownerId)
   const summary = state.summary || ''
 
   let facts = []
@@ -61,6 +61,7 @@ export async function recall({ sessionId, agentName, query }) {
       facts = await milvusStore.searchMemories(vec, {
         topK: tunables.memory.recallTopK,
         sessionId,
+        ownerId,
       })
     } catch (err) {
       // 显式降级：本轮不带事实记忆继续（对话主链路不依赖记忆），warn 留痕
@@ -103,11 +104,11 @@ export async function recallBlock({ sessionId, agentName, query }) {
  * 同一会话有进行中的处理时直接跳过；失败只 warn，游标不前进，下轮重试。
  * @param {{sessionId: string, agentName?: string}} p
  */
-export function onTurnEnd({ sessionId, agentName }) {
-  if (!sessionId) return
+export function onTurnEnd({ sessionId, agentName, ownerId }) {
+  if (!sessionId || !ownerId) return
   if (!tunables.memory?.enabled) return
   if (inFlight.has(sessionId)) return
-  const task = runTurnEnd({ sessionId, agentName })
+  const task = runTurnEnd({ sessionId, agentName, ownerId })
     .catch((err) => {
       log.warn(
         { details: err.message, stack: err.stack },
@@ -118,16 +119,17 @@ export function onTurnEnd({ sessionId, agentName }) {
   inFlight.set(sessionId, task)
 }
 
-async function runTurnEnd({ sessionId, agentName }) {
-  const msgs = sessionStore.getMessages(sessionId).map((m) => ({ ...m, seq: seqOf(m) }))
+async function runTurnEnd({ sessionId, agentName, ownerId }) {
+  const msgs = sessionStore.getMessages(sessionId, ownerId).map((m) => ({ ...m, seq: seqOf(m) }))
 
-  const summaryUntilSeq = await rollSummary({ sessionId, agentName, msgs })
+  const summaryUntilSeq = await rollSummary({ sessionId, agentName, msgs, ownerId })
   // 摘要滚动可能已写库，重读最新状态再提炼，避免游标互相覆盖
-  const state = sessionStore.getMemoryState(sessionId)
+  const state = sessionStore.getMemoryState(sessionId, ownerId)
   await extractFacts({
     sessionId,
     agentName,
     msgs,
+    ownerId,
     state: { ...state, summaryUntilSeq },
   })
 }
@@ -137,8 +139,8 @@ async function runTurnEnd({ sessionId, agentName }) {
  * 把「旧摘要 + 新增消息」压缩为新的滚动摘要并推进游标。
  * @returns {Promise<number>} 本次实际生效的摘要游标（未滚动则维持原值）
  */
-async function rollSummary({ sessionId, agentName, msgs }) {
-  const state = sessionStore.getMemoryState(sessionId)
+async function rollSummary({ sessionId, agentName, msgs, ownerId }) {
+  const state = sessionStore.getMemoryState(sessionId, ownerId)
   const every = Number(tunables.memory?.summaryEveryTurns) || 6
   const pending = msgs.filter((m) => m.seq > state.summaryUntilSeq)
   const pendingUserTurns = pending.filter((m) => m.role === 'user').length
@@ -152,7 +154,7 @@ async function rollSummary({ sessionId, agentName, msgs }) {
     role: MEMORY_ROLE,
     agentId: agentName || undefined,
   })
-  sessionStore.setMemoryState(sessionId, {
+  sessionStore.setMemoryState(sessionId, ownerId, {
     summary,
     summaryUntilSeq: lastSeq,
     extractUntilSeq: state.extractUntilSeq,
@@ -166,7 +168,7 @@ async function rollSummary({ sessionId, agentName, msgs }) {
  * 用 LLM 提炼事实 → content_hash 去重 → 向量化入库（scope=global 全局 / session 本会话）。
  * 游标只在事实成功持久化（或合法空结果）后推进。
  */
-async function extractFacts({ sessionId, agentName, msgs, state }) {
+async function extractFacts({ sessionId, agentName, msgs, ownerId, state }) {
   const every = Number(tunables.memory?.extractEveryTurns) || 4
   const maxFacts = Number(tunables.memory?.maxFactsPerExtract) || 5
   const pending = msgs.filter((m) => m.seq > state.extractUntilSeq)
@@ -188,7 +190,7 @@ async function extractFacts({ sessionId, agentName, msgs, state }) {
   })
   if (!facts.length) {
     // 合法空结果（没有值得记的内容）→ 只推进游标
-    sessionStore.setMemoryState(sessionId, {
+    sessionStore.setMemoryState(sessionId, ownerId, {
       summary: state.summary,
       summaryUntilSeq: state.summaryUntilSeq,
       extractUntilSeq: lastSeq,
@@ -211,6 +213,7 @@ async function extractFacts({ sessionId, agentName, msgs, state }) {
       // global 事实跨会话共享，不挂会话归属；session 事实只召回给本会话
       sessionId: f.scope === 'global' ? '' : sessionId,
       agentName: agentName ?? '',
+      ownerId,
       kind: 'fact',
       text: f.text,
       contentHash: f.contentHash,
@@ -223,7 +226,7 @@ async function extractFacts({ sessionId, agentName, msgs, state }) {
     log.info(`[memory] 会话 ${sessionId} 新增长期事实 ${fresh.length} 条（跳过重复 ${withHash.length - fresh.length} 条）`)
   }
 
-  sessionStore.setMemoryState(sessionId, {
+  sessionStore.setMemoryState(sessionId, ownerId, {
     summary: state.summary,
     summaryUntilSeq: state.summaryUntilSeq,
     extractUntilSeq: lastSeq,

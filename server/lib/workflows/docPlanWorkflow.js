@@ -52,8 +52,8 @@ function adjustSubtask(adj) {
  * @param {{ query:string, docId?:string, text?:string, history?:Array }} params
  * @returns {Promise<ReadableStream<Uint8Array>>} AI SDK data-stream 协议流
  */
-export async function runDocPlanAgent({ query, docId = '', text = '', history = [], signal }) {
-  const ctx = buildDocContext(docId, text)
+export async function runDocPlanAgent({ query, docId = '', text = '', history = [], signal, ownerId }) {
+  const ctx = buildDocContext(docId, text, ownerId)
   const intents = extractTaskIntents(query)
   return new ReadableStream({
     async start(controller) {

@@ -290,7 +290,7 @@ toolRegistry.register({
     vectors = deduped.vectors
     // 确保 doc 存在（粘贴文本等场景下还没有 doc）
     let docId = ctx.docId
-    if (!docId || !store.getDocument(docId)) {
+    if (!docId || !store.getDocument(docId, ctx.ownerId)) {
       const doc = await store.createDocument({
         title: `文档处理入库 ${new Date().toLocaleString('zh-CN')}`,
         category: '',
@@ -298,11 +298,12 @@ toolRegistry.register({
         size: Buffer.byteLength(text, 'utf8'),
         content: text,
         source: 'doc-processor-agent',
+        ownerId: ctx.ownerId,
       })
       docId = doc.id
       ctx.docId = docId
     }
-    await store.addChunks(docId, chunkList, vectors, { category: '', tags: [] })
+    await store.addChunks(docId, chunkList, vectors, { category: '', tags: [], ownerId: ctx.ownerId })
     clearCachedPreview(ctx.cacheKey)
     const totalChars = chunkList.reduce((s, c) => s + (typeof c.text === 'string' ? c.text.length : 0), 0)
     log.info(`[docTools] 入库 doc ${docId} | ${chunkList.length} 块 | ${totalChars} 字 | 去重跳过 批内${deduped.skippedWithin} 跨文档${deduped.skippedCross}`)

@@ -11,6 +11,16 @@
 
 import { request } from '@/lib/api'
 
+/** GET */
+function get(url) {
+  return request(url)
+}
+
+/** DELETE */
+function del(url) {
+  return request(url, { method: 'DELETE' })
+}
+
 /** JSON PATCH */
 function patchJson(url, body) {
   return request(url, {
@@ -33,6 +43,25 @@ function postJson(url, body) {
  * 总览：工具 + 工作流（含统计与启用状态）。
  * @returns {Promise<{ tools:{ items:Array, total:number, enabled:number, disabled:number }, workflows:{ items:Array, total:number, enabled:number, disabled:number } }>}
  */
+/** 用户管理（M5a / ADR-008）：列表 / 签发 / 吊销 */
+export function fetchUsers() {
+  return get('/users')
+}
+export function issueUser(userId, label) {
+  return postJson('/users', { userId, label })
+}
+export function revokeUser(userId) {
+  return del(`/users/${encodeURIComponent(userId)}`)
+}
+
+/** 存储 owner schema 状态与重建（M5a 迁移） */
+export function fetchOwnerSchema() {
+  return get('/storage/owner-schema')
+}
+export function ownerRebuild(dryRun = true) {
+  return postJson('/storage/owner-rebuild', { dryRun })
+}
+
 export function fetchOverview() {
   return request('/api/management/overview')
 }

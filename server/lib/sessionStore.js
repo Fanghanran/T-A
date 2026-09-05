@@ -157,6 +157,25 @@ if (db) {
     CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
     CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at);
   `)
+  // M5a（ADR-008）：幂等 schema 迁移。owner_id 过滤是越权防线，
+  // 存量数据一律归属 local 单一用户，disabled 模式下行为与历史完全一致。
+  db.exec(`CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+  )`)
+  const currentVersion = db.prepare('SELECT MAX(version) AS v FROM schema_version').get()?.v ?? 0
+  if (currentVersion < 1) {
+    const cols = db.pragma('table_info(sessions)').map((c) => c.name)
+    const tx = db.transaction(() => {
+      if (!cols.includes('owner_id')) {
+        db.exec("ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local'")
+        log.info('[sessionStore] schema v1：sessions 增加 owner_id（存量数据归属 local）')
+      }
+      db.prepare('INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES(1, ?)')
+        .run(new Date().toISOString())
+    })
+    tx()
+  }
 }
 
 const prepare = (sql) => db
@@ -189,6 +208,7 @@ const stmtListSessionsAll = prepare(`
          s.created_at AS createdAt, s.updated_at AS updatedAt,
          (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS messageCount
   FROM sessions s
+  WHERE s.owner_id = ?
   ORDER BY s.updated_at DESC
 `)
 const stmtListSessionsByAgent = prepare(`
@@ -196,27 +216,28 @@ const stmtListSessionsByAgent = prepare(`
          s.created_at AS createdAt, s.updated_at AS updatedAt,
          (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS messageCount
   FROM sessions s
-  WHERE s.agentName = ?
+  WHERE s.agentName = ? AND s.owner_id = ?
   ORDER BY s.updated_at DESC
 `)
-const stmtSessionExists = prepare('SELECT 1 FROM sessions WHERE id = ?')
+const stmtSessionExists = prepare('SELECT 1 FROM sessions WHERE id = ? AND owner_id = ?')
 const stmtGetSession = prepare(`
   SELECT s.id AS id, s.title AS title, s.agentName AS agentName,
          s.created_at AS createdAt, s.updated_at AS updatedAt,
          (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS messageCount
   FROM sessions s
-  WHERE s.id = ?
+  WHERE s.id = ? AND s.owner_id = ?
 `)
 const stmtGetMessages = prepare(`
   SELECT m.id AS id, m.role AS role, m.content AS content, m.created_at AS createdAt,
          a.data AS annotationsJson
   FROM messages m
+  JOIN sessions s ON s.id = m.session_id
   LEFT JOIN annotations a ON a.message_id = m.id
-  WHERE m.session_id = ?
+  WHERE m.session_id = ? AND s.owner_id = ?
   ORDER BY m.created_at ASC, m.rowid ASC
 `)
 const stmtInsertSession = prepare(
-  `INSERT INTO sessions(id, title, agentName, created_at, updated_at) VALUES(?, ?, ?, ?, ?)`,
+  `INSERT INTO sessions(id, title, agentName, owner_id, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)`,
 )
 const stmtInsertMessage = prepare(
   `INSERT INTO messages(id, session_id, role, content, created_at) VALUES(?, ?, ?, ?, ?)`,
@@ -225,12 +246,12 @@ const stmtInsertAnnotation = prepare(
   `INSERT INTO annotations(message_id, data) VALUES(?, ?)`,
 )
 const stmtUpdateSessionOnAppend = prepare(
-  `UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?`,
+  `UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND owner_id = ?`,
 )
 const stmtUpdateSessionTitle = prepare(
   `UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?`,
 )
-const stmtDeleteSession = prepare(`DELETE FROM sessions WHERE id = ?`)
+const stmtDeleteSession = prepare(`DELETE FROM sessions WHERE id = ? AND owner_id = ?`)
 
 // ============ 序号管理（meta 表存单调递增计数，等价于旧 index.json 的 sessSeq/msgSeq） ============
 function getSeq(name) {
@@ -270,6 +291,7 @@ function migrateFromJsonIfNeeded() {
           s.id,
           s.title ?? '',
           s.agentName ?? '',
+          'local',
           s.createdAt ?? new Date().toISOString(),
           s.updatedAt ?? new Date().toISOString(),
         )
@@ -348,19 +370,23 @@ export function flushSync() {
  * 列出会话（按 updatedAt 倒序，可选 agentName 过滤）
  * @param {{agentName?:string}} opts
  */
-export function listSessions({ agentName } = {}) {
-  const rows = agentName ? stmtListSessionsByAgent.all(agentName) : stmtListSessionsAll.all()
+export function listSessions({ agentName, ownerId } = {}) {
+  if (!ownerId) throw new Error('listSessions 需要 ownerId（越权防护）')
+  const rows = agentName
+    ? stmtListSessionsByAgent.all(agentName, ownerId)
+    : stmtListSessionsAll.all(ownerId)
   return rows.map((r) => ({ ...r }))
 }
 
 /** 会话是否存在 */
-export function sessionExists(id) {
-  return !!stmtSessionExists.get(id)
+export function sessionExists(id, ownerId) {
+  return !!stmtSessionExists.get(id, ownerId)
 }
 
 /** 获取会话元数据（不存在返回 null） */
-export function getSession(id) {
-  const r = stmtGetSession.get(id)
+export function getSession(id, ownerId) {
+  if (!ownerId) throw new Error('getSession 需要 ownerId（越权防护）')
+  const r = stmtGetSession.get(id, ownerId)
   return r ? { ...r } : null
 }
 
@@ -384,8 +410,10 @@ const stmtUpsertMemoryState = prepare(`
  * @param {string} sessionId
  * @returns {{summary: string, summaryUntilSeq: number, extractUntilSeq: number}}
  */
-export function getMemoryState(sessionId) {
+export function getMemoryState(sessionId, ownerId) {
   if (!db) return { summary: '', summaryUntilSeq: 0, extractUntilSeq: 0 }
+  if (!ownerId) throw new Error('getMemoryState 需要 ownerId（越权防护）')
+  if (!getSession(sessionId, ownerId)) return { summary: '', summaryUntilSeq: 0, extractUntilSeq: 0 }
   try {
     const r = stmtGetMemoryState.get(sessionId)
     return r
@@ -400,14 +428,16 @@ export function getMemoryState(sessionId) {
 /**
  * 写入会话记忆游标状态（只读库会抛 SESSION_DB_READONLY，由调用方决定是否吞掉）。
  */
-export function setMemoryState(sessionId, { summary, summaryUntilSeq, extractUntilSeq } = {}) {
+export function setMemoryState(sessionId, ownerId, { summary, summaryUntilSeq, extractUntilSeq } = {}) {
   requireWritable()
+  if (!getSession(sessionId, ownerId)) throw new Error('会话不存在或无权访问')
   const now = new Date().toISOString()
   stmtUpsertMemoryState.run(sessionId, summary ?? '', summaryUntilSeq ?? 0, extractUntilSeq ?? 0, now)
 }
 
-export function getMessages(id) {
-  const rows = stmtGetMessages.all(id)
+export function getMessages(id, ownerId) {
+  if (!ownerId) throw new Error('getMessages 需要 ownerId（越权防护）')
+  const rows = stmtGetMessages.all(id, ownerId)
   return rows.map((r) => {
     const m = { id: r.id, role: r.role, content: r.content, createdAt: r.createdAt }
     if (r.annotationsJson != null && r.annotationsJson !== '') {
@@ -422,8 +452,9 @@ export function getMessages(id) {
  * @param {{agentName:string, title?:string}} opts
  * @returns {SessionMeta}
  */
-export function createSession({ agentName, title }) {
+export function createSession({ agentName, title, ownerId }) {
   requireWritable()
+  if (!ownerId) throw new Error('createSession 需要 ownerId（越权防护）')
   const id = `sess_${++sessSeq}`
   const now = new Date().toISOString()
   const safeTitle = typeof title === 'string' && title.trim()
@@ -438,7 +469,7 @@ export function createSession({ agentName, title }) {
     messageCount: 0,
   }
   const tx = db.transaction(() => {
-    stmtInsertSession.run(id, safeTitle, meta.agentName, now, now)
+    stmtInsertSession.run(id, safeTitle, meta.agentName, ownerId, now, now)
     setSeq('sess', sessSeq)
   })
   tx()
@@ -451,15 +482,16 @@ export function createSession({ agentName, title }) {
  * @param {string} newTitle
  * @returns {SessionMeta|null}
  */
-export function renameSession(id, newTitle) {
+export function renameSession(id, newTitle, ownerId) {
   requireWritable()
-  const existing = stmtGetSession.get(id)
+  if (!ownerId) throw new Error('renameSession 需要 ownerId（越权防护）')
+  const existing = stmtGetSession.get(id, ownerId)
   if (!existing) return null
   const safe = typeof newTitle === 'string' && newTitle.trim()
     ? newTitle.trim().slice(0, 100)
     : existing.title
   const now = new Date().toISOString()
-  stmtUpdateSessionTitle.run(safe, now, id)
+  stmtUpdateSessionTitle.run(safe, now, id, ownerId)
   return { ...existing, title: safe, updatedAt: now }
 }
 
@@ -469,9 +501,10 @@ export function renameSession(id, newTitle) {
  * @param {string} id
  * @returns {boolean}
  */
-export function deleteSession(id) {
+export function deleteSession(id, ownerId) {
   requireWritable()
-  const info = stmtDeleteSession.run(id)
+  if (!ownerId) throw new Error('deleteSession 需要 ownerId（越权防护）')
+  const info = stmtDeleteSession.run(id, ownerId)
   if (info.changes > 0) stmtDeleteMemoryState.run(id)
   return info.changes > 0
 }
@@ -483,9 +516,10 @@ export function deleteSession(id) {
  * @param {{role:'user'|'assistant'|'system', content:string, annotations?:any[]}} msg
  * @returns {{id:string, role:string, content:string, createdAt:string, annotations?:any[]}|null}
  */
-export function appendMessage(sessionId, msg) {
+export function appendMessage(sessionId, msg, ownerId) {
   requireWritable()
-  const meta = stmtGetSession.get(sessionId)
+  if (!ownerId) throw new Error('appendMessage 需要 ownerId（越权防护）')
+  const meta = stmtGetSession.get(sessionId, ownerId)
   if (!meta) return null
   const id = `msg_${++msgSeq}`
   const now = new Date().toISOString()
@@ -509,7 +543,7 @@ export function appendMessage(sessionId, msg) {
     if (row.annotations) {
       stmtInsertAnnotation.run(id, JSON.stringify(msg.annotations))
     }
-    stmtUpdateSessionOnAppend.run(newTitle, now, sessionId)
+    stmtUpdateSessionOnAppend.run(newTitle, now, sessionId, ownerId)
     setSeq('msg', msgSeq)
   })
   tx()
@@ -527,11 +561,12 @@ export function appendMessage(sessionId, msg) {
  * @param {{maxTurns?:number, maxChars?:number}} [opts]
  * @returns {Array<{role:'user'|'assistant', content:string}>}
  */
-export function getContextWindow(sessionId, opts = {}) {
+export function getContextWindow(sessionId, opts = {}, ownerId) {
+  if (!ownerId) throw new Error('getContextWindow 需要 ownerId（越权防护）')
   const maxTurns = Math.max(1, Number(opts.maxTurns) || 6)
   const maxChars = Math.max(500, Number(opts.maxChars) || 6000)
 
-  const rows = stmtGetMessages.all(sessionId)
+  const rows = stmtGetMessages.all(sessionId, ownerId)
   // 倒着找：最多 maxTurns 轮（= 最多 maxTurns*2 条消息）
   let userCount = 0
   let i = rows.length - 1

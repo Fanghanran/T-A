@@ -13,6 +13,7 @@ import { logger } from './lib/logger.js'
 import { errorHandler } from './lib/errors.js'
 import { requestTrace } from './lib/requestTrace.js'
 import { corsOptions, securityHeaders, adminAuth, rateLimiters } from './lib/security.js'
+import * as principal from './lib/principal.js'
 import {
   llmMode,
   embeddingMode,
@@ -77,8 +78,17 @@ app.use(express.json({ limit: '8mb' }))
 // Public health endpoint remains unauthenticated.
 
 // ── 路由挂载（顺序无关：各 Router 内部使用绝对路径）──
-app.use(healthRouter) // / 、/api/health
-// 会话接口默认开放（本地单机）；公开部署时设 PROTECT_SESSIONS=1 挂管理员认证
+app.use(healthRouter) // / 、/api/health（健康探针不要求用户主体）
+// M5a 用户主体守卫（ADR-008）：AUTH_MODE=disabled 时所有请求视为 local 单一用户（零回归）；
+// user-token 模式下除 health/management 外的 /api 路由必须携带有效用户令牌，跨用户数据互相不可见。
+// management 路由走 adminAuth（管理员令牌），不在此守卫范围内。
+app.use('/api', (req, res, next) => {
+  if (req.path.startsWith('/management')) return next()
+  if (principal.usersEnabled()) return principal.requireUser(req, res, next)
+  req.principal = { userId: principal.LOCAL_USER_ID }
+  next()
+})
+// 会话接口默认开放给已识别用户（本地单机）；公开部署时设 PROTECT_SESSIONS=1 追加管理员认证
 const protectSessions = /^(1|true|on|yes)$/i.test(String(process.env.PROTECT_SESSIONS || ''))
 app.use(...(protectSessions ? [adminAuth] : []), sessionsRouter) // /api/sessions/*
 app.use(interviewRouter) // /api/interview/*

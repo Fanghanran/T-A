@@ -64,10 +64,10 @@
 - 实现与设计差异（如相似度去重未做、独立 memory 角色未拆）见 ADR-007 状态节「实施记录」。
 **依赖**：摘要/提炼要调 LLM → 依赖 M1 的模型选择能力（给提炼/摘要配「快/便宜」模型）。
 
-### 3.3 多智能体并行 / 多用户 → M4 已实施（2026-09-05）/ M5 暂缓 [`adr/008-multi-agent-parallel-and-multiuser.md`](./adr/008-multi-agent-parallel-and-multiuser.md)
+### 3.3 多智能体并行 / 多用户 → M4 + M5a 已实施（2026-09-05）/ M5b 待开工 [`adr/008-multi-agent-parallel-and-multiuser.md`](./adr/008-multi-agent-parallel-and-multiuser.md)
 **两个不同问题**：
 - 多智能体并行：✅ 已实施——前端 `chatRegistry` 常驻多窗格（每智能体一个 ChatPage 实例，URL 决定焦点，后台窗格流式继续）+ `streamGate` 并发上界（3）+ 未读徽标/在途脉点；后端每流 `res.close`→abort 上游 LLM、chat 限流 per-(IP,agent)、rewrite 两级并发闸门（全局+单 caller 配额）。实施差异见 ADR-008 状态节。
-- 多用户：`principal`(userId/tenantId) 抽象（`disabled`=单一 local，零回归）+ `sessions` 加 `owner_id` + `schema_version` 幂等迁移 + Milvus 强制 owner 过滤 + 记忆/配额 per-user + 公平调度 + 审计带 userId。**注意**：现记忆 `scope:'global'` 在多用户下是越权点，须改为 per-user global。**维持暂缓**。
+- 多用户：✅ **M5a 已实施**——principal 抽象（disabled 零回归 / user-token）、schema_version 迁移、全部数据 owner_id + Milvus 强制过滤、27/27 隔离矩阵；记忆 scope:'global' 已按 owner 过滤（per-user 语义）。**M5b 待开工**：记忆存量数据的 per-user 归属迁移工具、per-user 配额、审计带 userId、管理页用量视图。实施记录见 ADR-008 状态节。
 **边界**：后端已按 sessionId 隔离、已加 sid↔agent 防串。多用户属**架构级、暂缓**（维持“不引入租户体系”决定，仅留设计与未来开工清单）。
 
 #### M5 开工方案（默认值已定，待明确开工指令后执行）
@@ -101,7 +101,8 @@ M0 工程地基 ─→ M0.5 落盘 ADR(006/007/008)
 | **M2 会话记忆** | ✅ 已完成（2026-09-05）：`memoryService`(L4) + `session_memory` 滚动摘要 + `kb_memory` 事实库（embed 走 M1 profile）+ ADR-009 失败语义 + `memory/stats`·`memory/clear` 端点 | 中 | **M1** |
 | **M3 残留债务** | ✅ 已完成（2026-09-05）：lint 警告 33→0、3 处 hook 豁免正式化、`GET /documents/:id/status` + API client、commit-journal 评估结论落盘 ADR-004 | 低 | 可与 M1/M2 并行 |
 | **M4 多智能体并行** | ✅ 已完成（2026-09-05）：前端 chatRegistry 常驻多窗格 + streamGate 上界(3) + 未读/脉点；后端每流 abort 上游 + 限流 per-(IP,agent) + 两级并发闸门 | 中高 | **M1** |
-| **M5 多用户/多实例** | principal 抽象 + owner_id + Milvus owner 过滤 + 共享限流/缓存失效/uploadJobs 外置/registry 外部化 + `PROTECT_SESSIONS` 默认开 | 高（安全关键，需专测） | M1 + M4；**条件性/暂缓** |
+| **M5a 核心隔离** | ✅ 已完成（2026-09-05）：principal 抽象 + user-token + owner_id 全量迁移/过滤 + 27/27 隔离矩阵；disabled 零回归 | 高（安全关键，需专测） | M1 + M4 |
+| **M5b** | 记忆存量 per-user 迁移工具、per-user 配额、审计带 userId、管理页用量视图 | 中 | M5a |
 
 ---
 
@@ -121,7 +122,8 @@ M0 工程地基 ─→ M0.5 落盘 ADR(006/007/008)
 - M2：✅ 已实测（2026-09-05）：两轮对话后摘要滚动 + 事实入库（跨会话 hash 去重生效）；新会话「你还记得我是谁吗」命中全部注入事实；`memory/stats`·`memory/clear` 可用；`check:all` 全绿。30+ 轮长会话回归与 stub 降级演练留待日常使用观察。
 - M3：✅ 已完成（2026-09-05）：lint 警告清零（0 errors 0 warnings）、3 处 eslint-disable 豁免全部以稳定依赖正式化、status 端点实测（强一致 chunkCount + orphan 检测 + 404）、commit-journal 评估结论（不采用 + 重新评估触发条件）落盘 ADR-004；`check:all` 全绿。
 - M4：✅ 已实测（2026-09-05）：双/三智能体并行流互不打断（后台完成答案完整）、切换不打断、未读徽标与在途脉点生效、第 4 路发送被上界拦截提示、客户端断开 → 服务端日志确认 abort 到达 LLM、限流 per-(IP,agent) 独立计数；`check:all` 全绿。
-- M5：越权/隔离专测（跨 user 读写 403）、公平调度、审计含 userId。
+- M5a：✅ 已实测（2026-09-05）：27/27 隔离矩阵（401/404/检索隔离/吊销即时生效）+ disabled 模式 check:all 零回归。跨用户访问按 404 语义（不泄露存在性），见 ADR-008。
+- M5b：待开工时登记。
 
 ---
 

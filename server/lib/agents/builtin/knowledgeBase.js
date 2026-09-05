@@ -19,7 +19,7 @@ export const knowledgeBaseAgent = {
   aliases: ['知识库'],
 
   async handler(ctx) {
-    const { query, history, res, sessionId, onAssistantDone, pipeStream, dbg, agentId, memoryBlock, signal } = ctx
+    const { query, history, res, sessionId, onAssistantDone, pipeStream, dbg, agentId, memoryBlock, signal, ownerId } = ctx
 
     dbg(`[RAG] 触发知识库检索 | 问题: ${query.slice(0, 50)}...`)
     const t0 = performance.now()
@@ -29,6 +29,7 @@ export const knowledgeBaseAgent = {
       topK: 5,
       history, // 透传历史上下文给 Query Rewriter
       caller: agentId,
+      ownerId,
     })
     const chunks = u.knowledgeResults?.items ?? []
     const searchMs = Math.round(performance.now() - t0)

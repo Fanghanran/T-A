@@ -2,7 +2,7 @@
 
 ## 状态
 
-**部分实施：M4 多智能体并行已实施（2026-09-05）；B 多用户（M5）维持暂缓**
+**部分实施：M4 多智能体并行（2026-09-05）+ M5a 核心隔离（2026-09-05）已实施；M5b（记忆 per-user 迁移/配额/审计）待开工**
 
 M4 实施记录（与设计稿的差异以本节为准）：
 - 前端：`chatRegistry`（React Context）为每个已打开智能体保留一个常驻 ChatPage 窗格，URL `/chat/:agentId` 是焦点的唯一来源；后台窗格 `display:none` 保持挂载（独立 useChat 实例 / AbortController / 会话列表 / techStack），流式继续、互不打断。设计稿的 `Map<agentId:sid>` 简化为**每智能体一个窗格**（会话粒度切换在窗格内部完成）；techStack 从全局状态改为实例级（切换不再重置）。
@@ -13,6 +13,16 @@ M4 实施记录（与设计稿的差异以本节为准）：
 - 限流：chat 限流 key 从 per-IP 细化为 per-(IP, agentName)。
 - 并发 gate：`ConcurrencyGate` 升级为两级（全局总量 + 单 caller 配额=全局一半），rewrite 链路以智能体 id 为 caller（unifiedSearch 新增 `caller` 参数）；embed/reindex 现无 gate（无需升级）。
 - 实测（2026-09-05，浏览器 + HTTP e2e）：双/三智能体并行流互不打断、后台完成正确计数未读、第 4 路发送被上界拦截并提示、客户端中途断开 → 服务端日志出现「上游流错误，提前收尾」（abort 信号到达 LLM）、两智能体限流各自独立计数（remaining 均 29）。
+
+### B. M5a 核心隔离实施记录（2026-09-05）
+
+- **principal 抽象**（`lib/principal.js` L0）：`AUTH_MODE=disabled`（默认，单一 local 用户，现状零回归）→ `user-token`（请求带 `Authorization: Bearer` / `x-user-token`，令牌只存 sha256，签发明文仅显示一次）→ jwt 留升级位。userId 白名单校验（字母数字下划线连字符），同时作为 Milvus 过滤表达式防注入。管理端点 `GET/POST/DELETE /api/management/users`（adminAuth 保护；user-token 模式下管理端强制要求 ADMIN_TOKEN）。
+- **SQLite 迁移**：`schema_version` 表 + 幂等 ALTER（`sessions.owner_id`，存量归 local，v1）；全部会话读写函数显式要求 ownerId（缺参即抛，无默认值——杜绝静默漏传），SQL 按 `owner_id` 过滤。
+- **Milvus**：三集合（kb_documents/kb_chunks/kb_memory）加 `owner_id` 标量 + INVERTED 索引；旧 schema 集合由 `ensureCollection` 容错跳过缺失索引，管理端 `POST /storage/owner-rebuild`（默认 dry-run）执行「备份→drop→重建→原行回插（owner=local，向量原样保留不重嵌）→flush→核实」，实测 3 文档/164 切片/12 记忆全量保留。user-token 模式下旧 schema 启动即 fail-fast。
+- **过滤覆盖清单**（漏一处即越权，逐项核对）：sessions CRUD/消息/上下文窗口/记忆游标 ✓；documents 列表/详情/状态/删除/编辑/批量操作/分类标签治理 ✓；chunks 列表/同步/删除/查重扫描与清理 ✓；向量检索（含多 query 改写后逐 query）✓；记忆召回/提炼去重（scope:'global' 已升级为 per-user global 语义，按 owner 过滤）✓；上传 prepare/commit 缓存与 job 按 owner 隔离 ✓；doc-processor（REST + ReAct 工具 CommitToStore）✓。系统级例外（admin 遥测，无内容泄露）：/api/health、启动对账、listMemories。
+- **跨用户访问语义**：返回 404（资源不存在）而非 403 —— 不泄露存在性；`/api/health` 保持开放（探针），management 保持 adminAuth。
+- **前端**：api 层自动附加用户令牌（localStorage），401 时广播 `auth:required` → 全局令牌输入对话框；管理页新增「用户管理」区（签发/吊销）。
+- **验收**（2026-09-05 实测）：27/27 隔离矩阵全绿（无令牌 401、跨用户会话/文档读写 404、检索内容隔离、吊销即时生效、管理端 ADMIN_TOKEN 保护）；disabled 模式 `check:all` 全绿零回归（检索/文档/健康全正常）。
 
 落地路线见 `docs/ROADMAP.md` §3.3 / §4：M4 多智能体并行（已完成）、M5 多用户/多实例（条件性、暂缓）。
 

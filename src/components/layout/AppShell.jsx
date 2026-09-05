@@ -14,6 +14,7 @@ import { Sidebar } from '@/components/layout/Sidebar'
 import { Header } from '@/components/layout/Header'
 import { Suspense } from 'react'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
+import { AuthTokenDialog } from '@/components/layout/AuthTokenDialog'
 
 const ChatPage = React.lazy(() => import('@/pages/ChatPage'))
 const KnowledgeBasePage = React.lazy(() => import('@/pages/KnowledgeBasePage'))
@@ -190,6 +191,7 @@ function AppShellInner() {
           status={viewLoading ? 'thinking' : 'online'}
           onOpenSidebar={() => setMobileSidebarOpen(true)}
         />
+        <AuthTokenDialog />
         <Suspense fallback={<RouteLoadingFallback />}>
           <Routes>
             <Route

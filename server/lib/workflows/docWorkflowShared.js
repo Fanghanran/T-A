@@ -74,18 +74,20 @@ export function buildHistoryBlock(history) {
  * @param {string} docId 文档 id（空串表示粘贴文本场景）
  * @param {string} text 请求体携带的粘贴文本
  */
-export function buildDocContext(docId = '', text = '') {
+export function buildDocContext(docId = '', text = '', ownerId = '') {
   const cacheKey = docId || '__ephemeral__'
   return {
     docId: docId || '',
+    ownerId,
     cacheKey,
     pastedText: typeof text === 'string' ? text : '',
     // 文档正文解析：优先预览缓存 → store.doc.content → 请求体 text
     resolveText() {
       if (this.docId) {
         const cached = getCachedPreview(this.docId)
+        if (cached?.ownerId && this.ownerId && cached.ownerId !== this.ownerId) return ''
         if (cached?.text) return cached.text
-        const doc = store.getDocument(this.docId)
+        const doc = store.getDocument(this.docId, this.ownerId)
         if (doc?.content) return doc.content
       }
       return this.pastedText

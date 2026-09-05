@@ -79,10 +79,11 @@ docProcessorRouter.post('/api/doc-processor/upload', rateLimiters.upload, upload
       size: req.file.buffer.length,
       content: text,
       source: 'doc-processor',
+      ownerId: req.principal.userId,
     })
 
     // 初始化预览缓存（文本 + 推荐策略，chunks 待 preview 填充）
-    setCachedPreview(doc.id, { text, chunks: null, strategy: features.suggestedStrategy, opts: { maxChars: features.maxChars } })
+    setCachedPreview(doc.id, { ownerId: req.principal.userId, text, chunks: null, strategy: features.suggestedStrategy, opts: { maxChars: features.maxChars } })
 
     dbg(`[doc-processor] 上传 ${originalName} → doc ${doc.id} | ${features.chars} 字 / ${features.paragraphs} 段 | format=${format} | 推荐 strategy=${features.suggestedStrategy}`)
 
@@ -105,10 +106,12 @@ docProcessorRouter.post('/api/doc-processor/upload', rateLimiters.upload, upload
 })
 
 /** 解析文档正文与预览缓存（preview/adjust/commit/export 共用） */
-function resolveDocContext(docId) {
+function resolveDocContext(docId, ownerId) {
   if (!docId || typeof docId !== 'string') return { error: 400, message: '缺少 docId' }
   const cached = getCachedPreview(docId)
-  const doc = store.getDocument(docId)
+  // 预览缓存按 owner 隔离：他人上传的文档解析不到缓存正文，getDocument 也会 404
+  const doc = store.getDocument(docId, ownerId)
+  if (cached && cached.ownerId !== ownerId) return { error: 404, message: '文档不存在或内容为空，请重新上传' }
   const text = cached?.text || doc?.content || ''
   if (!text.trim()) return { error: 404, message: '文档不存在或内容为空，请重新上传' }
   return { cached, doc, text }
@@ -118,12 +121,12 @@ function resolveDocContext(docId) {
 docProcessorRouter.post('/api/doc-processor/preview', async (req, res, next) => {
   try {
     const docId = String(req.body?.docId ?? '').trim()
-    const ctx = resolveDocContext(docId)
+    const ctx = resolveDocContext(docId, req.principal.userId)
     if (ctx.error) return res.status(ctx.error).json({ message: ctx.message })
     let chunks = ctx.cached?.chunks
     if (!chunks) {
       chunks = await previewChunks(ctx.text, { strategy: ctx.cached?.strategy, ...(ctx.cached?.opts || {}) })
-      setCachedPreview(docId, { text: ctx.text, chunks, strategy: ctx.cached?.strategy || 'semantic', opts: ctx.cached?.opts || {} })
+      setCachedPreview(docId, { ownerId: req.principal.userId, text: ctx.text, chunks, strategy: ctx.cached?.strategy || 'semantic', opts: ctx.cached?.opts || {} })
     }
     // 返回带评分的副本（启发式 + 语义混合评分）；缓存里仍存未评分切片
     const scored = await attachChunkScoresAsync(chunks)
@@ -140,7 +143,7 @@ docProcessorRouter.post('/api/doc-processor/adjust', async (req, res, next) => {
   try {
     const docId = String(req.body?.docId ?? '').trim()
     const instruction = String(req.body?.instruction ?? '').trim()
-    const ctx = resolveDocContext(docId)
+    const ctx = resolveDocContext(docId, req.principal.userId)
     if (ctx.error) return res.status(ctx.error).json({ message: ctx.message })
     const adj = parseAdjustmentInstruction(instruction)
     if (!adj) {
@@ -174,15 +177,15 @@ docProcessorRouter.post('/api/doc-processor/adjust', async (req, res, next) => {
  * 预览缓存优先（保留用户调整）→ 批内+跨文档去重 → 写入 Milvus → 清缓存。
  * @throws {Error & {status:number}} 业务错误（404 文档不存在 / 409 已入库）
  */
-async function commitDocToStore(docId) {
-  const ctx = resolveDocContext(docId)
+async function commitDocToStore(docId, ownerId) {
+  const ctx = resolveDocContext(docId, ownerId)
   if (ctx.error) {
     const e = new Error(ctx.message)
     e.status = ctx.error
     throw e
   }
   // 防重复入库：addChunks 是追加语义，重复点击会写入重复数据
-  if (store.listChunksOf(docId).length > 0) {
+  if (store.listChunksOf(docId, ownerId).length > 0) {
     const e = new Error('该文档已入库，请勿重复操作')
     e.status = 409
     throw e
@@ -205,7 +208,7 @@ async function commitDocToStore(docId) {
   const deduped = await dedupPreparedChunks(chunkList, vectors)
   chunkList = deduped.chunkList
   vectors = deduped.vectors
-  await store.addChunks(docId, chunkList, vectors, { category: ctx.doc?.category || '', tags: ctx.doc?.tags || [] })
+  await store.addChunks(docId, chunkList, vectors, { category: ctx.doc?.category || '', tags: ctx.doc?.tags || [], ownerId })
   clearCachedPreview(docId)
   const totalChars = chunkList.reduce((s, c) => s + (typeof c.text === 'string' ? c.text.length : 0), 0)
   const ms = Math.round(performance.now() - t0)
@@ -227,7 +230,7 @@ async function commitDocToStore(docId) {
 docProcessorRouter.post('/api/doc-processor/commit', async (req, res, next) => {
   try {
     const docId = String(req.body?.docId ?? '').trim()
-    res.json(await commitDocToStore(docId))
+    res.json(await commitDocToStore(docId, req.principal.userId))
   } catch (err) {
     if (err.status) return res.status(err.status).json({ message: err.message, docId: req.body?.docId })
     next(err)
@@ -242,7 +245,7 @@ docProcessorRouter.post('/api/doc-processor/commit-batch', async (req, res, next
     const results = []
     for (const docId of docIds) {
       try {
-        const r = await commitDocToStore(docId)
+        const r = await commitDocToStore(docId, req.principal.userId)
         results.push({ docId, ok: true, ...r })
       } catch (err) {
         results.push({ docId, ok: false, error: err.message || '入库失败', status: err.status || 500 })
@@ -260,12 +263,12 @@ docProcessorRouter.post('/api/doc-processor/commit-batch', async (req, res, next
 docProcessorRouter.post('/api/doc-processor/export', async (req, res, next) => {
   try {
     const docId = String(req.body?.docId ?? '').trim()
-    const ctx = resolveDocContext(docId)
+    const ctx = resolveDocContext(docId, req.principal.userId)
     if (ctx.error) return res.status(ctx.error).json({ message: ctx.message })
     let chunks = ctx.cached?.chunks
     if (!chunks) {
       chunks = await previewChunks(ctx.text, { strategy: ctx.cached?.strategy, ...(ctx.cached?.opts || {}) })
-      setCachedPreview(docId, { ...ctx.cached, text: ctx.text, chunks, strategy: ctx.cached?.strategy || 'semantic', opts: ctx.cached?.opts || {} })
+      setCachedPreview(docId, { ...ctx.cached, ownerId: req.principal.userId, text: ctx.text, chunks, strategy: ctx.cached?.strategy || 'semantic', opts: ctx.cached?.opts || {} })
     }
     const markdown = exportChunksAsMarkdown(chunks)
     const base = (ctx.doc?.title || '文档').replace(/\.[a-z0-9]+$/i, '')
@@ -317,13 +320,13 @@ docProcessorRouter.post('/api/doc-processor/templates/apply', async (req, res, n
   try {
     const docId = String(req.body?.docId ?? '').trim()
     const templateId = String(req.body?.templateId ?? '').trim()
-    const ctx = resolveDocContext(docId)
+    const ctx = resolveDocContext(docId, req.principal.userId)
     if (ctx.error) return res.status(ctx.error).json({ message: ctx.message })
     const tpl = (await listTemplates()).find((t) => t.id === templateId)
     if (!tpl) return res.status(404).json({ message: '模板不存在' })
     const opts = tpl.strategy === 'delimiter' ? { delimiter: tpl.delimiter, ...(tpl.maxChars ? { maxChars: tpl.maxChars } : {}) } : tpl.maxChars ? { maxChars: tpl.maxChars } : {}
     const chunks = await previewChunks(ctx.text, { strategy: tpl.strategy, ...opts })
-    setCachedPreview(docId, { text: ctx.text, chunks, strategy: tpl.strategy, opts })
+    setCachedPreview(docId, { ownerId: req.principal.userId, text: ctx.text, chunks, strategy: tpl.strategy, opts })
     const scored = await attachChunkScoresAsync(chunks)
     const totalChars = chunks.reduce((s, c) => s + (c.chars || 0), 0)
     dbg(`[doc-processor:rest] apply template "${tpl.name}" → doc ${docId} → ${chunks.length} 块 | ${scored.scoreMode}`)
@@ -353,13 +356,13 @@ docProcessorRouter.post('/api/doc-processor/templates/apply-batch', async (req, 
     const results = []
     for (const docId of docIds) {
       try {
-        const ctx = resolveDocContext(docId)
+        const ctx = resolveDocContext(docId, req.principal.userId)
         if (ctx.error) {
           results.push({ docId, ok: false, error: ctx.message, status: ctx.error })
           continue
         }
         const chunks = await previewChunks(ctx.text, { strategy: tpl.strategy, ...opts })
-        setCachedPreview(docId, { text: ctx.text, chunks, strategy: tpl.strategy, opts })
+        setCachedPreview(docId, { ownerId: req.principal.userId, text: ctx.text, chunks, strategy: tpl.strategy, opts })
         const scored = await attachChunkScoresAsync(chunks)
         results.push({
           docId,

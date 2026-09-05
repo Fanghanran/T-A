@@ -47,10 +47,14 @@ function brief(c) {
  * @param {number} [opts.maxPairs=200] 最多返回的重复对数（相似度降序）
  * @returns {Promise<{scanned:number,total:number,truncated:boolean,pairs:Array,pairTotal:number,ms:number}>}
  */
-export async function scanDuplicateChunks({ maxChunks = 800, maxPairs = 200 } = {}) {
+export async function scanDuplicateChunks({ maxChunks = 800, maxPairs = 200, ownerId } = {}) {
+  if (!ownerId) throw new Error('scanDuplicateChunks 需要 ownerId（越权防护）')
   const t0 = performance.now()
   const all = await milvus.listAllChunkVectors()
-  const list = all.filter((c) => Array.isArray(c.vector) && c.vector.length > 0)
+  // 查重范围按用户隔离（ADR-008）：只比对当前 owner 的切片
+  const list = all.filter(
+    (c) => c.ownerId === ownerId && Array.isArray(c.vector) && c.vector.length > 0,
+  )
   const truncated = list.length > maxChunks
   const scan = truncated ? list.slice(list.length - maxChunks) : list
 

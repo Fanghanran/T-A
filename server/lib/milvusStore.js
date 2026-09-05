@@ -1,5 +1,6 @@
 import { MilvusClient, DataType } from '@zilliz/milvus2-sdk-node'
 import { childLogger } from './logger.js'
+import { usersEnabled } from './principal.js'
 
 const log = childLogger('milvusStore')
 
@@ -12,6 +13,7 @@ const METRIC = 'COSINE'
 // VarChar 长度上限（Milvus 硬限制 65535）
 const LEN = {
   id: 128,
+  owner: 64,
   short: 64,
   title: 512,
   tags: 1024,
@@ -64,6 +66,7 @@ function parseJsonArr(s, fallback = []) {
 function docFields(d) {
   return [
     { name: 'doc_id', data_type: DataType.VarChar, max_length: LEN.id, is_primary_key: true },
+    { name: 'owner_id', data_type: DataType.VarChar, max_length: LEN.owner },
     { name: 'title_vector', data_type: DataType.FloatVector, dim: d },
     { name: 'title', data_type: DataType.VarChar, max_length: LEN.title },
     { name: 'category', data_type: DataType.VarChar, max_length: LEN.short },
@@ -82,6 +85,7 @@ function docFields(d) {
 function chunkFields(d) {
   return [
     { name: 'chunk_id', data_type: DataType.VarChar, max_length: LEN.id, is_primary_key: true },
+    { name: 'owner_id', data_type: DataType.VarChar, max_length: LEN.owner },
     { name: 'doc_id', data_type: DataType.VarChar, max_length: LEN.id },
     { name: 'idx', data_type: DataType.Int64 },
     { name: 'text', data_type: DataType.VarChar, max_length: LEN.text },
@@ -104,6 +108,7 @@ function chunkFields(d) {
 function memoryFields(d) {
   return [
     { name: 'mem_id', data_type: DataType.VarChar, max_length: LEN.id, is_primary_key: true },
+    { name: 'owner_id', data_type: DataType.VarChar, max_length: LEN.owner },
     { name: 'scope', data_type: DataType.VarChar, max_length: LEN.short },
     { name: 'session_id', data_type: DataType.VarChar, max_length: LEN.id },
     { name: 'agent_name', data_type: DataType.VarChar, max_length: LEN.short },
@@ -115,10 +120,19 @@ function memoryFields(d) {
   ]
 }
 
+async function describeFields(name) {
+  const desc = await getClient().describeCollection({ collection_name: name })
+  return new Set((desc?.schema?.fields ?? []).map((f) => f.name))
+}
+
 async function ensureCollection(name, fields, vectorFields, scalarIndexes) {
   const c = getClient()
   const { collection_names = [] } = await c.listCollections()
-  if (!collection_names.includes(name)) {
+  // 旧 schema（无 owner_id）的集合：跳过其不存在的标量索引，等待 owner 重建（M5a）
+  let existingFields = null
+  if (collection_names.includes(name)) {
+    existingFields = await describeFields(name)
+  } else {
     await c.createCollection({ collection_name: name, fields, enable_dynamic_field: false })
     log.info(`[milvus] 已创建集合 ${name}（dim=${dim}）`)
   }
@@ -133,6 +147,10 @@ async function ensureCollection(name, fields, vectorFields, scalarIndexes) {
     })
   }
   for (const f of scalarIndexes) {
+    if (existingFields && !existingFields.has(f)) {
+      log.warn(`[milvus] 集合 ${name} 缺少字段 ${f}（旧 schema），跳过其索引；请执行 owner 重建`)
+      continue
+    }
     await c.createIndex({ collection_name: name, field_name: f, index_type: 'INVERTED' }).catch((e) => {
       if (!/already exist/i.test(e.message)) throw e
     })
@@ -174,20 +192,28 @@ export async function init(embedFn) {
     if (collection_names.includes(CHUNK_COL)) await verifyDim(CHUNK_COL)
     if (collection_names.includes(MEM_COL)) await verifyDim(MEM_COL)
 
-    await ensureCollection(DOC_COL, docFields(dim), ['title_vector'], ['doc_id', 'category', 'status'])
+    await ensureCollection(DOC_COL, docFields(dim), ['title_vector'], ['doc_id', 'owner_id', 'category', 'status'])
     await ensureCollection(
       CHUNK_COL,
       chunkFields(dim),
       ['text_vector', 'question_vector'],
-      ['chunk_id', 'doc_id', 'category', 'status'],
+      ['chunk_id', 'owner_id', 'doc_id', 'category', 'status'],
     )
     // 记忆集合（ADR-007）：随知识库同维度初始化，换 embedding 模型同样需要重建
     await ensureCollection(
       MEM_COL,
       memoryFields(dim),
       ['text_vector'],
-      ['mem_id', 'scope', 'session_id', 'content_hash'],
+      ['mem_id', 'owner_id', 'scope', 'session_id', 'content_hash'],
     )
+    // M5a（ADR-008）：owner 过滤是越权防线。user-token 模式下旧 schema 不可服务（fail-fast），
+    // disabled 模式仅告警（数据仍归属 local，行为与历史一致）。
+    const ownerReady = await ownerSchemaStatus()
+    if (!ownerReady.ready) {
+      const msg = '[milvus] 集合缺少 owner_id 字段（旧 schema），需执行管理端 owner 重建后才能启用用户体系'
+      if (usersEnabled()) throw new Error(msg)
+      log.warn(msg)
+    }
     ready = true
     log.info(`[milvus] 就绪 ${ADDRESS} · ${DOC_COL} + ${CHUNK_COL} + ${MEM_COL} · dim=${dim}`)
     return { dim }
@@ -204,6 +230,7 @@ export async function init(embedFn) {
 export function rowToDoc(r) {
   return {
     id: r.doc_id,
+    ownerId: r.owner_id ?? 'local',
     title: r.title ?? '',
     category: r.category ?? '',
     tags: parseJsonArr(r.tags),
@@ -224,9 +251,15 @@ function zeroVec() {
   return new Array(dim).fill(0)
 }
 
+function requireOwnerId(ownerId, what) {
+  if (!ownerId) throw new Error(`[milvus] ${what} 缺少 ownerId（M5a 越权防护，禁止默认归属）`)
+  return ownerId
+}
+
 function docToRow(d) {
   return {
     doc_id: d.id,
+    owner_id: requireOwnerId(d.ownerId, '文档写入'),
     title_vector: [d.title_vector, d._titleVector].find(
       (v) => Array.isArray(v) && v.length === dim,
     ) ?? zeroVec(),
@@ -249,23 +282,25 @@ export async function insertDocument(doc) {
 }
 
 export async function upsertDocument(doc) {
+  // doc.ownerId 由调用方（vectorStore）线程化；删除旧行时同 id 可能不存在（首次 upsert）
   const c = getClient()
-  await c.delete({ collection_name: DOC_COL, filter: `doc_id == "${esc(doc.id)}"` })
+  await c.delete({ collection_name: DOC_COL, filter: `doc_id == "${esc(doc.id)}" && owner_id == "${esc(doc.ownerId)}"` })
   await insertDocument(doc)
 }
 
-export async function patchDocument(docId, patch) {
+export async function patchDocument(docId, patch, ownerId) {
   const c = getClient()
+  const own = `doc_id == "${esc(docId)}" && owner_id == "${esc(requireOwnerId(ownerId, '文档更新'))}"`
   const rows = await c.query({
     collection_name: DOC_COL,
-    filter: `doc_id == "${esc(docId)}"`,
+    filter: own,
     output_fields: ['doc_id'],
     limit: 1,
   })
   if (!rows?.data?.length) return null
   const [cur] = await c.query({
     collection_name: DOC_COL,
-    filter: `doc_id == "${esc(docId)}"`,
+    filter: own,
     output_fields: ['*'],
     limit: 1,
   }).then((r) => (r?.data ?? []).map(rowToDoc))
@@ -275,8 +310,11 @@ export async function patchDocument(docId, patch) {
   return next
 }
 
-export async function deleteDoc(docId) {
-  await getClient().delete({ collection_name: DOC_COL, filter: `doc_id == "${esc(docId)}"` })
+export async function deleteDoc(docId, ownerId) {
+  await getClient().delete({
+    collection_name: DOC_COL,
+    filter: `doc_id == "${esc(docId)}" && owner_id == "${esc(requireOwnerId(ownerId, '文档删除'))}"`,
+  })
 }
 
 export async function listAllDocuments() {
@@ -295,6 +333,7 @@ export async function listAllDocuments() {
 export function rowToChunk(r) {
   return {
     id: r.chunk_id,
+    ownerId: r.owner_id ?? 'local',
     docId: r.doc_id,
     idx: Number(r.idx ?? 0),
     text: r.text ?? '',
@@ -314,6 +353,7 @@ export function rowToChunk(r) {
 function chunkToRow(ch) {
   return {
     chunk_id: ch.id,
+    owner_id: requireOwnerId(ch.ownerId, '切片写入'),
     doc_id: ch.docId,
     idx: Number(ch.idx ?? 0),
     text: ch.text ?? '',
@@ -357,10 +397,10 @@ export async function flush(collections = [DOC_COL, CHUNK_COL, MEM_COL]) {
  * 按 docId 强一致统计切片数（用于写入后核实与孤儿检测）。
  * consistency_level Strong：读取一定包含此前已提交的写入，能真实反映是否落库。
  */
-export async function countChunksOfDoc(docId) {
+export async function countChunksOfDoc(docId, ownerId) {
   const r = await getClient().query({
     collection_name: CHUNK_COL,
-    filter: `doc_id == "${esc(docId)}"`,
+    filter: `doc_id == "${esc(docId)}" && owner_id == "${esc(requireOwnerId(ownerId, '切片计数'))}"`,
     output_fields: ['chunk_id'],
     limit: 16384,
     consistency_level: 'Strong',
@@ -368,15 +408,21 @@ export async function countChunksOfDoc(docId) {
   return (r?.data ?? []).length
 }
 
-/** 按文档整体替换切片：先删后插，保证幂等 */
-export async function replaceChunksOfDoc(docId, chunks) {
+/** 按文档整体替换切片：先删后插，保证幂等（owner 隔离） */
+export async function replaceChunksOfDoc(docId, chunks, ownerId) {
   const c = getClient()
-  await c.delete({ collection_name: CHUNK_COL, filter: `doc_id == "${esc(docId)}"` })
+  await c.delete({
+    collection_name: CHUNK_COL,
+    filter: `doc_id == "${esc(docId)}" && owner_id == "${esc(requireOwnerId(ownerId, '切片替换'))}"`,
+  })
   await insertChunks(chunks)
 }
 
-export async function deleteChunksOfDoc(docId) {
-  await getClient().delete({ collection_name: CHUNK_COL, filter: `doc_id == "${esc(docId)}"` })
+export async function deleteChunksOfDoc(docId, ownerId) {
+  await getClient().delete({
+    collection_name: CHUNK_COL,
+    filter: `doc_id == "${esc(docId)}" && owner_id == "${esc(requireOwnerId(ownerId, '切片删除'))}"`,
+  })
 }
 
 export async function deleteChunksById(ids) {
@@ -412,11 +458,12 @@ export async function listAllChunkVectors() {
   const r = await c.query({
     collection_name: CHUNK_COL,
     filter: 'chunk_id != ""',
-    output_fields: ['chunk_id', 'doc_id', 'idx', 'text', 'heading', 'text_vector'],
+    output_fields: ['chunk_id', 'owner_id', 'doc_id', 'idx', 'text', 'heading', 'text_vector'],
     limit: 16384,
   })
   return (r?.data ?? []).map((row) => ({
     id: row.chunk_id,
+    ownerId: row.owner_id ?? 'local',
     docId: row.doc_id,
     idx: Number(row.idx ?? 0),
     text: row.text ?? '',
@@ -425,11 +472,11 @@ export async function listAllChunkVectors() {
   }))
 }
 
-export async function listChunksOfDoc(docId) {
+export async function listChunksOfDoc(docId, ownerId) {
   const c = getClient()
   const r = await c.query({
     collection_name: CHUNK_COL,
-    filter: `doc_id == "${esc(docId)}"`,
+    filter: `doc_id == "${esc(docId)}" && owner_id == "${esc(requireOwnerId(ownerId, '切片列表'))}"`,
     output_fields: [
       'chunk_id', 'doc_id', 'idx', 'text', 'heading', 'topic', 'questions',
       'display_title', 'pre_context', 'post_context', 'category', 'tags', 'status', 'indexed_at',
@@ -451,11 +498,11 @@ const CHUNK_ALL_FIELDS = [
  * 修复历史缺陷：patchMeta 改 category/tags 时不同步切片，导致「改完分类后按新分类检索不到」。
  * 注意 Milvus 无原地 update —— 必须连同向量一起取回，再整批删插。
  */
-export async function syncMetaToChunks(docId, { category, tags }) {
+export async function syncMetaToChunks(docId, { category, tags }, ownerId) {
   const c = getClient()
   const r = await c.query({
     collection_name: CHUNK_COL,
-    filter: `doc_id == "${esc(docId)}"`,
+    filter: `doc_id == "${esc(docId)}" && owner_id == "${esc(requireOwnerId(ownerId, '切片元数据同步'))}"`,
     output_fields: CHUNK_ALL_FIELDS,
     limit: 4096,
     consistency_level: 'Strong',
@@ -481,18 +528,19 @@ export async function syncMetaToChunks(docId, { category, tags }) {
 
 // ============ 检索 ============
 
-function buildFilter(category, tag) {
-  const parts = []
+function buildFilter(category, tag, ownerId) {
+  // owner 过滤是第一道条件（越权防线），业务过滤叠加其上
+  const parts = [`owner_id == "${esc(requireOwnerId(ownerId, '向量检索'))}"`]
   if (category) parts.push(`category == "${esc(category)}"`)
   if (tag) parts.push(`tags like "%${esc(tag)}%"`)
-  return parts.length ? parts.join(' && ') : undefined
+  return parts.join(' && ')
 }
 
 /**
  * 向量检索。
  * @param {'text'|'question'} field 检索哪个向量字段
  */
-export async function search(vector, { topK = 5, category, tag, field = 'text' } = {}) {
+export async function search(vector, { topK = 5, category, tag, field = 'text', ownerId } = {}) {
   const c = getClient()
   const anns_field = field === 'question' ? 'question_vector' : 'text_vector'
   const r = await c.search({
@@ -502,7 +550,7 @@ export async function search(vector, { topK = 5, category, tag, field = 'text' }
     limit: Math.max(1, topK),
     // Strong：保证刚写入的切片立即可检索（RAG 场景「上传完马上问」是常态）
     consistency_level: 'Strong',
-    filter: buildFilter(category, tag),
+    filter: buildFilter(category, tag, ownerId),
     output_fields: [
       'chunk_id', 'doc_id', 'idx', 'text', 'heading', 'topic', 'questions',
       'display_title', 'pre_context', 'post_context', 'category', 'tags',
@@ -604,6 +652,7 @@ export async function dropAll() {
 function memToRow(m) {
   return {
     mem_id: m.id,
+    owner_id: requireOwnerId(m.ownerId, '记忆写入'),
     scope: m.scope ?? 'global',
     session_id: m.sessionId ?? '',
     agent_name: (m.agentName ?? '').slice(0, LEN.short - 1),
@@ -635,11 +684,13 @@ export async function insertMemories(items) {
  * @param {number[]} vector 查询向量
  * @param {{topK?: number, sessionId?: string}} opts
  */
-export async function searchMemories(vector, { topK = 4, sessionId } = {}) {
+export async function searchMemories(vector, { topK = 4, sessionId, ownerId } = {}) {
   const c = getClient()
-  const filter = sessionId
+  // owner 过滤在最外层：记忆事实按用户隔离（ADR-008，global 也是 per-user 语义）
+  const scopeFilter = sessionId
     ? `(scope == "global" || session_id == "${esc(sessionId)}")`
     : 'scope == "global"'
+  const filter = `owner_id == "${esc(requireOwnerId(ownerId, '记忆检索'))}" && ${scopeFilter}`
   const r = await c.search({
     collection_name: MEM_COL,
     data: [vector],
@@ -666,14 +717,27 @@ export async function searchMemories(vector, { topK = 4, sessionId } = {}) {
   return out
 }
 
-/**
- * 强一致统计记忆条数。
- * @param {string} [filter] 附加过滤表达式（如 scope == "global"），缺省统计全部
- */
-export async function countMemories(filter) {
+/** 系统级记忆总数（管理端遥测用，无 owner 维度；仅 admin 端点调用） */
+export async function countMemoriesAll() {
   const r = await getClient().query({
     collection_name: MEM_COL,
-    filter: filter ? `mem_id != "" && (${filter})` : 'mem_id != ""',
+    filter: 'mem_id != ""',
+    output_fields: ['mem_id'],
+    limit: 16384,
+    consistency_level: 'Strong',
+  })
+  return (r?.data ?? []).length
+}
+
+/**
+ * 强一致统计记忆条数（按 owner 隔离）。
+ * @param {string} [filter] 附加过滤表达式（如 scope == "global"）
+ */
+export async function countMemories(filter, ownerId) {
+  const own = `mem_id != "" && owner_id == "${esc(requireOwnerId(ownerId, '记忆统计'))}"`
+  const r = await getClient().query({
+    collection_name: MEM_COL,
+    filter: filter ? `${own} && (${filter})` : own,
     output_fields: ['mem_id'],
     limit: 16384,
     consistency_level: 'Strong',
@@ -684,6 +748,68 @@ export async function countMemories(filter) {
 /** 按过滤表达式删除记忆（管理页清空用） */
 export async function deleteMemoriesByFilter(filter) {
   await getClient().delete({ collection_name: MEM_COL, filter })
+}
+
+/**
+ * owner 字段就绪状态（M5a 迁移判定）。ready=false 表示集合仍为旧 schema，
+ * 用户体系（user-token）不可启用。
+ */
+export async function ownerSchemaStatus() {
+  const check = async (name) => {
+    try {
+      return (await describeFields(name)).has('owner_id')
+    } catch {
+      return false
+    }
+  }
+  const [doc, chunk, mem] = await Promise.all([check(DOC_COL), check(CHUNK_COL), check(MEM_COL)])
+  return { doc, chunk, mem, ready: doc && chunk && mem }
+}
+
+/**
+ * owner 重建（M5a）：备份→drop→按新 schema 重建→原行回插（owner 归 local）→flush→核实。
+ * 行内向量原样保留，不重新 embed；仅管理端点调用（管理员已认证）。
+ */
+export async function ownerRebuild({ dryRun = true } = {}) {
+  const status = await ownerSchemaStatus()
+  const targets = []
+  if (!status.doc) targets.push(DOC_COL)
+  if (!status.chunk) targets.push(CHUNK_COL)
+  if (!status.mem) targets.push(MEM_COL)
+  if (!targets.length) return { needed: false, dryRun: !!dryRun, rebuilt: [] }
+  if (dryRun) return { needed: true, dryRun: true, collections: targets }
+
+  const c = getClient()
+  const rebuilt = []
+  for (const name of targets) {
+    const pkFilter =
+      name === DOC_COL ? 'doc_id != ""' : name === CHUNK_COL ? 'chunk_id != ""' : 'mem_id != ""'
+    const allFields = name === CHUNK_COL ? CHUNK_ALL_FIELDS : ['*']
+    const raw = await c.query({
+      collection_name: name,
+      filter: pkFilter,
+      output_fields: allFields,
+      limit: 16384,
+      consistency_level: 'Strong',
+    })
+    const rows = (raw?.data ?? []).map((r) => ({ ...r, owner_id: 'local' }))
+    await c.dropCollection({ collection_name: name })
+    if (name === DOC_COL) {
+      await ensureCollection(name, docFields(dim), ['title_vector'], ['doc_id', 'owner_id', 'category', 'status'])
+    } else if (name === CHUNK_COL) {
+      await ensureCollection(name, chunkFields(dim), ['text_vector', 'question_vector'], ['chunk_id', 'owner_id', 'doc_id', 'category', 'status'])
+    } else {
+      await ensureCollection(name, memoryFields(dim), ['text_vector'], ['mem_id', 'owner_id', 'scope', 'session_id', 'content_hash'])
+    }
+    const BATCH = 64
+    for (let i = 0; i < rows.length; i += BATCH) {
+      await c.insert({ collection_name: name, data: rows.slice(i, i + BATCH) })
+    }
+    await c.flush({ collection_names: [name] })
+    rebuilt.push({ collection: name, rows: rows.length })
+    log.warn(`[milvus] owner 重建完成：${name}（${rows.length} 行，owner=local）`)
+  }
+  return { needed: true, dryRun: false, rebuilt }
 }
 
 /** 列出记忆（管理页展示 / 按 content_hash 查重用，强一致） */

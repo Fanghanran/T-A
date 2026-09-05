@@ -9,7 +9,11 @@ function positiveInt(value, fallback) {
 
 export function authMode() {
   const configured = String(process.env.AUTH_MODE || '').trim().toLowerCase()
-  if (configured === 'disabled' || configured === 'token') return configured
+  if (configured === 'disabled') return 'disabled'
+  // user-token 档：数据路由按用户令牌隔离（principal.js），管理路由仍要求 ADMIN_TOKEN
+  if (configured === 'token' || configured === 'user-token') {
+    return process.env.ADMIN_TOKEN ? 'token' : 'disabled'
+  }
   return process.env.NODE_ENV === 'production' && process.env.ADMIN_TOKEN ? 'token' : 'disabled'
 }
 

@@ -63,7 +63,7 @@ healthRouter.get('/api/health', (_req, res) => {
     llm: llmMode,
     embedding: embeddingMode,
     ...store.stats(), // { documents, chunks }
-    knowledgeByCategory: store.statsByCategory(), // [{name, count, chunks}]
+    knowledgeByCategory: store.statsByCategoryAll(), // 系统级统计（无 owner 维度）
     // 一致性自检：status=indexed 但 0 切片的孤儿文档（可经 /api/knowledge/orphans 查、reindex 修复）
     orphanDocuments: orphans.length,
     orphans: orphans.map((o) => ({ id: o.id, title: o.title })),

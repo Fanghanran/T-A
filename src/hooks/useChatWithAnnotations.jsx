@@ -6,6 +6,7 @@ import {
   tryAcquireStream,
   releaseStream,
 } from '@/lib/streamGate'
+import { getUserToken } from '@/lib/api'
 import { child } from '@/lib/logger'
 
 const log = child('chat')
@@ -71,9 +72,13 @@ export function useChatWithAnnotations(options) {
 
       let resp
       try {
+        // 用户令牌（M5a）：useChat 不走 api.js 封装，此处手动附加
+        const headers = new Headers(init?.headers)
+        const token = getUserToken()
+        if (token && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`)
         resp = userFetch
-          ? await userFetch(input, init)
-          : await fetch(input, init)
+          ? await userFetch(input, { ...init, headers })
+          : await fetch(input, { ...init, headers })
       } catch (err) {
         release()
         throw err

@@ -19,6 +19,29 @@ export class AppError extends Error {
 let _requestCount = 0
 
 /**
+ * 用户令牌存取（M5a / ADR-008 user-token 档）：
+ * - AUTH_MODE=user-token 时后端要求 Authorization: Bearer <token>
+ * - token 由管理页签发，前端保存于 localStorage
+ * - 收到 401 时广播 auth:required 事件，由 AppShell 弹出令牌输入框
+ */
+const USER_TOKEN_KEY = 'userToken'
+export function getUserToken() {
+  try {
+    return localStorage.getItem(USER_TOKEN_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+export function setUserToken(token) {
+  try {
+    if (token) localStorage.setItem(USER_TOKEN_KEY, token)
+    else localStorage.removeItem(USER_TOKEN_KEY)
+  } catch {
+    /* 存储不可用时忽略 */
+  }
+}
+
+/**
  * 统一 fetch 封装：
  *  - 自动附加 x-request-id 头（与后端 requestTrace 对接，全链路可追溯）
  *  - 统一错误处理：解析错误体 → 抛 AppError → 触发全局错误边界
@@ -31,10 +54,12 @@ export async function request(url, options = {}) {
 
   log.debug(`#${id} ${options.method ?? 'GET'} ${url}`)
 
+  const token = getUserToken()
   const res = await fetch(url, {
     ...options,
     headers: {
       'x-request-id': requestId,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(options.headers ?? {}),
     },
   })
@@ -65,6 +90,10 @@ export async function request(url, options = {}) {
   if (!res.ok) {
     const message = data?.message ?? `请求失败 (${res.status})`
     log.error(`#${id} 失败 ${res.status}: ${message}`)
+    if (res.status === 401) {
+      // 令牌缺失/失效：通知 UI 弹出令牌输入
+      window.dispatchEvent(new CustomEvent('auth:required', { detail: { message } }))
+    }
     throw new AppError(message, {
       status: res.status,
       code: data?.code,

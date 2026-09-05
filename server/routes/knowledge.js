@@ -68,7 +68,7 @@ knowledgeRouter.post(
         return res.status(400).json({ message: '缺少 q（查询文本）' })
       }
       const t0 = performance.now()
-      const result = await unifiedSearch(req.body ?? {})
+      const result = await unifiedSearch({ ...req.body, ownerId: req.principal.userId })
       const searchMs = Math.round(performance.now() - t0)
       res.json({ searchMs, ...result })
     } catch (err) {
@@ -110,11 +110,12 @@ knowledgeRouter.post(
       const text = extracted.text
       const category = req.body.category || ''
       const tags = parseTags(req.body.tags)
+      const ownerId = req.principal.userId
 
-      // ② 整篇内容哈希秒断重复：同一文件重复上传不再走完整切片+embedding 链路
-      const dupId = store.findDocIdByContent(text)
+      // ② 整篇内容哈希秒断重复（按 owner 隔离）：同一文件重复上传不再走完整切片+embedding 链路
+      const dupId = store.findDocIdByContent(text, ownerId)
       if (dupId) {
-        const existed = store.getDocument(dupId)
+        const existed = store.getDocument(dupId, ownerId)
         return res.status(409).json({
           message: `内容与已有文档「${existed?.title ?? dupId}」重复，已取消入库`,
           duplicate: true,
@@ -174,8 +175,9 @@ knowledgeRouter.post(
         tags,
         size: req.file.buffer.length,
         content: text,
+        ownerId,
       })
-      await store.addChunks(doc.id, chunkList, vectors, { category, tags })
+      await store.addChunks(doc.id, chunkList, vectors, { category, tags, ownerId })
 
       res.status(201).json(doc)
     } catch (err) {
@@ -246,10 +248,10 @@ knowledgeRouter.post(
       }
       const text = extracted.text
 
-      // ② 哈希秒断：prepare 阶段就告知重复，用户不必走到 commit 才发现
-      const dupId = store.findDocIdByContent(text)
+      // ② 哈希秒断（按 owner 隔离）：prepare 阶段就告知重复，用户不必走到 commit 才发现
+      const dupId = store.findDocIdByContent(text, req.principal.userId)
       if (dupId) {
-        const existed = store.getDocument(dupId)
+        const existed = store.getDocument(dupId, req.principal.userId)
         return res.status(409).json({
           message: `内容与已有文档「${existed?.title ?? dupId}」重复`,
           duplicate: true,
@@ -311,6 +313,7 @@ knowledgeRouter.post(
       const previewId = `pv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
       uploadPreviews.set(previewId, {
         title: originalName,
+        ownerId: req.principal.userId,
         text,
         size: req.file.buffer.length,
         strategy: chunkStrategy,
@@ -364,12 +367,17 @@ knowledgeRouter.post(
           .status(410)
           .json({ message: '预览不存在或已过期（30 分钟），请重新上传' })
       }
+      // 预览归属校验：他人无法拿你的 previewId 提交入库
+      if (entry.ownerId !== req.principal.userId) {
+        return res.status(404).json({ message: '预览不存在或已过期（30 分钟），请重新上传' })
+      }
+      const ownerId = req.principal.userId
       uploadPreviews.delete(previewId) // 一次性使用，防重复提交
 
       // ② commit 前再查一次（多标签页可能同时 commit 同一内容）
-      const dupId = store.findDocIdByContent(entry.text)
+      const dupId = store.findDocIdByContent(entry.text, ownerId)
       if (dupId) {
-        const existed = store.getDocument(dupId)
+        const existed = store.getDocument(dupId, ownerId)
         return res.status(409).json({
           message: `内容与已有文档「${existed?.title ?? dupId}」重复，已取消入库`,
           duplicate: true,
@@ -382,6 +390,7 @@ knowledgeRouter.post(
           ? {
               id: `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
               title: entry.title,
+              ownerId,
               stage: 'chunking',
               chunkCount: null,
               doc: null,
@@ -415,10 +424,12 @@ knowledgeRouter.post(
           tags: parsedTags,
           size: entry.size,
           content: entry.text,
+          ownerId,
         })
         await store.addChunks(doc.id, chunkList, vectors, {
           category: safeCategory,
           tags: parsedTags,
+          ownerId,
         })
         if (job) {
           job.stage = 'done'
@@ -451,7 +462,10 @@ knowledgeRouter.post(
 knowledgeRouter.get('/api/knowledge/documents/jobs/:id', (req, res) => {
   _pruneJobs()
   const job = uploadJobs.get(req.params.id)
-  if (!job) return res.status(404).json({ message: '任务不存在或已完成清理' })
+  // job 按 owner 隔离：他人查询一律 404
+  if (!job || job.ownerId !== req.principal.userId) {
+    return res.status(404).json({ message: '任务不存在或已完成清理' })
+  }
   res.json(job)
 })
 
@@ -543,8 +557,8 @@ function chunkSigKey(docId, rawChunks) {
 }
 
 /** 列表页每文档的启发式均分：命中缓存则零计算，未命中用同步启发式并回填（不触发 embed）。 */
-function listAvgScoreOfDoc(docId) {
-  const raw = store.listChunksOf(docId)
+function listAvgScoreOfDoc(docId, ownerId) {
+  const raw = store.listChunksOf(docId, ownerId)
   const cacheKey = chunkSigKey(docId, raw)
   const hit = chunkScoreCache.get(cacheKey)
   if (hit?.avgScore !== undefined) return hit.avgScore
@@ -561,6 +575,7 @@ knowledgeRouter.get('/api/knowledge/documents', (req, res) => {
     tag,
     q,
     sort: typeof sort === 'string' ? sort : 'uploadedAtDesc',
+    ownerId: req.principal.userId,
   })
   const p = Math.max(1, Number(page) || 1)
   const ps = Math.max(1, Math.min(100, Number(pageSize) || 20))
@@ -568,14 +583,14 @@ knowledgeRouter.get('/api/knowledge/documents', (req, res) => {
   // 每文档附带启发式评分均分（走内容签名缓存，避免每次列表对全部切片重复纯 CPU 计算），供列表质量徽标
   const scoredItems = items.map((d) => ({
     ...d,
-    avgScore: listAvgScoreOfDoc(d.id),
+    avgScore: listAvgScoreOfDoc(d.id, d.ownerId),
   }))
   res.json({ items: scoredItems, total: all.length, page: p, pageSize: ps })
 })
 
 // ---------- 文档详情 ----------
 knowledgeRouter.get('/api/knowledge/documents/:id', (req, res) => {
-  const doc = store.getDocument(req.params.id)
+  const doc = store.getDocument(req.params.id, req.principal.userId)
   if (!doc) return res.status(404).json({ message: '文档不存在' })
   res.json(doc)
 })
@@ -587,9 +602,9 @@ knowledgeRouter.get(
   '/api/knowledge/documents/:id/status',
   async (req, res, next) => {
     try {
-      const doc = store.getDocument(req.params.id)
+      const doc = store.getDocument(req.params.id, req.principal.userId)
       if (!doc) return res.status(404).json({ message: '文档不存在' })
-      const chunkCount = await store.countChunksOfDoc(req.params.id)
+      const chunkCount = await store.countChunksOfDoc(req.params.id, req.principal.userId)
       res.json({
         id: doc.id,
         title: doc.title,
@@ -614,9 +629,9 @@ knowledgeRouter.get(
   '/api/knowledge/documents/:id/chunks',
   async (req, res, next) => {
     try {
-      const doc = store.getDocument(req.params.id)
+      const doc = store.getDocument(req.params.id, req.principal.userId)
       if (!doc) return res.status(404).json({ message: '文档不存在' })
-      const raw = store.listChunksOf(req.params.id)
+      const raw = store.listChunksOf(req.params.id, req.principal.userId)
       const cacheKey = chunkSigKey(req.params.id, raw)
       const cached = chunkScoreCache.get(cacheKey)
       if (cached && Array.isArray(cached.items)) return res.json(cached)
@@ -650,7 +665,7 @@ knowledgeRouter.get(
 
 // ---------- 删除文档 ----------
 knowledgeRouter.delete('/api/knowledge/documents/:id', async (req, res) => {
-  const existed = await store.deleteDocument(req.params.id)
+  const existed = await store.deleteDocument(req.params.id, req.principal.userId)
   if (!existed) return res.status(404).json({ message: '文档不存在' })
   res.status(204).end()
 })
@@ -665,7 +680,7 @@ knowledgeRouter.patch(
   async (req, res, next) => {
     try {
       const id = req.params.id
-      if (!store.getDocument(id))
+      if (!store.getDocument(id, req.principal.userId))
         return res.status(404).json({ message: '文档不存在' })
       const body = req.body ?? {}
       const { content, ...metaPatch } = body
@@ -708,7 +723,7 @@ knowledgeRouter.patch(
       let doc = null
       // 先改元数据（如果带）
       if (Object.keys(meta).length > 0) {
-        doc = await store.patchMetaAsync(id, meta)
+        doc = await store.patchMetaAsync(id, meta, req.principal.userId)
         if (!doc) return res.status(500).json({ message: '元数据保存失败' })
       }
       // 再改正文（如果带）— 阶段 1 新链路：预先算好 chunkList+vectors（含 topic/questions/pre/post 上下文）
@@ -721,7 +736,7 @@ knowledgeRouter.patch(
         // ⑥ 增量复用：正文未变的块沿用旧向量，只重嵌变化的块（改错别字不再全篇重嵌）
         let reuse = null
         try {
-          const oldVecs = await store.listChunkVectorsOfDoc(id)
+          const oldVecs = await store.listChunkVectorsOfDoc(id, req.principal.userId)
           if (oldVecs.length > 0) {
             reuse = new Map()
             for (const c of oldVecs) {
@@ -749,8 +764,9 @@ knowledgeRouter.patch(
           content,
           chunkList,
           vectors,
+          { ownerId: req.principal.userId },
         )
-        if (!doc) return res.status(500).json({ message: '正文更新失败' })
+        if (!doc) return res.status(404).json({ message: '文档不存在' })
       }
       // 两者都没带 → 400
       if (doc === null) {
@@ -785,7 +801,7 @@ knowledgeRouter.post(
   async (req, res, next) => {
     try {
       const { id } = req.params
-      const doc = store.getDocument(id)
+      const doc = store.getDocument(id, req.principal.userId)
       if (!doc) return res.status(404).json({ message: '文档不存在' })
       const content = doc.content ?? ''
       if (content.trim().length < 10) {
@@ -801,6 +817,7 @@ knowledgeRouter.post(
         content,
         chunkList,
         vectors,
+        { ownerId: req.principal.userId },
       )
       if (!updated) return res.status(500).json({ message: '重新入库失败' })
       dbg(`[reindex] 文档 ${id} 重切片入库完成：${chunkList.length} 块`)
@@ -829,17 +846,24 @@ knowledgeRouter.post(
       const results = []
       for (const o of orphans.slice(0, limit)) {
         try {
+          // 对账按调用者归属：他人文档跳过（管理端另有全量对账）
+          const ownDoc = store.getDocument(o.id, req.principal.userId)
+          if (!ownDoc) {
+            results.push({ id: o.id, ok: false, error: '无权访问' })
+            continue
+          }
           const { chunkList, vectors } = await prepareDocChunksAndVectors(
-            o.contentLen ? (store.getDocument(o.id)?.content ?? '') : '',
+            o.contentLen ? (ownDoc.content ?? '') : '',
             {
               withQuestions: chunkerConfig?.questionsPerChunk > 0,
             },
           )
           await store.updateContentWithPrepared(
             o.id,
-            store.getDocument(o.id)?.content ?? '',
+            ownDoc.content ?? '',
             chunkList,
             vectors,
+            { ownerId: req.principal.userId },
           )
           results.push({ id: o.id, ok: true, chunkCount: chunkList.length })
         } catch (e) {
@@ -874,7 +898,10 @@ knowledgeRouter.post(
       }
       switch (op) {
         case 'delete': {
-          const result = await store.batchDelete(safeIds)
+          // 批量删除按 owner 过滤：只删自己的文档（不存在/无权 → failed）
+          const ownedIds = safeIds.filter((id) => store.getDocument(id, req.principal.userId))
+          const result = await store.batchDelete(ownedIds, req.principal.userId)
+          for (const id of safeIds) if (!ownedIds.includes(id)) result.failed.push(id)
           return res.json({ op, ...result })
         }
         case 'setCategory': {
@@ -882,7 +909,9 @@ knowledgeRouter.post(
             typeof req.body.category === 'string'
               ? req.body.category.trim()
               : ''
-          const result = await store.batchPatchMetaAsync(safeIds, {
+          const ownedIds = safeIds.filter((id) => store.getDocument(id, req.principal.userId))
+          const result = await store.batchPatchMetaAsync(ownedIds, {
+            ownerId: req.principal.userId,
             setCategory: category,
           })
           return res.json({ op, ...result, category })
@@ -894,7 +923,9 @@ knowledgeRouter.post(
           if (tags.some((t) => typeof t !== 'string' || t.length > 20)) {
             return res.status(400).json({ message: '每个 tag 长度 ≤ 20 字符' })
           }
-          const result = await store.batchPatchMetaAsync(safeIds, {
+          const ownedIds = safeIds.filter((id) => store.getDocument(id, req.principal.userId))
+          const result = await store.batchPatchMetaAsync(ownedIds, {
+            ownerId: req.principal.userId,
             addTags: tags,
           })
           return res.json({ op, ...result })
@@ -903,7 +934,9 @@ knowledgeRouter.post(
           const tags = Array.isArray(req.body.tags) ? req.body.tags : []
           if (tags.length === 0)
             return res.status(400).json({ message: 'tags 必填' })
-          const result = await store.batchPatchMetaAsync(safeIds, {
+          const ownedIds = safeIds.filter((id) => store.getDocument(id, req.principal.userId))
+          const result = await store.batchPatchMetaAsync(ownedIds, {
+            ownerId: req.principal.userId,
             removeTags: tags,
           })
           return res.json({ op, ...result })
@@ -920,11 +953,11 @@ knowledgeRouter.post(
 )
 
 // ---------- 分类 / 标签 ----------
-knowledgeRouter.get('/api/knowledge/categories', (_req, res) =>
-  res.json(store.listCategories()),
+knowledgeRouter.get('/api/knowledge/categories', (req, res) =>
+  res.json(store.listCategories(req.principal.userId)),
 )
-knowledgeRouter.get('/api/knowledge/tags', (_req, res) =>
-  res.json(store.listTags()),
+knowledgeRouter.get('/api/knowledge/tags', (req, res) =>
+  res.json(store.listTags(req.principal.userId)),
 )
 
 // ---------- 分类治理：重命名（to='' 表示并入「未分类」）----------
@@ -940,9 +973,11 @@ knowledgeRouter.post(
         return res.status(400).json({ message: 'from 必填（原分类名）' })
       if (to.length > 50)
         return res.status(400).json({ message: 'to 长度 ≤ 50 字符' })
-      const affected = store.listDocuments({ category: from }).map((d) => d.id)
+      const affected = store
+        .listDocuments({ category: from, ownerId: req.principal.userId })
+        .map((d) => d.id)
       if (affected.length === 0) return res.json({ renamed: 0, affected: [] })
-      const r = await store.batchPatchMetaAsync(affected, { setCategory: to })
+      const r = await store.batchPatchMetaAsync(affected, { setCategory: to, ownerId: req.principal.userId })
       res.json({
         renamed: r.updated.length,
         affected: r.updated,
@@ -974,7 +1009,7 @@ knowledgeRouter.post(
       if (to.length > 20)
         return res.status(400).json({ message: 'to 长度 ≤ 20 字符' })
       const affected = store
-        .listDocuments()
+        .listDocuments({ ownerId: req.principal.userId })
         .filter((d) => (d.tags ?? []).some((t) => from.includes(t)))
         .map((d) => d.id)
       if (affected.length === 0) return res.json({ merged: 0, affected: [] })
@@ -982,6 +1017,7 @@ knowledgeRouter.post(
       const r = await store.batchPatchMetaAsync(affected, {
         removeTags: from,
         addTags: [to],
+        ownerId: req.principal.userId,
       })
       res.json({
         merged: r.updated.length,
@@ -1005,6 +1041,7 @@ knowledgeRouter.post(
       const n = Number(req.body?.maxChunks)
       const result = await scanDuplicateChunks({
         maxChunks: Number.isFinite(n) ? Math.max(50, Math.min(2000, n)) : 800,
+        ownerId: req.principal.userId,
       })
       res.json(result)
     } catch (err) {
@@ -1024,7 +1061,7 @@ knowledgeRouter.post(
         : []
       if (chunkIds.length === 0)
         return res.status(400).json({ message: '缺少 chunkIds（非空数组）' })
-      const r = await store.deleteChunksByIds(chunkIds)
+      const r = await store.deleteChunksByIds(chunkIds, req.principal.userId)
       res.json({ deleted: r.deleted.length, failed: r.failed })
     } catch (err) {
       next(err)
@@ -1073,6 +1110,7 @@ knowledgeRouter.post(
       const doc = await store.createDocument({
         title: title.trim(),
         category: safeCategory,
+        ownerId: req.principal.userId,
         tags: safeTags,
         size: Buffer.byteLength(content, 'utf8'),
         content,
@@ -1084,6 +1122,7 @@ knowledgeRouter.post(
       await store.addChunks(doc.id, chunkList, vectors, {
         category: safeCategory,
         tags: safeTags,
+        ownerId: req.principal.userId,
       })
       res.status(201).json(doc)
     } catch (err) {
@@ -1108,6 +1147,7 @@ knowledgeRouter.post(
         tag,
         topK: 5,
         history: Array.isArray(history) ? history : [],
+        ownerId: req.principal.userId,
       })
       const results = u.knowledgeResults?.items ?? []
       res.json({
@@ -1139,6 +1179,7 @@ knowledgeRouter.post(
         tag,
         topK: 5,
         history: Array.isArray(history) ? history : [],
+        ownerId: req.principal.userId,
       })
       const chunks = u.knowledgeResults?.items ?? []
       const searchMs = Math.round(performance.now() - t0)

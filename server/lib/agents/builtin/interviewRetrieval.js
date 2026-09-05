@@ -16,7 +16,7 @@ export const interviewRetrievalAgent = {
   aliases: ['面试题检索'],
 
   async handler(ctx) {
-    const { query, history, techStack, res, sessionId, onAssistantDone, pipeStream, dbg, agentId, memoryBlock, signal } = ctx
+    const { query, history, techStack, res, sessionId, onAssistantDone, pipeStream, dbg, agentId, memoryBlock, signal, ownerId } = ctx
     const LIMIT = 5
 
     dbg(`[面试检索] 触发统一检索 | query: ${query.slice(0, 50)}... | techStack: ${JSON.stringify(techStack)}`)
@@ -28,6 +28,7 @@ export const interviewRetrievalAgent = {
       topK: LIMIT,
       history, // Query Rewriter 用（KB 分支的多 query 改写）
       caller: agentId,
+      ownerId,
     })
     const searchMs = Math.round(performance.now() - t0)
 

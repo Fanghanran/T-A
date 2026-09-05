@@ -227,11 +227,33 @@ router.post('/models/test', async (req, res) => {
 import {
   isReady as milvusReady,
   getCollections,
-  countMemories,
+  countMemoriesAll,
   listMemories,
   deleteMemoriesByFilter,
+  ownerSchemaStatus,
+  ownerRebuild,
   flush,
 } from '../milvusStore.js'
+
+/** owner schema 状态与重建（M5a）：GET status / POST rebuild {dryRun?} */
+router.get('/storage/owner-schema', async (_req, res) => {
+  try {
+    res.json(await ownerSchemaStatus())
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+router.post('/storage/owner-rebuild', async (req, res) => {
+  try {
+    const dryRun = req.body?.dryRun !== false
+    const r = await ownerRebuild({ dryRun })
+    appendAudit('storage.ownerRebuild', { dryRun, result: r })
+    res.json(r)
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
 
 /** 记忆统计：GET /api/management/memory/stats（总数 + 按 scope + 最近条目） */
 router.get('/memory/stats', async (_req, res) => {
@@ -240,9 +262,9 @@ router.get('/memory/stats', async (_req, res) => {
   }
   try {
     const [total, global, session] = await Promise.all([
-      countMemories(),
-      countMemories('scope == "global"'),
-      countMemories('scope == "session"'),
+      countMemoriesAll(),
+      countMemoriesAll('scope == "global"'),
+      countMemoriesAll('scope == "session"'),
     ])
     const recent = await listMemories({ limit: 50 })
     recent.sort((a, b) => b.ts - a.ts)
@@ -284,6 +306,37 @@ router.post('/memory/clear', async (req, res) => {
     res.json({ ok: true, scope })
   } catch (err) {
     res.status(503).json({ error: err.message })
+  }
+})
+
+/* ---------- 用户管理（M5a / ADR-008：user-token 档的签发与吊销） ---------- */
+import { issueUserToken, listUsers, revokeUser, usersEnabled } from '../principal.js'
+
+/** 用户列表：GET /api/management/users */
+router.get('/users', (_req, res) => {
+  res.json({ mode: usersEnabled() ? 'user-token' : 'disabled', users: listUsers() })
+})
+
+/** 签发用户令牌：POST /api/management/users {userId, label?}；明文 token 仅本次返回 */
+router.post('/users', (req, res) => {
+  try {
+    const r = issueUserToken({ userId: req.body?.userId, label: req.body?.label })
+    appendAudit('user.token.issue', { userId: r.userId })
+    res.status(201).json(r)
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
+})
+
+/** 吊销用户：DELETE /api/management/users/:userId（数据保留，令牌立即失效） */
+router.delete('/users/:userId', (req, res) => {
+  try {
+    const ok = revokeUser(req.params.userId)
+    if (!ok) return res.status(404).json({ error: '用户不存在或已吊销' })
+    appendAudit('user.token.revoke', { userId: req.params.userId })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(400).json({ error: err.message })
   }
 })
 

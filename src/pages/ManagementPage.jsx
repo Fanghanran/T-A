@@ -24,6 +24,7 @@ import { RegistryRow } from '@/components/management/RegistryRow'
 import { ToggleSwitch } from '@/components/management/ToggleSwitch'
 import { TunablesSection } from '@/components/management/TunablesSection'
 import { ModelsSection } from '@/components/management/ModelsSection'
+import { UsersSection } from '@/components/management/UsersSection'
 
 /**
  * ManagementPage —— 系统管理独立菜单视图
@@ -293,6 +294,9 @@ export function ManagementPage({ onLoadingChange }) {
           {/* ===== 模型管理（多模型 profile + 角色路由，ADR-006） ===== */}
           <div className="mt-6">
             <ModelsSection />
+            <div className="mt-6">
+              <UsersSection />
+            </div>
           </div>
 
           {loading && !overview && (

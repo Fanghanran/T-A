@@ -214,8 +214,8 @@ function buildFallbackAnswer(steps) {
  * @param {{ query:string, docId?:string, text?:string, history?:Array }} params
  * @returns {Promise<ReadableStream<Uint8Array>>} AI SDK data-stream 协议流
  */
-export async function runDocAgent({ query, docId = '', text = '', history = [], signal }) {
-  const ctx = buildDocContext(docId, text)
+export async function runDocAgent({ query, docId = '', text = '', history = [], signal, ownerId }) {
+  const ctx = buildDocContext(docId, text, ownerId)
 
   return new ReadableStream({
     async start(controller) {
