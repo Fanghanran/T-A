@@ -70,6 +70,15 @@
 - 多用户：`principal`(userId/tenantId) 抽象（`disabled`=单一 local，零回归）+ `sessions` 加 `owner_id` + `schema_version` 幂等迁移 + Milvus 强制 owner 过滤 + 记忆/配额 per-user + 公平调度 + 审计带 userId。**注意**：现记忆 `scope:'global'` 在多用户下是越权点，须改为 per-user global。**维持暂缓**。
 **边界**：后端已按 sessionId 隔离、已加 sid↔agent 防串。多用户属**架构级、暂缓**（维持“不引入租户体系”决定，仅留设计与未来开工清单）。
 
+#### M5 开工方案（默认值已定，待明确开工指令后执行）
+
+前置依赖（M1/M2/M4）已满足，随时可开工。因属安全关键 + 破坏性数据改造（此前被明确暂缓），执行前需一次明确「开工 M5」指令；以下默认值已按 ADR-008 与工程保守性选定：
+
+- **切片**：先 **M5a 核心隔离**（principal 抽象 + `schema_version` 幂等迁移 + `sessions`/文档 `owner_id` + Milvus 三集合 owner 标量与强制过滤 + 跨用户 403 专测矩阵 + `disabled` 模式零回归验证）→ 再 **M5b**（记忆 `scope:'global'` 迁移为 per-user、per-user 配额、审计带 userId、管理页用量视图）。
+- **认证**：principal 抽象先行落地，`AUTH_MODE=disabled` 为默认（现状零回归）；同批实现 `user-token` 档（管理页签发/吊销 token），jwt 留升级位。不做 OAuth（ADR 既定）。
+- **迁移**：SQLite `schema_version` 幂等 ALTER，存量数据归属 `local` 用户；Milvus owner 标量 = 集合重建（走既有「备份→重建→原子翻转」流程，默认 dry-run）。
+- **验收**：跨用户读写 403 矩阵全绿 + `disabled` 模式 `check:all` 与既有端到端零回归 + owner 过滤覆盖清单（sessions / documents / chunks / memory / audit 逐项核对）。
+
 ---
 
 ## 4. 里程碑与依赖顺序
