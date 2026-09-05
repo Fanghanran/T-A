@@ -293,7 +293,7 @@ npm --prefix server run check:layers   # 分层检查
 | 后端测试 | Node test runner | ✅ 已配置 |
 | 后端分层检查 | `check-layers.mjs` | ✅ 纳入 `check:all` |
 | 构建验证 | `vite build` | ✅ 纳入 `check:all` |
-| CI（GitHub Actions） | — | ⬜ 待补 |
+| CI（GitHub Actions） | `.github/workflows/ci.yml`（Node 22，跑 `check:all`） | ✅ 已配置 |
 | 类型检查 | JSDoc（暂不强制 TS） | ⬜ 可选 |
 
 **提交前最低门禁**：`npm run check:all` 必须全绿；后端改动额外确保 `node scripts/check-layers.mjs` 通过。
@@ -362,6 +362,8 @@ npm --prefix server run check:layers   # 分层检查
 - `docs/adr/006-model-management.md` — 模型管理系统（多模型路由·运行时热改·三级选择·含 Embedding 重建）〔设计已接受·暂缓实施〕
 - `docs/adr/007-conversation-memory.md` — 会话记忆机制（会话内滚动摘要 + 跨会话事实向量库）〔设计已接受·暂缓实施〕
 - `docs/adr/008-multi-agent-parallel-and-multiuser.md` — 多智能体并行与多用户（隔离·公平·边界）〔设计已接受·暂缓实施〕
+- `docs/adr/009-fail-fast-no-silent-degradation.md` — 禁止静默降级 · Fail-Fast 策略（hash 假向量/stub 假回答/假会话全部改为显式报错）〔已实施〕
+- `docs/adr/010-hybrid-retrieval-faq-answer.md` — 混合检索（近重复折叠+单文档配额+2-gram 覆盖率加权）与 FAQ 直接应答〔已实施〕
 
 > 三份「暂缓实施」的设计与实施排期总览见 `docs/ROADMAP.md`。
 

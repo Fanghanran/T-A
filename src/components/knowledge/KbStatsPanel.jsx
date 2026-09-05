@@ -16,7 +16,7 @@ import { cn } from '@/lib/utils'
 /** 从 "openai-compatible:qwen2.5-coder:14b" 里取出模型名 */
 function modelName(str) {
   if (!str) return '未配置'
-  if (/^stub/i.test(str)) return 'stub 模式'
+  if (/^stub|unconfigured/i.test(str)) return '未配置'
   const parts = String(str).split(':')
   return parts.length > 1 ? parts.slice(1).join(':') : str
 }
@@ -56,12 +56,12 @@ export function KbStatsPanel({ stats, loading }) {
           </div>
           <div className="flex flex-wrap gap-2">
             <StatusPill
-              ok={!loading && !/stub/i.test(stats?.llm || '')}
+              ok={!loading && !/unconfigured/i.test(stats?.llm || '')}
               label="LLM"
               value={loading ? '检测中…' : modelName(stats?.llm)}
             />
             <StatusPill
-              ok={!loading && !/hash 指纹/i.test(stats?.embedding || '')}
+              ok={!loading && !/unconfigured/i.test(stats?.embedding || '')}
               label="Embedding"
               value={loading ? '检测中…' : modelName(stats?.embedding)}
             />

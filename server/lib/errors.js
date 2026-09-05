@@ -34,8 +34,8 @@ export class BadRequestError extends AppError {
 }
 
 export class ServiceUnavailableError extends AppError {
-  constructor(message) {
-    super(message, { status: 503, code: 'SERVICE_UNAVAILABLE' })
+  constructor(message, code = 'SERVICE_UNAVAILABLE') {
+    super(message, { status: 503, code })
   }
 }
 

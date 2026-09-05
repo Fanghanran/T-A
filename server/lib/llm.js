@@ -4,8 +4,22 @@ import { childLogger } from './logger.js'
 import { getChatModel } from './llmProvider.js'
 import { stubStream, prependAnnotation } from './streamUtils.js'
 import { stripToJson } from './textUtils.js'
+import { ServiceUnavailableError } from './errors.js'
 
 const log = childLogger('llm')
+
+/**
+ * Fail-Fast 守卫（ADR-009）：模型未连接时显式报错，禁止降级为占位/假回答。
+ * 「没有就是没有」——未配置 LLM 时，所有依赖 LLM 的能力直接返回 503 + 修复指引。
+ */
+function requireLLM() {
+  if (!llmAvailable) {
+    throw new ServiceUnavailableError(
+      '模型未连接：对话与回答功能不可用。请在 server/.env 配置 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 后重启后端。',
+      'LLM_NOT_CONFIGURED',
+    )
+  }
+}
 
 /**
  * llm —— RAG / 对话流式生成
@@ -54,66 +68,6 @@ function capCtx(s, max = 200) {
   return t.length > max ? t.slice(0, max).trimEnd() + '…' : t
 }
 
-/**
- * stub 模式摘录器（知识库 RAG chunks）：
- * - 真实模型模式下：正文禁止出现引用元数据，交给 Recall 面板卡片承载。
- * - stub 模式下：没有真实模型做「抽象总结 → 自然语言润色」这一步，若只输出一句空话，用户等于什么有用信息都看不到。
- *   因此这里**刻意放宽约束**：直接把每个 chunk 的文档标题/章节 + snippet 原文摘录（限长）贴出来，
- *   并明确标注"stub 摘录"，让用户即使没配 LLM Key 也能读到"知识库到底召回了什么内容"。
- *   最后仍会附一句"配 LLM 后会润色成自然回答"，避免误解为最终形态。
- */
-function buildStubSnippetExcerpts(chunks, { maxPer = 260, maxChunks = 5 } = {}) {
-  const list = chunks.slice(0, maxChunks)
-  if (!list.length) return ''
-  return list
-    .map((c, i) => {
-      const header =
-        c.heading && c.title !== c.heading ? `《${c.title}》· ${c.heading}` : `《${c.title}》`
-      const topicTag = c.topic ? ` 〔主题：${c.topic}〕` : ''
-      const body =
-        typeof c.snippet === 'string' && c.snippet.length > maxPer
-          ? c.snippet.slice(0, maxPer).trimEnd() + '…'
-          : (c.snippet || '').trim()
-      const pre = c.preContext ? `\n〔上文〕${capCtx(c.preContext)}` : ''
-      const post = c.postContext ? `\n〔下文〕${capCtx(c.postContext)}` : ''
-      return `▎摘录 ${i + 1} —— ${header}${topicTag}\n${body}${pre}${post}`
-    })
-    .join('\n\n')
-}
-
-/**
- * stub 模式摘录器（结构化题库命中）：输出题目标题 + 参考答案/题解原文限长摘录
- */
-function buildStubInterviewExcerpts(results, { maxPer = 320, maxResults = 5 } = {}) {
-  const list = results.slice(0, maxResults)
-  if (!list.length) return ''
-  return list
-    .map((r, i) => {
-      const tag = [r.category, r.difficulty, ...(r.tags ?? [])].filter(Boolean).join(' · ')
-      const src = r.answer ?? r.analysis ?? ''
-      const body =
-        typeof src === 'string' && src.length > maxPer
-          ? src.slice(0, maxPer).trimEnd() + '…'
-          : (src || '（暂无答案/题解内容）')
-      return `▎题目 ${i + 1}：${r.title}${tag ? `【${tag}】` : ''}\n${body}`
-    })
-    .join('\n\n')
-}
-
-function buildStubAnswer(query, chunks) {
-  if (!chunks.length) {
-    return `未在知识库中检索到与「${query}」相关的内容。\n\n（配置 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 后，可由真实 LLM 给出更完整的回答。）`
-  }
-  const excerpts = buildStubSnippetExcerpts(chunks)
-  return (
-    `【📚 已检索知识库】围绕「${query}」命中了 ${chunks.length} 条相关内容。\n\n` +
-    `———— 以下为 stub 模式的原始材料摘录（配 LLM 后会由模型整理为自然语言回答，不复述摘录原文） ————\n\n` +
-    excerpts +
-    `\n\n* 以上为 stub 降级回答（未配置真实 LLM API 时直接展示召回片段）。\n` +
-    `  配置 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 后，将基于相同材料生成结构清晰、无重复信息的自然回答。`
-  )
-}
-
 /** 把结构化检索结果格式化为 LLM prompt 可用的"题目文本块" */
 function buildInterviewContext(results) {
   if (!results.length) return '（未检索到任何结构化面试题）'
@@ -157,6 +111,7 @@ function buildHistoryContext(history, currentQuery) {
  * @returns {ReadableStream<Uint8Array>} AI SDK data-stream
  */
 export async function streamRagAnswer({ query, chunks, searchMs = 0, history }) {
+  requireLLM()
   // 给前端 FallbackSlice 卡片准备字段：title(文件名badge) / heading(来源/大纲badge) / score(分数) / snippet(正文预览)
   const resultsForFrontend = chunks.map((c, idx) => ({
     rank: idx + 1,
@@ -184,21 +139,18 @@ export async function streamRagAnswer({ query, chunks, searchMs = 0, history }) 
   const hasChunks = chunks.length > 0
   const historyCtx = buildHistoryContext(history, query)
 
-  if (llmAvailable) {
-    const result = await streamText({
-      model: getChatModel(),
-      system:
-        `你是面试知识助手。严格基于提供的知识库片段回答用户问题；若片段不足以回答，请如实说明，不要编造。\n\n` +
-        `显示规则（UI 层已单独处理，请严格遵守以免重复）：\n` +
-        `- 如果检索到知识库内容，请在回答开头加上【📚 已检索知识库】标记。\n` +
-        `- 如果未检索到相关内容，请明确说明「未在知识库中找到相关内容」。` +
-        NO_REF_RULE +
-        (historyCtx ? `\n\n注意：如果提供了「历史对话上下文」段落，请务必结合前文语境延续对话（例如"它"指代的是上一轮用户提到的概念），不要当作孤立的单轮问答。` : ''),
-      prompt: `${historyCtx}知识库片段：\n${context}\n\n用户问题：${query}`,
-    })
-    return prependAnnotation(result.toDataStream(), annotation)
-  }
-  return prependAnnotation(stubStream(buildStubAnswer(query, chunks)), annotation)
+  const result = await streamText({
+    model: getChatModel(),
+    system:
+      `你是面试知识助手。严格基于提供的知识库片段回答用户问题；若片段不足以回答，请如实说明，不要编造。\n\n` +
+      `显示规则（UI 层已单独处理，请严格遵守以免重复）：\n` +
+      `- 如果检索到知识库内容，请在回答开头加上【📚 已检索知识库】标记。\n` +
+      `- 如果未检索到相关内容，请明确说明「未检索到相关内容」。` +
+      NO_REF_RULE +
+      (historyCtx ? `\n\n注意：如果提供了「历史对话上下文」段落，请务必结合前文语境延续对话（例如"它"指代上一轮用户提到的概念），不要当作孤立的单轮问答。` : ''),
+    prompt: `${historyCtx}知识库片段：\n${context}\n\n用户问题：${query}`,
+  })
+  return prependAnnotation(result.toDataStream(), annotation)
 }
 
 /**
@@ -206,39 +158,22 @@ export async function streamRagAnswer({ query, chunks, searchMs = 0, history }) 
  * @param {{query:string, techStack?:string[], history?:Array<{role:string,content:string}>}} param0
  */
 export async function streamChat({ query, techStack, history }) {
+  requireLLM()
   const historyCtx = buildHistoryContext(history, query)
-  if (llmAvailable) {
-    const system = (
-      techStack?.length
-        ? `你是一位资深面试官。结合以下技术栈作答：${techStack.join('、')}。`
-        : '你是一位资深面试官，回答清晰专业。'
-    ) + (historyCtx ? ' 如果提供了「历史对话上下文」段落，请结合前文语境延续对话，不要当作孤立单轮。' : '')
-    const result = await streamText({
-      model: getChatModel(),
-      system,
-      prompt: `${historyCtx}${query}`,
-    })
-    return result.toDataStream()
-  }
-  return stubStream(
-    `（stub 模式）${historyCtx ? '（含多轮历史上下文）' : ''}你问的是：${query}${techStack?.length ? `\n涉及技术栈：${techStack.join('、')}` : ''}\n\n配置 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 后将由真实 LLM 回答。`,
-  )
+  const system = (
+    techStack?.length
+      ? `你是一位资深面试官。结合以下技术栈作答：${techStack.join('、')}。`
+      : '你是一位资深面试官，回答清晰专业。'
+  ) + (historyCtx ? ' 如果提供了「历史对话上下文」段落，请结合前文语境延续对话，不要当作孤立单轮。' : '')
+  const result = await streamText({
+    model: getChatModel(),
+    system,
+    prompt: `${historyCtx}${query}`,
+  })
+  return result.toDataStream()
 }
 
 /* ===================== 简历分析智能体 ===================== */
-
-/** LLM 不可用时的占位报告（自包含，不依赖上层模块） */
-function stubResumeReport(resumeText, jd) {
-  const len = (resumeText || '').length
-  return {
-    overall: 0,
-    summary: `（stub 模式）未接入真实 LLM，暂无法给出智能分析。已收到简历正文约 ${len} 字${jd ? '，并附带岗位 JD' : ''}。配置 LLM_API_KEY / LLM_MODEL 后重试可获得结构化评估。`,
-    sections: [{ title: '基本信息', items: [`简历文本长度：${len} 字`, jd ? '已提供岗位 JD' : '未提供岗位 JD'] }],
-    jdMatch: null,
-    interviewQuestions: [],
-    suggestions: [{ level: '高', issue: '未接入模型', fix: '在 server/.env 配置 LLM 后重启后端' }],
-  }
-}
 
 /** 把结构化报告渲染成可读 markdown（作为聊天气泡正文；卡片承载细节） */
 function resumeNarrative(report) {
@@ -251,12 +186,31 @@ function resumeNarrative(report) {
   return parts.join('\n') || '已生成简历分析报告，详见下方卡片。'
 }
 
+/** 严格 JSON 生成 + 解析（最多 2 次尝试；仍失败 → 显式 503，绝不降级为假报告） */
+async function generateStructuredJSON({ system, prompt, label }) {
+  let lastErr = null
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const { text: out } = await generateText({ model: getChatModel(), system, prompt })
+      return JSON.parse(stripToJson(out))
+    } catch (e) {
+      lastErr = e
+      log.warn(`[${label}] 第 ${attempt} 次生成/解析失败：${e.message}`)
+    }
+  }
+  throw new ServiceUnavailableError(
+    `${label}失败：模型输出无法解析为结构化结果（${lastErr?.message || '未知错误'}），请重试；若持续失败请检查模型质量或更换模型。`,
+    'LLM_OUTPUT_INVALID',
+  )
+}
+
 /**
  * 简历分析：单次 generateText 产出严格 JSON → 结构化报告卡片 + 简述。
  * @param {{resumeText?:string, jd?:string, query:string}} param0
  * @returns {ReadableStream} data-stream（含 2: resume_report 注解）
  */
 export async function streamResumeAnalyze({ resumeText, jd, query }) {
+  requireLLM()
   const text = (resumeText || query || '').trim()
   const system =
     `你是一位资深技术招聘官兼简历顾问。请分析候选人简历并给出可执行的改进建议。\n` +
@@ -270,17 +224,11 @@ export async function streamResumeAnalyze({ resumeText, jd, query }) {
       : `候选人未提供岗位 JD，jdMatch 字段输出 null。`)
   const prompt = `${jd ? `目标岗位 JD：\n${jd}\n\n` : ''}简历正文：\n${text || '（空）'}`
 
-  let report = null
-  if (llmAvailable) {
-    try {
-      const { text: out } = await generateText({ model: getChatModel(), system, prompt })
-      report = JSON.parse(stripToJson(out))
-    } catch (e) {
-      log.warn(`[streamResumeAnalyze] JSON 解析失败，降级占位：${e.message}`)
-      report = null
-    }
-  }
-  if (!report) report = stubResumeReport(text, jd)
+  const report = await generateStructuredJSON({
+    system,
+    prompt,
+    label: '简历分析',
+  })
 
   return prependAnnotation(
     stubStream(resumeNarrative(report)),
@@ -290,32 +238,19 @@ export async function streamResumeAnalyze({ resumeText, jd, query }) {
 
 /* ===================== 模拟面试智能体 ===================== */
 
-/** LLM 不可用时的占位评分卡 */
-function stubInterviewScorecard() {
-  return {
-    overall: 0,
-    dimensions: [
-      { name: '专业知识', score: 0, comment: 'stub 模式未评分' },
-      { name: '表达沟通', score: 0, comment: 'stub 模式未评分' },
-    ],
-    highlights: [],
-    improvements: ['配置真实 LLM 后可获得完整面试评分与点评'],
-    verdict: '（stub 模式）未接入真实模型，无法给出评分。',
-  }
-}
-
 /**
  * 模拟面试：多轮问答走流式文本；finish=true 时产出结构化评分卡。
  * @param {{query:string, techStack?:string[], history?:Array, results?:Array, finish?:boolean}} param0
  * @returns {ReadableStream} data-stream
  */
 export async function streamMockInterview({ query, techStack, history, results, finish }) {
+  requireLLM()
   const stack = Array.isArray(techStack) && techStack.length
     ? techStack.join('、')
     : (results?.[0]?.category || '通用')
   const historyCtx = buildHistoryContext(history, query)
 
-  // 结束面试 → 评分卡（单次 generateText 严格 JSON）
+  // 结束面试 → 评分卡（单次 generateText 严格 JSON，失败重试 1 次，仍失败显式报错）
   if (finish) {
     const transcript = (Array.isArray(history) ? history : [])
       .map((m) => `${m.role === 'assistant' ? '面试官' : '候选人'}：${m.content}`)
@@ -325,21 +260,11 @@ export async function streamMockInterview({ query, techStack, history, results, 
       `**只输出一个 JSON 对象，无多余文字/围栏**，结构：\n` +
       `{ "overall": 0到100整数, "dimensions": [ { "name": "维度", "score": 0到100整数, "comment": "简评" } ], ` +
       `"highlights": ["亮点", ...], "improvements": ["改进项", ...], "verdict": "总结论与是否推荐进入下一轮" }。`
-    let scores = null
-    if (llmAvailable) {
-      try {
-        const { text: out } = await generateText({
-          model: getChatModel(),
-          system,
-          prompt: `面试记录：\n${transcript || '（无有效记录）'}`,
-        })
-        scores = JSON.parse(stripToJson(out))
-      } catch (e) {
-        log.warn(`[streamMockInterview] 评分 JSON 解析失败，降级占位：${e.message}`)
-        scores = null
-      }
-    }
-    if (!scores) scores = stubInterviewScorecard()
+    const scores = await generateStructuredJSON({
+      system,
+      prompt: `面试记录：\n${transcript || '（无有效记录）'}`,
+      label: '面试评分',
+    })
     return prependAnnotation(
       stubStream(`面试结束，综合评分 **${scores.overall}/100**。详见下方评分卡。`),
       { type: 'interview_scorecard', engine: 'mock-interview', scores },
@@ -457,6 +382,7 @@ export async function streamInterviewAnswer({
   const annotations = ragAnnot ? [interviewAnnot, ragAnnot] : [interviewAnnot]
 
   // ---- 上下文块 / Prompt ----
+  requireLLM()
   const interviewContext = buildInterviewContext(results)
   const ragContext = hasRag ? buildContext(ragChunks) : ''
   const historyCtx = buildHistoryContext(history, query)
@@ -466,86 +392,50 @@ export async function streamInterviewAnswer({
     ? '\n\n- 另外：如果提供了「历史对话上下文」段落，请务必结合前文语境延续对话（例如"它"指代上一轮提到的概念、"还有吗"指继续列举同类题目等），不要当作孤立单轮。'
     : ''
 
-  if (llmAvailable) {
-    let system = ''
-    let prompt = ''
+  let system = ''
+  let prompt = ''
 
-    if (hasInterview && hasRag) {
-      system =
-        `你是资深面试官。回答时"结构化面试题库命中"为主，"知识库补充材料"为辅。\n\n` +
-        `核心信息说明：命中 ${results.length} 道结构化题目，并从知识库找到 ${ragChunks.length} 条补充材料（具体命中条目已在正上方独立面板卡片展示，正文不复述）。\n` +
-        `- 重点参考命中题目中的参考答案组织答案；知识库材料仅作为背景/扩展补充，不要喧宾夺主。\n` +
-        `${techStr}` + NO_REF_RULE + HISTORY_NOTICE
-      prompt =
-        `${historyCtx}一、命中的结构化面试题：\n${interviewContext}\n\n` +
-        `二、知识库补充材料：\n${ragContext}\n\n` +
-        `用户问题：${query}`
-    } else if (hasInterview && !hasRag) {
-      system =
-        `你是资深面试官。下面提供了本次从"结构化面试题库"中命中的 ${results.length} 道题目（命中详情已在正上方面板展示，正文不复述），请严格以此为参考回答用户。\n\n` +
-        `- 开头一句话点出"已从结构化题库命中 N 道相关题目"即可（不用逐题写编号/标题）。\n` +
-        `${techStr}` + NO_REF_RULE + HISTORY_NOTICE
-      prompt = `${historyCtx}命中的结构化面试题：\n${interviewContext}\n\n用户问题：${query}`
-    } else if (!hasInterview && hasRag) {
-      system =
-        `你是面试知识助手。结构化题库未命中任何题目，以下信息全部来自知识库语义检索命中的片段（命中详情已在正上方面板展示，正文不复述），请严格基于这些片段回答用户问题。\n\n` +
-        `- 开头第一句必须说明：「未在结构化题库中匹配到题目，已从知识库召回 ${ragChunks.length} 条相关材料，基于以下内容回答。」（只说 N 条数量，不罗列文件/章节名）。\n` +
-        `- 若片段不足以回答问题，要如实说明缺口，不要编造。\n` +
-        `${techStr}` + NO_REF_RULE + HISTORY_NOTICE
-      prompt = `${historyCtx}知识库片段：\n${ragContext}\n\n用户问题：${query}`
-    } else {
-      system =
-        `你是资深面试官。当前关键词"结构化题库"和"知识库"两边都未命中任何匹配内容。\n\n` +
-        `规则：\n` +
-        `- 明确告知用户两边都没命中，建议：1. 换关键词；2. 到"知识库"智能体上传更详细的面经/讲稿文档；3. 到题库 JSON 补题。\n` +
-        `- 语气友好，不要编造题目或知识点。\n` +
-        `${techStr}` + (historyCtx ? '如有历史上下文，请结合前几轮对话给出建议。' : '')
-      prompt = `${historyCtx}用户问题：${query}`
-    }
-
-    const inner = await streamText({ model: getChatModel(), system, prompt })
-    return prependAnnotation(inner.toDataStream(), annotations)
-  }
-
-  // --------- stub 模式 ---------
-  // stub 模式下**放宽"正文不显示引用元数据"的强约束**：
-  //   因为没有真实 LLM 做"抽象总结 → 润色"的动作，直接输出模板话用户看不到任何有用内容。
-  //   因此直接把命中题目答案/知识库 snippet 的真实摘录贴出来，末尾明确标注"这是 stub 降级摘录，配 LLM 后会改成自然回答"。
-  //   Recall 面板仍会独立展示完整的命中卡片（展开看 5 条详情）。
-  const hasHistory = historyCtx.length > 0
-  const historyTag = hasHistory ? '（含多轮历史上下文）' : ''
-  const interviewExcerpts = buildStubInterviewExcerpts(results)
-  const ragExcerpts = buildStubSnippetExcerpts(ragChunks)
-  const stubFooter =
-    `\n\n————\n` +
-    `* 以上为 stub 降级回答（展示原始材料摘录，保证未配 LLM 时也能读到召回内容）。\n` +
-    `  配置 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 后，将由真实模型对相同命中材料生成结构清晰的自然语言讲解` +
-    (hasHistory ? `，并延续多轮对话语境理解指代/追问关系` : '') +
-    `；命中详情与完整片段可在正上方"运行过程"面板卡片展开查看。`
-  let summary = ''
   if (hasInterview && hasRag) {
-    summary =
-      `${historyTag ? historyTag + ' ' : ''}✅ 已命中：结构化题库 ${results.length} 题 + 知识库 ${ragChunks.length} 条补充材料。\n\n` +
-      `▍▍结构化题库命中答案摘录 ▍▍\n${interviewExcerpts}\n\n` +
-      `▍▍知识库补充材料摘录 ▍▍\n${ragExcerpts}` +
-      stubFooter
+    system =
+      `你是资深面试官。回答时"结构化面试题库命中"为主，"知识库补充材料"为辅。\n\n` +
+      `核心信息说明：命中 ${results.length} 道结构化题目，并从知识库找到 ${ragChunks.length} 条补充材料（具体命中条目已在正上方独立面板卡片展示，正文不复述）。\n` +
+      `- 重点参考命中题目中的参考答案组织答案；知识库材料仅作为背景/扩展补充，不要喧宾夺主。\n` +
+      `${techStr}` + NO_REF_RULE + HISTORY_NOTICE
+    prompt =
+      `${historyCtx}一、命中的结构化面试题：\n${interviewContext}\n\n` +
+      `二、知识库补充材料：\n${ragContext}\n\n` +
+      `用户问题：${query}`
   } else if (hasInterview && !hasRag) {
-    summary =
-      `${historyTag ? historyTag + ' ' : ''}✅ 已从结构化题库命中 ${results.length} 道相关题目。\n\n` +
-      `▍▍题目答案/题解摘录 ▍▍\n${interviewExcerpts}` +
-      stubFooter
+    system =
+      `你是资深面试官。下面提供了本次从"结构化面试题库"中命中的 ${results.length} 道题目（命中详情已在正上方面板展示，正文不复述），请严格以此为参考回答用户。\n\n` +
+      `- 开头一句话点出"已从结构化题库命中 N 道相关题目"即可（不用逐题写编号/标题）。\n` +
+      `${techStr}` + NO_REF_RULE + HISTORY_NOTICE
+    prompt = `${historyCtx}命中的结构化面试题：\n${interviewContext}\n\n用户问题：${query}`
   } else if (!hasInterview && hasRag) {
-    summary =
-      `${historyTag ? historyTag + ' ' : ''}📚 未在题库命中题目，已从知识库召回 ${ragChunks.length} 条相关材料。\n\n` +
-      `▍▍知识库片段摘录 ▍▍\n${ragExcerpts}` +
-      stubFooter
+    // 注意：此分支**刻意不挂 NO_REF_RULE**——知识库片段常为「问/答」式 FAQ，
+    // 片段中的"答"就是答案本体，要求模型直接给出（复述"答"是预期行为）；
+    // NO_REF_RULE 禁复述片段原文的规则在此会答非所问（见 2026-09-03「还招外卖员吗」案例）。
+    system =
+      `你是知识库问答助手。用户的提问命中了知识库片段（命中卡片已在正上方面板展示；正文中不要复述检索过程）。\n\n` +
+      `回答规则：\n` +
+      `- 直接回答用户的问题本身；禁止出现"根据片段N""知识库召回/检索到""未在结构化题库中匹配到题目"这类检索过程表述。\n` +
+      `- 片段常为「问:…／答:…」式FAQ：当某片段的问句与用户问题相同或高度相似时，直接以该片段的"答"为答案主体（可按对话口吻轻微润色），并融合其他片段的相关信息一并补充（如薪资范围、要求）。\n` +
+      `- 禁止空泛套话：片段里已有答案（如薪资范围、区域要求）就直接给出；不要用"会因…而有所差异，请提供更多信息"搪塞，除非片段确实没有答案。\n` +
+      `- 确实不足时才如实说明还缺什么，并给出下一步建议；不要编造。\n` +
+      `${techStr}` + HISTORY_NOTICE
+    prompt = `${historyCtx}知识库片段：\n${ragContext}\n\n用户问题：${query}`
   } else {
-    summary =
-      `${historyTag ? historyTag + ' ' : ''}未在结构化题库中找到与「${query}」匹配的题目，知识库内也暂无相关材料。\n\n` +
-      `建议：① 尝试更换关键词；② 到"知识库"智能体上传更详细的面经/讲稿文档；③ 到题库 JSON 手动补题。\n` +
-      `（stub 模式提示${hasHistory ? '；已带入历史上下文' : ''}。）`
+    system =
+      `你是资深面试官。当前关键词"结构化题库"和"知识库"两边都未命中任何匹配内容。\n\n` +
+      `规则：\n` +
+      `- 明确告知用户两边都没命中，建议：1. 换关键词；2. 到"知识库"智能体上传更详细的面经/讲稿文档；3. 到题库 JSON 补题。\n` +
+      `- 语气友好，不要编造题目或知识点。\n` +
+      `${techStr}` + (historyCtx ? '如有历史上下文，请结合前几轮对话给出建议。' : '')
+    prompt = `${historyCtx}用户问题：${query}`
   }
-  return prependAnnotation(stubStream(summary), annotations)
+
+  const inner = await streamText({ model: getChatModel(), system, prompt })
+  return prependAnnotation(inner.toDataStream(), annotations)
 }
 
 /**
@@ -573,7 +463,7 @@ export async function generateChunkAnnotations(chunks, { questionsPerChunk = 3, 
   const results = safeChunks.map(fallback)
   if (!safeChunks.length) return results
 
-  if (!llmAvailable) return results // 无 LLM 直接降级
+  requireLLM() // 无 LLM 显式报错；调用方（prepareDocChunksAndVectors）catch 后按「无标注」降级并记录日志
 
   // 只送有意义的字段：heading + text 前 600 字（避免 prompt 爆长）
   const promptPayload = safeChunks.map((c, i) => ({

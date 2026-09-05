@@ -1,3 +1,5 @@
+> ⚠️ 历史文档（Vectra 时代）：本文撰写时存储层为 Vectra，现已迁移至 Milvus；部分行号/实现细节已失效，仅作设计沿革参考。最新架构见项目根 ARCHITECTURE.md。
+
 # Query 改写与检索优化计划
 
 ## Context

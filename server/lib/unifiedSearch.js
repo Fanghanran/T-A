@@ -5,6 +5,7 @@ import { embedTexts } from './embed.js'
 import { rewrite } from './queryRewriter.js'
 import { queryRewriterConfig } from './config.js'
 import { childLogger } from './logger.js'
+import { AppError } from './errors.js'
 
 const log = childLogger('unifiedSearch')
 
@@ -151,6 +152,7 @@ export async function unifiedSearch(opts = {}) {
             try {
               return await _searchOneQueryKB(query, { overK, topK })
             } catch (err) {
+              if (err instanceof AppError) throw err // 能力不可用等结构性错误必须穿透提醒
               log.warn(`[unifiedSearch] KB query[${qi}] 检索失败：${err.message}，丢弃`)
               return []
             }
@@ -188,7 +190,57 @@ export async function unifiedSearch(opts = {}) {
           })
         }
         arr.sort((a, b) => b.score - a.score)
-        const finalItems = arr.slice(0, topK).map(({ item, score }) => ({
+
+        // 4.5) 关键词混合加权（CJK 2-gram 覆盖率，2026-09-03「还招外卖员吗」案例）：
+        //  纯向量对口语短查询不稳——语义分虚高的讲义同质块（44%）压住字面精确命中的
+        //  FAQ 块。用「原始 q 的 2-gram 被片段覆盖的比例 ×0.2」加分：
+        //    - 覆盖率 1 = 片段几乎逐字含着用户问句（强字面命中）→ +0.2；
+        //    - 讲义块 0 覆盖 → 不加分。
+        //  必须在 4.6 去重/配额**之前**做：字面命中的低语义分块才有机会存活进 topK。
+        //  只用原始 q（不含改写 query）；加分封顶 +0.2，避免颠覆语义排序。
+        const normKey = (s) =>
+          String(s ?? '').replace(/[\s\p{P}\p{S}]/gu, '').slice(0, 400)
+        const qNorm = normKey(q)
+        const qGrams = new Set()
+        for (let i = 0; i < qNorm.length - 1; i++) qGrams.add(qNorm.slice(i, i + 2))
+        const boosted = qGrams.size
+          ? arr.map(({ item, score }) => {
+              // 用全文匹配（snippet 只截前 240 字，目标 Q&A 常在其后）
+              const sNorm = normKey(item.text || item.snippet)
+              let cov = 0
+              if (sNorm) {
+                const sGrams = new Set()
+                for (let i = 0; i < sNorm.length - 1; i++) sGrams.add(sNorm.slice(i, i + 2))
+                let hit = 0
+                for (const g of qGrams) if (sGrams.has(g)) hit++
+                cov = hit / qGrams.size
+              }
+              return cov > 0
+                ? { item, score: Math.min(1, score + 0.2 * cov) }
+                : { item, score }
+            })
+          : arr
+        boosted.sort((a, b) => b.score - a.score)
+
+        // 4.6) 近重复折叠 + 单文档配额：同一大文档互相近似的切片（讲义逐页同质段）
+        //  会霸占 topK。规则：① snippet 归一化前 64 字作近似键，同键留最高分；
+        //  ② 单 docId 最多 3 条（多样性，给其他文档让位）。
+        const kept = []
+        const seenKey = new Set()
+        const perDocCount = new Map()
+        const MAX_PER_DOC = 3
+        for (const { item, score } of boosted) {
+          const key = normKey(item.snippet).slice(0, 64) || `id:${item.id}`
+          if (key && seenKey.has(key)) continue
+          const docId = item.docId || item.id
+          const cnt = perDocCount.get(docId) || 0
+          if (cnt >= MAX_PER_DOC) continue
+          if (key) seenKey.add(key)
+          perDocCount.set(docId, cnt + 1)
+          kept.push({ item, score })
+        }
+
+        const finalItems = kept.slice(0, topK).map(({ item, score }) => ({
           ...item,
           // 最终 score 归一化：多 query 累加可能 > 1，截断回 [0,1]；保留 4 位小数
           score: Number(Math.max(0, Math.min(1, Number.isFinite(score) ? score : 0)).toFixed(4)),

@@ -27,3 +27,11 @@ server/data/
 data/knowledge/
 *.json.tmp
 *.json.corrupt.*
+
+# 工作记忆 / 会话数据（非项目内容）
+.workbuddy/
+.zcode/
+
+# 临时文件
+.tmp-*
+nohup.out

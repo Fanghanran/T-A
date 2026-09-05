@@ -115,8 +115,8 @@ const LISTEN_HOST = process.env.HOST || '127.0.0.1'
 function tryListen(port) {
   const server = app.listen(port, LISTEN_HOST, () => {
     const line = '═══════════════════════════════════════════════════════════'
-    const LLM_STATUS = llmAvailable ? '✅ 已接入真实模型' : '⚠️   stub 模式（未读取到 LLM_API_KEY）'
-    const EMB_STATUS = embedAvailable ? '✅ 已接入真实 Embedding' : '⚠️   hash 指纹模式（未读取到 EMBED/LLM API_KEY）'
+    const LLM_STATUS = llmAvailable ? '✅ 已接入真实模型' : '⚠️   未配置（对话/回答请求将返回 503 错误，不再降级为占位回答）'
+    const EMB_STATUS = embedAvailable ? '✅ 已接入真实 Embedding' : '⚠️   未配置（上传/检索将返回 503 错误）'
     const mask = (s) => (s ? `${'*'.repeat(Math.min(6, s.length))}…(len=${s.length})` : '（未设置）')
     console.log(`\n${line}`)
     console.log(`[Interview-Agent RAG] 服务已启动: http://${LISTEN_HOST}:${port}`)
@@ -226,12 +226,20 @@ async function bootstrap() {
       }
     }
   } catch (e) {
-    console.error('\n[启动失败] Milvus 初始化失败：', e.message, '\n')
-    console.error('  请确认 Milvus 容器已启动：')
-    console.error('    docker ps --filter name=milvus')
-    console.error('  若未启动，在项目根目录执行：')
-    console.error('    docker compose -f milvus-compose.yml up -d\n')
-    process.exit(1)
+    if (e?.code === 'EMBED_UNAVAILABLE') {
+      console.error('\n[启动失败] Embedding 未配置或不可用：', e.message, '\n')
+      console.error('  配置方法：编辑 server/.env 的 EMBED_API_KEY / EMBED_BASE_URL / EMBED_MODEL 后重启。')
+      console.error('  （向量检索与入库强依赖 Embedding，按 ADR-009 不再降级为 hash 假向量。）\n')
+    } else {
+      console.error('\n[启动失败] Milvus 初始化失败：', e.message, '\n')
+      console.error('  请确认 Milvus 容器已启动：')
+      console.error('    docker ps --filter name=milvus')
+      console.error('  若未启动，在项目根目录执行：')
+      console.error('    docker compose -f milvus-compose.yml up -d\n')
+    }
+    // 延迟退出：给 pino/sonic-boom 一拍 flush 时间，避免 exit 竞态崩溃
+    setTimeout(() => process.exit(1), 150).unref?.()
+    return
   }
   tryListen(BASE_PORT)
 }

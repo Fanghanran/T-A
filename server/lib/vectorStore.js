@@ -506,6 +506,7 @@ export async function search(queryVector, opts = {}) {
       id: h.id,
       docId: h.docId,
       title: doc?.title ?? '',
+      text: h.text ?? '', // 全文：混合检索的关键词覆盖率加权要用（snippet 只有前 240 字）
       snippet: h.snippet,
       score: h.score,
       category: h.category ?? '',

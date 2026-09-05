@@ -25,6 +25,7 @@
 | 安全 | 认证/CORS 白名单/分层限流/requestId 校验/AppError；会话 `sessionId↔agentName` 绑定；`PROTECT_SESSIONS` 开关；chat body 收口（单条 32k / resumeText 200k / jd 20k 等） | ADR-001、`security.js`、`routes/chat.js`、`index.js` |
 | 质量门禁 | ESLint(含 react-hooks)+Prettier+Vitest+node --test+分层+构建，统一 `check:all`；CI 工作流文件存在 | `package.json`、`.github/workflows/ci.yml` |
 | 前端健壮性 | 4 个 hook 请求序号竞态防护、`runtimeAnnotations` LRU 上限、原生 confirm 清零、上传统一 `request()`、大文件拆分、vendor `manualChunks`、仪表盘/文档懒加载 | 最近一轮债务清偿（`ARCHITECTURE.md` 附录 A） |
+| 检索与应答质量 | 混合检索（近重复折叠+单文档配额+2-gram 覆盖率加权）+ FAQ 直接应答 prompt（修复「答非所问」），详见 [`adr/010`](./adr/010-hybrid-retrieval-faq-answer.md) | ADR-010、`unifiedSearch.js`、`llm.js` |
 | 新智能体 | 简历分析 + 模拟面试（单次 JSON 报告卡，向后兼容插件化接入） | ADR-005、`server/lib/agents/builtin/`、`ResumeReportPanel`/`InterviewScorecardPanel` |
 
 ---

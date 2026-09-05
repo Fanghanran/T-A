@@ -3,6 +3,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Database from 'better-sqlite3'
 import { childLogger } from './logger.js'
+import { ServiceUnavailableError } from './errors.js'
 
 const log = childLogger('sessionStore')
 
@@ -159,7 +160,16 @@ const prepare = (sql) => db
       run: () => { throw Object.assign(new Error('会话数据库不可用'), { code: 'SESSION_DB_UNAVAILABLE', statusCode: 503 }) },
     }
 const requireWritable = () => {
-  if (!isWritable()) throw Object.assign(new Error('会话数据库为只读或不可用，无法写入'), { code: 'SESSION_DB_READONLY', statusCode: 503 })
+  // Fail-Fast（ADR-009）：只读/不可用一律显式 503，禁止"内存假会话"静默不落盘
+  if (!db) {
+    throw new ServiceUnavailableError('会话数据库不可用，会话功能关闭', 'SESSION_DB_UNAVAILABLE')
+  }
+  if (!dbWritable) {
+    throw new ServiceUnavailableError(
+      '会话数据库为只读，无法写入（历史会话仍可查看）。请检查文件权限后重启后端。',
+      'SESSION_DB_READONLY',
+    )
+  }
 }
 const stmtSessionCount = prepare('SELECT COUNT(*) AS c FROM sessions')
 const stmtMessageCountAll = prepare('SELECT COUNT(*) AS c FROM messages')
@@ -379,12 +389,6 @@ export function createSession({ agentName, title }) {
     updatedAt: now,
     messageCount: 0,
   }
-  // 只读模式：仍然返回可用的会话对象，只是不落盘。
-  // 这样前端能正常开始对话（检索/问答不受影响），代价是刷新后会话丢失。
-  if (!isWritable()) {
-    log.warn('[sessionStore] 数据库只读，会话仅存在于内存：' + id)
-    return { ...meta, _ephemeral: true }
-  }
   const tx = db.transaction(() => {
     stmtInsertSession.run(id, safeTitle, meta.agentName, now, now)
     setSeq('sess', sessSeq)
@@ -448,12 +452,6 @@ export function appendMessage(sessionId, msg) {
   const row = { id, role, content, createdAt: now }
   if (Array.isArray(msg.annotations) && msg.annotations.length) {
     row.annotations = msg.annotations
-  }
-
-  // 只读模式：消息不落盘，但仍返回完整对象，保证本轮对话与流式响应正常
-  if (!isWritable()) {
-    log.debug(`[sessionStore] 数据库只读，消息未持久化：${id}`)
-    return { ...row, _ephemeral: true }
   }
 
   const tx = db.transaction(() => {

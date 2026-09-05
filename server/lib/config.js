@@ -43,19 +43,15 @@ export const llmAvailable = !STUB && !!llmApiKey
 /** 真实 Embedding 是否可用（非 stub 且有 apiKey） */
 export const embedAvailable = !STUB && !!embedApiKey
 
-/** LLM 模式描述（用于健康检查与启动日志） */
-export const llmMode = STUB
-  ? 'stub'
-  : llmAvailable
-    ? `${llmBaseUrl ? 'openai-compatible' : 'openai'}:${llmModel}`
-    : 'stub'
+/** LLM 模式描述（用于健康检查与启动日志）；未配置 = 'unconfigured'（Fail-Fast，ADR-009） */
+export const llmMode = llmAvailable
+  ? `${llmBaseUrl ? 'openai-compatible' : 'openai'}:${llmModel}`
+  : 'unconfigured'
 
 /** Embedding 模式描述 */
-export const embeddingMode = STUB
-  ? 'hash'
-  : embedAvailable
-    ? `${embedBaseUrl ? 'openai-compatible' : 'openai'}:${embedModel}`
-    : 'hash'
+export const embeddingMode = embedAvailable
+  ? `${embedBaseUrl ? 'openai-compatible' : 'openai'}:${embedModel}`
+  : 'unconfigured'
 
 /** 供 llm.js 使用 */
 export const llmConfig = {

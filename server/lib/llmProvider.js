@@ -9,6 +9,7 @@
  */
 
 import { createOpenAI } from '@ai-sdk/openai'
+import { ServiceUnavailableError } from './errors.js'
 import { llmConfig } from './config.js'
 
 /** @type {import('ai').LanguageModel | null} */
@@ -21,6 +22,13 @@ let _model = null
  */
 export function getChatModel() {
   if (_model) return _model
+  // Fail-Fast（ADR-009）：未配置模型直接抛错，由上层路由转 503 提醒
+  if (!llmConfig.apiKey) {
+    throw new ServiceUnavailableError(
+      '模型未连接：请在 server/.env 配置 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 后重启后端。',
+      'LLM_NOT_CONFIGURED',
+    )
+  }
   const opts = { apiKey: llmConfig.apiKey }
   if (llmConfig.baseUrl) opts.baseURL = llmConfig.baseUrl
   const openai = createOpenAI(opts)
