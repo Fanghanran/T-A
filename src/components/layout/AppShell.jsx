@@ -8,7 +8,8 @@ import {
   useNavigate,
   useParams,
 } from 'react-router-dom'
-import { getAgent, getDefaultAgent, listAgents } from '@/lib/agentRegistry'
+import { getAgent, getDefaultAgent } from '@/lib/agentRegistry'
+import { ChatRegistryProvider, useChatRegistry } from '@/lib/chatRegistry'
 import { Sidebar } from '@/components/layout/Sidebar'
 import { Header } from '@/components/layout/Header'
 import { Suspense } from 'react'
@@ -50,11 +51,23 @@ function RouteLoadingFallback() {
  *   /audit          操作审计
  *
  * 新增智能体只需 registerAgent()；ChatRoute 会自动匹配 /chat/:agentId。
+ *
+ * M4 并行（ADR-008）：聊天区渲染 ChatRegistry 中所有已打开的窗格（每智能体一个
+ * 常驻 ChatPage 实例），URL /chat/:agentId 只决定哪个窗格可见 —— 切换不打断其他
+ * 窗格进行中的流式对话。
  */
 export function AppShell() {
+  return (
+    <ChatRegistryProvider>
+      <AppShellInner />
+    </ChatRegistryProvider>
+  )
+}
+
+function AppShellInner() {
   const navigate = useNavigate()
   const location = useLocation()
-  const [techStack, setTechStack] = React.useState([])
+  const registry = useChatRegistry()
   const [mobileSidebarOpen, setMobileSidebarOpen] = React.useState(false)
   const [viewLoading, setViewLoading] = React.useState(false)
 
@@ -77,8 +90,6 @@ export function AppShell() {
     (agent) => {
       if (!agent?.available) return
       navigate(`/chat/${agent.id}`)
-      setTechStack([])
-      setViewLoading(false)
       setMobileSidebarOpen(false)
     },
     [navigate],
@@ -135,6 +146,15 @@ export function AppShell() {
               }
             : currentAgent
 
+  // 聊天视图：焦点窗格忙（流式/加载历史）→ Header 思考态
+  const chatBusy = React.useMemo(() => {
+    if (activeView !== 'chat') return false
+    return registry.chats.some((c) => c.agentId === currentAgent.id && c.busy)
+  }, [activeView, registry.chats, currentAgent.id])
+  React.useEffect(() => {
+    setViewLoading(chatBusy)
+  }, [chatBusy])
+
   return (
     <div className="flex h-dvh w-full overflow-hidden bg-background">
       {/* 桌面端侧边栏 */}
@@ -142,6 +162,7 @@ export function AppShell() {
         <Sidebar
           currentAgentId={currentAgent.id}
           activeView={activeView}
+          chatStates={registry.chats}
           onSelectAgent={handleSelectAgent}
           onNavigateView={handleNavigateView}
         />
@@ -154,6 +175,7 @@ export function AppShell() {
           <Sidebar
             currentAgentId={currentAgent.id}
             activeView={activeView}
+            chatStates={registry.chats}
             onSelectAgent={handleSelectAgent}
             onNavigateView={handleNavigateView}
             onNavigate={() => setMobileSidebarOpen(false)}
@@ -180,13 +202,7 @@ export function AppShell() {
             />
             <Route
               path="/chat/:agentId"
-              element={
-                <ChatRoute
-                  techStack={techStack}
-                  onTechStackChange={setTechStack}
-                  onLoadingChange={setViewLoading}
-                />
-              }
+              element={<ChatRoute />}
             />
             <Route
               path="/dashboard"
@@ -212,8 +228,8 @@ export function AppShell() {
   )
 }
 
-/** 路由级 ChatPage：从 URL 参数解析已注册智能体 */
-function ChatRoute({ techStack, onTechStackChange, onLoadingChange }) {
+/** 路由级聊天区：校验 agentId 并渲染并行窗格宿主 */
+function ChatRoute() {
   const { agentId } = useParams()
   const navigate = useNavigate()
   const agent = resolveChatAgent(agentId)
@@ -224,13 +240,38 @@ function ChatRoute({ techStack, onTechStackChange, onLoadingChange }) {
     }
   }, [agentId, agent.id, navigate])
 
+  return <ChatPaneHost focusedAgentId={agent.id} />
+}
+
+/**
+ * ChatPaneHost —— 并行聊天窗格宿主（M4 / ADR-008）
+ *
+ * registry 中每个已打开的智能体渲染一个常驻 ChatPage 实例：
+ *   - 焦点窗格（URL 指向）用 display:contents 融入布局
+ *   - 后台窗格 display:none 隐藏但保持挂载 → useChat/流式继续
+ */
+function ChatPaneHost({ focusedAgentId }) {
+  const registry = useChatRegistry()
+  const { chats, openChat, markUnread, setBusy } = registry
+
+  // URL 指向的智能体必须已在 registry 中打开（首次进入/刷新兜底）
+  React.useEffect(() => {
+    openChat(focusedAgentId)
+  }, [focusedAgentId, openChat])
+
   return (
-    <ChatPage
-      agent={agent}
-      techStack={techStack}
-      onTechStackChange={onTechStackChange}
-      onLoadingChange={onLoadingChange}
-    />
+    <div className="flex h-full min-w-0 flex-1">
+      {chats.map((c) => (
+        <div key={c.agentId} className={c.agentId === focusedAgentId ? 'contents' : 'hidden'}>
+          <ChatPage
+            agent={resolveChatAgent(c.agentId)}
+            focused={c.agentId === focusedAgentId}
+            onBusyChange={setBusy}
+            onStreamSettled={markUnread}
+          />
+        </div>
+      ))}
+    </div>
   )
 }
 

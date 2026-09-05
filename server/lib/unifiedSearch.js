@@ -95,6 +95,8 @@ export async function unifiedSearch(opts = {}) {
   const scope = ['question', 'knowledge', 'all'].includes(opts.scope) ? opts.scope : 'all'
   const topK = Math.max(1, Math.min(20, Number(opts.topK) || 5))
   const history = Array.isArray(opts.history) ? opts.history : []
+  // 并发闸门分片键（智能体 id），并行时保证各智能体公平占用改写并发（ADR-008）
+  const caller = typeof opts.caller === 'string' && opts.caller.trim() ? opts.caller.trim() : ''
 
   const needQB = scope === 'all' || scope === 'question'
   const needKB = scope === 'all' || scope === 'knowledge'
@@ -130,7 +132,7 @@ export async function unifiedSearch(opts = {}) {
         let rewriteRes
         const rwStart = performance.now()
         try {
-          rewriteRes = await rewrite(q, history)
+          rewriteRes = await rewrite(q, history, {}, caller)
         } catch (err) {
           log.warn(`[unifiedSearch] rewrite 异常，降级单 query：${err.message}`)
           rewriteRes = { queries: q ? [q] : [], rewritten: false, reason: 'rewrite_throw' }

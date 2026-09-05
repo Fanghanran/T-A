@@ -361,7 +361,7 @@ npm --prefix server run check:layers   # 分层检查
 - `docs/adr/005-resume-mock-interview-agents.md` — 简历分析/模拟面试智能体接入与单次 JSON 结构化报告取舍
 - `docs/adr/006-model-management.md` — 模型管理系统（多模型路由·运行时热改·三级选择·含 Embedding 重建）〔已实施〕
 - `docs/adr/007-conversation-memory.md` — 会话记忆机制（会话内滚动摘要 + 跨会话事实向量库）〔已实施〕
-- `docs/adr/008-multi-agent-parallel-and-multiuser.md` — 多智能体并行与多用户（隔离·公平·边界）〔设计已接受·暂缓实施〕
+- `docs/adr/008-multi-agent-parallel-and-multiuser.md` — 多智能体并行与多用户（隔离·公平·边界）〔M4 已实施 · 多用户暂缓〕
 - `docs/adr/009-fail-fast-no-silent-degradation.md` — 禁止静默降级 · Fail-Fast 策略（hash 假向量/stub 假回答/假会话全部改为显式报错）〔已实施〕
 - `docs/adr/010-hybrid-retrieval-faq-answer.md` — 混合检索（近重复折叠+单文档配额+2-gram 覆盖率加权）与 FAQ 直接应答〔已实施〕
 

@@ -5,6 +5,11 @@ import {
   clearAnnotationsForChat,
   finalizePending,
 } from '@/lib/runtimeAnnotations'
+import {
+  MAX_CONCURRENT_STREAMS,
+  tryAcquireStream,
+  releaseStream,
+} from '@/lib/streamGate'
 import { child } from '@/lib/logger'
 
 const log = child('chat')
@@ -53,16 +58,37 @@ export function useChatWithAnnotations(options) {
     // 1) 拦截 fetch：全流逐行过滤 `2:` annotation 行 → 写入 runtimeAnnotations；
     //    其余字节（0: 文本 / d: 结束等）原样转发给 SDK。
     //    注：SDK 对 `2:` 行只会塞进无人消费的 chat.data（data part），必须在此剥离。
+    // 2) 并行流上界（M4/ADR-008）：发送前抢槽位，超上限直接抛错让 useChat 进 error 态；
+    //    结束（完成/中止/出错）时释放。槽位泄漏防护：每个 return / throw 路径都 release。
     fetch: async (input, init) => {
-      const resp = userFetch
-        ? await userFetch(input, init)
-        : await fetch(input, init)
+      if (!tryAcquireStream()) {
+        throw new Error(
+          `已达到并行流上限（${MAX_CONCURRENT_STREAMS}），请等待某个对话结束，或先停止其中一个`,
+        )
+      }
+      let released = false
+      const release = () => {
+        if (released) return
+        released = true
+        releaseStream()
+      }
+
+      let resp
+      try {
+        resp = userFetch ? await userFetch(input, init) : await fetch(input, init)
+      } catch (err) {
+        release()
+        throw err
+      }
       try {
         userOnResponse?.(resp)
       } catch (err) {
         log.error('[useChatWithAnnotations] onResponse 回调异常：', err)
       }
-      if (!resp.body || resp.status >= 400) return resp
+      if (!resp.body || resp.status >= 400) {
+        release()
+        return resp
+      }
 
       // 新请求开始 → 重置一轮内的开关
       writtenRef.current = false
@@ -91,6 +117,7 @@ export function useChatWithAnnotations(options) {
                 controller.enqueue(encoder.encode(lineBuf))
               }
             }
+            release()
             controller.close()
             return
           }
@@ -115,6 +142,7 @@ export function useChatWithAnnotations(options) {
           }
         },
         async cancel(reason) {
+          release()
           await reader.cancel(reason)
         },
       })

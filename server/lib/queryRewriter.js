@@ -35,28 +35,56 @@ class LRU {
 
 // ====== 并发限流 + maxPending 熔断（p-queue 极简版）======
 class ConcurrencyGate {
-  constructor({ maxConcurrency = 3, maxPending = 10 } = {}) {
+  /**
+   * 两级并发闸门（ADR-008 M4）：全局总量 maxConcurrency + 单 caller 配额 maxPerCaller。
+   * caller 默认 '__global__'（未分片语义与旧版一致）；释放时在队列里找第一个满足
+   * 「全局有空位 且 该 caller 未超配额」的任务放行，避免队头阻塞其他 caller。
+   */
+  constructor({ maxConcurrency = 3, maxPending = 10, maxPerCaller = 0 } = {}) {
     this.maxConcurrency = Math.max(1, maxConcurrency)
     this.maxPending = Math.max(0, maxPending)
+    this.maxPerCaller = Math.max(0, maxPerCaller) // 0 = 不限单 caller
     this.running = 0
-    this.pending = [] // 数组队列，push 入尾 / shift 出头
+    this.runningBy = new Map() // caller → running 数
+    this.pending = [] // { caller, res }
   }
   /** 返回 { ok:boolean, run: (fn:()=>Promise<T>) => Promise<T> } — ok=false 表示超 maxPending 直接降级 */
-  acquire() {
+  acquire(caller) {
+    const key = caller || '__global__'
     if (this.pending.length >= this.maxPending) return { ok: false, run: null }
     const self = this
+    const task = { caller: key, res: null }
     const run = async (fn) => {
       await new Promise((res) => {
-        if (self.running < self.maxConcurrency) { self.running++; res(); return }
-        self.pending.push({ res })
+        task.res = res
+        if (self._canRun(key)) { self._start(task); return }
+        self.pending.push(task)
       })
       try { return await fn() }
-      finally {
-        self.running--
-        if (self.pending.length > 0) { const next = self.pending.shift(); self.running++; next.res() }
-      }
+      finally { self._finish(task) }
     }
     return { ok: true, run }
+  }
+  _canRun(key) {
+    if (this.running >= this.maxConcurrency) return false
+    if (this.maxPerCaller > 0 && (this.runningBy.get(key) ?? 0) >= this.maxPerCaller) return false
+    return true
+  }
+  _start(task) {
+    this.running++
+    this.runningBy.set(task.caller, (this.runningBy.get(task.caller) ?? 0) + 1)
+    task.res()
+  }
+  _finish(task) {
+    this.running--
+    const n = (this.runningBy.get(task.caller) ?? 1) - 1
+    if (n <= 0) this.runningBy.delete(task.caller)
+    else this.runningBy.set(task.caller, n)
+    const idx = this.pending.findIndex((t) => this._canRun(t.caller))
+    if (idx >= 0) {
+      const next = this.pending.splice(idx, 1)[0]
+      this._start(next)
+    }
   }
 }
 
@@ -65,6 +93,8 @@ const _cache = new LRU(queryRewriterConfig?.rewriteCacheSize ?? 64)
 const _gate = new ConcurrencyGate({
   maxConcurrency: queryRewriterConfig?.maxConcurrency ?? 3,
   maxPending: queryRewriterConfig?.maxPending ?? 10,
+  // 单 caller 配额：全局一半（向上取整），并行时保证公平
+  maxPerCaller: Math.max(1, Math.ceil((queryRewriterConfig?.maxConcurrency ?? 3) / 2)),
 })
 
 
@@ -123,9 +153,10 @@ function _cacheKey(query, historyStr) {
  * @param {string} query 原始用户 query
  * @param {Array<{role:string,content:string}>} [history] 多轮对话（从 sessionStore 或前端 body.history 透传）
  * @param {Object} [overrideCfg] 覆盖默认 queryRewriterConfig
+ * @param {string} [caller] 并发闸门分片键（智能体 id），实现单 caller 配额公平（ADR-008）
  * @returns {Promise<{queries:string[], rewritten:boolean, reason:string}>}
  */
-export async function rewrite(query, history, overrideCfg = {}) {
+export async function rewrite(query, history, overrideCfg = {}, caller) {
   const cfg = { ...(queryRewriterConfig ?? {}), ...overrideCfg }
   const q = typeof query === 'string' ? query.trim() : ''
   const fallback = (reason = '') => ({ queries: q ? [q] : [], rewritten: false, reason })
@@ -149,7 +180,7 @@ export async function rewrite(query, history, overrideCfg = {}) {
   if (!llmAvailable) { _cache.set(k, fallback('llm_unavailable')); return fallback('llm_unavailable') }
 
   // 3) 并发限流：超 maxPending → 降级（绝不排队阻塞，保证主链路响应性）
-  const gate = _gate.acquire()
+  const gate = _gate.acquire(caller)
   if (!gate.ok) { _cache.set(k, fallback('max_pending')); return fallback('max_pending') }
 
   // 4) 真实改写（超时 ms 内不完成 → AbortController 中断 → 降级）

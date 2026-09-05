@@ -64,11 +64,11 @@
 - 实现与设计差异（如相似度去重未做、独立 memory 角色未拆）见 ADR-007 状态节「实施记录」。
 **依赖**：摘要/提炼要调 LLM → 依赖 M1 的模型选择能力（给提炼/摘要配「快/便宜」模型）。
 
-### 3.3 多智能体并行 / 多用户 → 已落盘 [`adr/008-multi-agent-parallel-and-multiuser.md`](./adr/008-multi-agent-parallel-and-multiuser.md)
+### 3.3 多智能体并行 / 多用户 → M4 已实施（2026-09-05）/ M5 暂缓 [`adr/008-multi-agent-parallel-and-multiuser.md`](./adr/008-multi-agent-parallel-and-multiuser.md)
 **两个不同问题**：
-- 多智能体并行：前端把「单 activeAgent」改为 **ChatRegistry `Map<agent:sid>`**，每 chat 独立 `useChat`/`AbortController`，切焦点不打断他流，`MAX_CONCURRENT_STREAMS` 限并发；后端**每流 `res.close`→abort 上游**、熔断/限流/gate **按 profile(+caller) 分片**（与 §3.1 合流）。
-- 多用户：`principal`(userId/tenantId) 抽象（`disabled`=单一 local，零回归）+ `sessions` 加 `owner_id` + `schema_version` 幂等迁移 + Milvus 强制 owner 过滤 + 记忆/配额 per-user + 公平调度 + 审计带 userId。**注意**：现记忆 `scope:'global'` 在多用户下是越权点，须改为 per-user global。
-**边界**：当前前端同一时刻只有一个智能体在流式（切换即中断），后端已按 sessionId 隔离、已加 sid↔agent 防串。多用户属**架构级、暂缓**（维持“不引入租户体系”决定，仅留设计与未来开工清单）。
+- 多智能体并行：✅ 已实施——前端 `chatRegistry` 常驻多窗格（每智能体一个 ChatPage 实例，URL 决定焦点，后台窗格流式继续）+ `streamGate` 并发上界（3）+ 未读徽标/在途脉点；后端每流 `res.close`→abort 上游 LLM、chat 限流 per-(IP,agent)、rewrite 两级并发闸门（全局+单 caller 配额）。实施差异见 ADR-008 状态节。
+- 多用户：`principal`(userId/tenantId) 抽象（`disabled`=单一 local，零回归）+ `sessions` 加 `owner_id` + `schema_version` 幂等迁移 + Milvus 强制 owner 过滤 + 记忆/配额 per-user + 公平调度 + 审计带 userId。**注意**：现记忆 `scope:'global'` 在多用户下是越权点，须改为 per-user global。**维持暂缓**。
+**边界**：后端已按 sessionId 隔离、已加 sid↔agent 防串。多用户属**架构级、暂缓**（维持“不引入租户体系”决定，仅留设计与未来开工清单）。
 
 ---
 
@@ -91,7 +91,7 @@ M0 工程地基 ─→ M0.5 落盘 ADR(006/007/008)
 | **M1 模型管理** | ✅ 已完成（2026-09-04）：`models.js`(L0) + keyed 缓存 + 调用点走 `getChatModel({role,agentId})` + 管理 CRUD + 前端 `ModelsSection`；env 种子零迁移 | 中 | M0.5 |
 | **M2 会话记忆** | ✅ 已完成（2026-09-05）：`memoryService`(L4) + `session_memory` 滚动摘要 + `kb_memory` 事实库（embed 走 M1 profile）+ ADR-009 失败语义 + `memory/stats`·`memory/clear` 端点 | 中 | **M1** |
 | **M3 残留债务** | `useUploadForm` 豁免正式化、~31 unused-vars 清理、Milvus commit-journal 评估(ADR-004 备选)、`GET /documents/:id/status` | 低 | 可与 M1/M2 并行 |
-| **M4 多智能体并行** | 前端 ChatRegistry 多实例 + 每流 abort + 熔断/限流按 profile(+caller) 分片 | 中高 | **M1** |
+| **M4 多智能体并行** | ✅ 已完成（2026-09-05）：前端 chatRegistry 常驻多窗格 + streamGate 上界(3) + 未读/脉点；后端每流 abort 上游 + 限流 per-(IP,agent) + 两级并发闸门 | 中高 | **M1** |
 | **M5 多用户/多实例** | principal 抽象 + owner_id + Milvus owner 过滤 + 共享限流/缓存失效/uploadJobs 外置/registry 外部化 + `PROTECT_SESSIONS` 默认开 | 高（安全关键，需专测） | M1 + M4；**条件性/暂缓** |
 
 ---
@@ -111,7 +111,7 @@ M0 工程地基 ─→ M0.5 落盘 ADR(006/007/008)
 - M1：`models` 解析优先级单测 + 本地多模型手测（rewrite 绑快模型、resume 绑强模型，按角色命中不同模型）。
 - M2：✅ 已实测（2026-09-05）：两轮对话后摘要滚动 + 事实入库（跨会话 hash 去重生效）；新会话「你还记得我是谁吗」命中全部注入事实；`memory/stats`·`memory/clear` 可用；`check:all` 全绿。30+ 轮长会话回归与 stub 降级演练留待日常使用观察。
 - M3：`check:all` 绿 + unused-vars 清零或收敛。
-- M4：并行多流互不打断、坏模型只熔断其角色、无僵尸流吃上游。
+- M4：✅ 已实测（2026-09-05）：双/三智能体并行流互不打断（后台完成答案完整）、切换不打断、未读徽标与在途脉点生效、第 4 路发送被上界拦截提示、客户端断开 → 服务端日志确认 abort 到达 LLM、限流 per-(IP,agent) 独立计数；`check:all` 全绿。
 - M5：越权/隔离专测（跨 user 读写 403）、公平调度、审计含 userId。
 
 ---

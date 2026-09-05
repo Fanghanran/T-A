@@ -42,6 +42,7 @@ import { cn } from '@/lib/utils'
  * @param {Object} props
  * @param {string} props.currentAgentId    当前选中的聊天智能体 id
  * @param {string} [props.activeView]      'chat' | 'dashboard' | 'knowledge'
+ * @param {Array}  [props.chatStates]      并行窗格状态（chatRegistry：agentId/unread/busy）
  * @param {(agent: Object) => void} props.onSelectAgent  选中聊天智能体
  * @param {(view: 'dashboard' | 'knowledge') => void} [props.onNavigateView] 切换管理视图
  * @param {() => void} [props.onNavigate]   任意导航后触发（用于移动端关闭抽屉）
@@ -49,6 +50,7 @@ import { cn } from '@/lib/utils'
 export function Sidebar({
   currentAgentId,
   activeView = 'chat',
+  chatStates = [],
   onSelectAgent,
   onNavigateView,
   onNavigate,
@@ -97,6 +99,10 @@ export function Sidebar({
             const Icon = agent.icon
             const active = isChatAgentActive(agent.id)
             const disabled = !agent.available
+            // 并行窗格状态：后台流式进行中显示脉点；流结束后未读显示计数
+            const state = chatStates.find((c) => c.agentId === agent.id)
+            const busyBackground = Boolean(state?.busy) && !active
+            const unread = !active ? state?.unread ?? 0 : 0
             return (
               <button
                 key={agent.id}
@@ -118,6 +124,17 @@ export function Sidebar({
                 )}
                 <Icon className="h-4 w-4 shrink-0" />
                 <span className="flex-1 truncate">{agent.name}</span>
+                {busyBackground && (
+                  <span
+                    className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500"
+                    title="该智能体正在后台生成回复"
+                  />
+                )}
+                {unread > 0 && (
+                  <Badge className="h-4 min-w-4 shrink-0 rounded-full px-1 text-[10px] leading-4">
+                    {unread > 99 ? '99+' : unread}
+                  </Badge>
+                )}
                 {disabled && (
                   <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
                     即将上线

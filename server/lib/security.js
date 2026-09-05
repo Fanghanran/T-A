@@ -82,7 +82,16 @@ export function createRateLimiter({ windowMs, max, envPrefix, keyGenerator } = {
 }
 
 export const rateLimiters = {
-  chat: createRateLimiter({ envPrefix: 'RATE_CHAT', max: 30 }),
+  // chat 按 (IP, agentName) 计数：并行场景下一个智能体打满配额不影响其他智能体（ADR-008）
+  chat: createRateLimiter({
+    envPrefix: 'RATE_CHAT',
+    max: 30,
+    keyGenerator: (req) => {
+      const ip = req.ip || req.socket?.remoteAddress || 'unknown'
+      const agent = typeof req.body?.agentName === 'string' && req.body.agentName.trim() ? req.body.agentName.trim() : '-'
+      return `${ip}:${agent}`
+    },
+  }),
   upload: createRateLimiter({ envPrefix: 'RATE_UPLOAD', max: 20 }),
   search: createRateLimiter({ envPrefix: 'RATE_SEARCH', max: 60 }),
   management: createRateLimiter({ envPrefix: 'RATE_MANAGEMENT', max: 120 }),

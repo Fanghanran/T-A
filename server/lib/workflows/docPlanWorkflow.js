@@ -52,14 +52,14 @@ function adjustSubtask(adj) {
  * @param {{ query:string, docId?:string, text?:string, history?:Array }} params
  * @returns {Promise<ReadableStream<Uint8Array>>} AI SDK data-stream 协议流
  */
-export async function runDocPlanAgent({ query, docId = '', text = '', history = [] }) {
+export async function runDocPlanAgent({ query, docId = '', text = '', history = [], signal }) {
   const ctx = buildDocContext(docId, text)
   const intents = extractTaskIntents(query)
   return new ReadableStream({
     async start(controller) {
       const { emitText, emitAnnotation, emitDone } = createEmitters(controller)
       try {
-        await runCompoundPlan({ ctx, query, history, intents, emitText, emitAnnotation })
+        await runCompoundPlan({ ctx, query, history, intents, emitText, emitAnnotation, signal })
         emitDone()
       } catch (err) {
         log.error({ msg: err.message, stack: err.stack }, '[docPlanWorkflow] 计划执行异常')
@@ -76,7 +76,7 @@ export async function runDocPlanAgent({ query, docId = '', text = '', history = 
  * 计划执行主体：拆解 → 逐一执行 → LLM 汇总。
  * @param {{ ctx:object, query:string, history:Array, intents:Array, emitText:Function, emitAnnotation:Function }} params
  */
-async function runCompoundPlan({ ctx, query, history, intents, emitText, emitAnnotation }) {
+async function runCompoundPlan({ ctx, query, history, intents, emitText, emitAnnotation, signal }) {
   // ① 拆解
   const subtasks = []
   for (const it of intents) {
@@ -138,6 +138,7 @@ async function runCompoundPlan({ ctx, query, history, intents, emitText, emitAnn
   try {
     const { text } = await generateText({
       model: getChatModel({ role: 'chat.doc.plan', agentId: 'doc-processor' }),
+      abortSignal: signal,
       system:
         '你是文档处理智能体。用户给了复合任务，各子任务已全部执行完毕。' +
         '请根据执行结果用中文写一段简要汇总（3 句以内）：每步做了什么、最终状态如何。' +

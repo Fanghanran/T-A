@@ -24,19 +24,27 @@ const log = child('chat')
  *   useChatHistory   切换会话拉历史消息 + 注解恢复
  *   useDocProcessor  文档处理智能体的操作栏 REST 编排
  *
+ * M4 并行（ADR-008）：每个已打开的智能体各挂载一个本组件实例（由 ChatPaneHost
+ * 常驻渲染）；focused=false 的后台实例仅隐藏不卸载 —— 流式继续、互不打断，
+ * 流结束且非焦点时回调 onStreamSettled 给侧栏记未读。techStack 为实例级状态，
+ * 各智能体独立记忆，不再全局重置。
+ *
  * @param {Object} props
  * @param {Object} props.agent                当前智能体
- * @param {string[]} props.techStack          已选技术栈
- * @param {(stack:string[])=>void} props.onTechStackChange 技术栈变更
- * @param {(busy:boolean)=>void} [props.onLoadingChange] 上报加载状态（驱动 Header 思考中）
+ * @param {boolean} [props.focused]           是否为当前可见窗格（URL 指向）
+ * @param {(agentId:string, busy:boolean)=>void} [props.onBusyChange] 上报忙状态（流式/加载历史）
+ * @param {(agentId:string)=>void} [props.onStreamSettled]    非焦点流结束时回调（记未读）
  */
 export function ChatPage({
   agent,
-  techStack,
-  onTechStackChange,
-  onLoadingChange,
+  focused = true,
+  onBusyChange,
+  onStreamSettled,
 }) {
   const agentName = agent?.id ?? ''
+
+  // 实例级技术栈（并行窗格各自独立）
+  const [techStack, setTechStack] = React.useState([])
 
   // 1) 会话列表（提供 currentSessionId 给 useAgentChat）
   const list = useSessionList(agentName)
@@ -84,10 +92,19 @@ export function ChatPage({
     else resumeAnnotationsClear?.()
   }, [loadingHistory, pauseAnnotationsClear, resumeAnnotationsClear])
 
-  // 上报加载状态（生成中 + 加载历史任一 true 都算"忙"）
+  // 上报忙状态到注册表（流式 + 加载历史任一 true 都算忙）；
+  // Header 只读「焦点窗格」的 busy，后台窗格的 busy 在侧栏显示脉点。
   React.useEffect(() => {
-    onLoadingChange?.(isLoading || loadingHistory)
-  }, [isLoading, loadingHistory, onLoadingChange])
+    onBusyChange?.(agentName, isLoading || loadingHistory)
+  }, [agentName, isLoading, loadingHistory, onBusyChange])
+
+  // 后台窗格一轮流式结束 → 记未读（焦点窗格不记，用户正看着）
+  const prevLoadingRef = React.useRef(false)
+  React.useEffect(() => {
+    const was = prevLoadingRef.current
+    prevLoadingRef.current = isLoading
+    if (was && !isLoading && !focused) onStreamSettled?.(agentName)
+  }, [isLoading, focused, agentName, onStreamSettled])
 
   const structured = !!agent?.structuredInput
   const isDocProcessor = agent?.id === 'doc-processor'
@@ -193,7 +210,7 @@ export function ChatPage({
           agent={agent}
           structured={structured}
           techStack={techStack}
-          onTechStackChange={onTechStackChange}
+          onTechStackChange={setTechStack}
           input={input}
           handleInputChange={handleInputChange}
           handleSubmit={handleSubmit}

@@ -14,7 +14,7 @@ export const resumeAnalysisAgent = {
   aliases: ['简历分析'],
 
   async handler(ctx) {
-    const { query, req, res, sessionId, onAssistantDone, pipeStream, dbg, agentId } = ctx
+    const { query, req, res, sessionId, onAssistantDone, pipeStream, dbg, agentId, signal } = ctx
     const body = req.body ?? {}
     const hasResumeText = typeof body.resumeText === 'string' && body.resumeText.trim()
     const resumeText = hasResumeText ? body.resumeText : query
@@ -26,7 +26,7 @@ export const resumeAnalysisAgent = {
     dbg(`[resume-analysis] resumeText=${(resumeText || '').length}字 | jd=${jd ? jd.length + '字' : '无'}`)
     return pipeStream(
       res,
-      await streamResumeAnalyze({ resumeText, jd, query, agentId }),
+      await streamResumeAnalyze({ resumeText, jd, query, agentId, signal }),
       { sessionId, onAssistantText: onAssistantDone },
     )
   },

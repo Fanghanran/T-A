@@ -82,7 +82,7 @@ agentRegistry.registerAgent({
     const opReport = req.body?.opReport
     if (opReport && typeof opReport === 'object' && typeof opReport.op === 'string') {
       dbg(`[doc-processor] opReport op=${opReport.op} | docId=${opReport.docId || '(无)'}`)
-      return pipeStream(res, await streamOpReport({ opReport, history }), opts)
+      return pipeStream(res, await streamOpReport({ opReport, history, signal: ctx.signal }), opts)
     }
 
     // 双工作流分发
@@ -94,9 +94,9 @@ agentRegistry.registerAgent({
       let agentStream = null
       if (planOn && buildDocContext(agentDocId, agentText).resolveText().trim() && extractTaskIntents(query).length >= 2) {
         dbg(`[doc-processor] 复合任务 → 计划工作流（${DOC_PLAN_WORKFLOW_NAME}）`)
-        agentStream = await runDocPlanAgent({ query, docId: agentDocId, text: agentText, history })
+        agentStream = await runDocPlanAgent({ query, docId: agentDocId, text: agentText, history, signal: ctx.signal })
       } else if (reactOn) {
-        agentStream = await runDocAgent({ query, docId: agentDocId, text: agentText, history })
+        agentStream = await runDocAgent({ query, docId: agentDocId, text: agentText, history, signal: ctx.signal })
       }
       if (agentStream) {
         return pipeStream(res, agentStream, opts)
@@ -160,6 +160,14 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
     }
 
     if (query) sessionStore.appendMessage(sid, { role: 'user', content: query })
+
+    // M4 并行：客户端断开（切走/停止按钮/关闭页面）→ abort 上游 LLM，
+    // 防止僵尸流占满本地模型队列。正常结束后 writableEnded=true 不触发。
+    const upstreamAbort = new AbortController()
+    res.on('close', () => {
+      if (!res.writableEnded) upstreamAbort.abort()
+    })
+
     const history = sessionStore.getContextWindow(sid, { maxTurns: 6, maxChars: 6000 })
     dbg(`[Chat] 会话 ${sid} 上下文窗口 ${history.length} 条 | agent=${safeAgentName || '(未知)'} | query: ${query.slice(0, 50)}...`)
 
@@ -192,7 +200,7 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
       log.warn(`[Chat] 未找到智能体 "${safeAgentName}"，使用默认对话`)
       return pipeStream(
         res,
-        await streamChat({ query, techStack: techStackArr, history, memoryBlock }),
+        await streamChat({ query, techStack: techStackArr, history, memoryBlock, signal: upstreamAbort.signal }),
         { sessionId: sid, onAssistantText: onAssistantDone },
       )
     }
@@ -200,7 +208,7 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
     // 构造共享 ctx，供 agent handler 消费
     const ctx = {
       query, history, techStack: techStackArr, sessionId: sid, onAssistantDone,
-      agentId: agentDef.id, memoryBlock,
+      agentId: agentDef.id, memoryBlock, signal: upstreamAbort.signal,
       req, res, pipeStream, dbg,
       // L5+ 依赖（仅 doc-processor 需要，按需传入不影响其他 agent）
       workflowRegistry: undefined, runDocAgent: undefined, runDocPlanAgent: undefined,

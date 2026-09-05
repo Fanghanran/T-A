@@ -2,8 +2,19 @@
 
 ## 状态
 
-**已接受设计 · 暂缓实施（Proposed — 未开工）**（2026-09-03）
-落地路线见 `docs/ROADMAP.md` §3.3 / §4：M4 多智能体并行（依赖 ADR-006）、M5 多用户/多实例（条件性、暂缓）。
+**部分实施：M4 多智能体并行已实施（2026-09-05）；B 多用户（M5）维持暂缓**
+
+M4 实施记录（与设计稿的差异以本节为准）：
+- 前端：`chatRegistry`（React Context）为每个已打开智能体保留一个常驻 ChatPage 窗格，URL `/chat/:agentId` 是焦点的唯一来源；后台窗格 `display:none` 保持挂载（独立 useChat 实例 / AbortController / 会话列表 / techStack），流式继续、互不打断。设计稿的 `Map<agentId:sid>` 简化为**每智能体一个窗格**（会话粒度切换在窗格内部完成）；techStack 从全局状态改为实例级（切换不再重置）。
+- 并发上界：`streamGate.js` `MAX_CONCURRENT_STREAMS=3`，在 useChat 的 fetch 包装层统一抢/放槽位，超限直接抛错提示（useChat error 态展示）。
+- 未读与在途指示：后台窗格流式结束 → 侧栏对应智能体显示未读计数徽标；后台流式进行中显示脉点（title 提示）。
+- 后端：每请求 `AbortController` + `res.on('close')`（`!writableEnded` 时 abort）→ 4 个对话 stream 函数 / 评分卡 / 简历分析 / 文档双工作流全部 `abortSignal` 穿线到 `streamText`/`generateText`；`pipeStream` 对上游错误（含 abort）显式收尾防未处理 error 逃逸。
+- 熔断分片：embedding 熔断按 profile 分片已在 M1（ADR-006）落地；LLM 侧无全局熔断器（Fail-Fast 直报），无需分片。
+- 限流：chat 限流 key 从 per-IP 细化为 per-(IP, agentName)。
+- 并发 gate：`ConcurrencyGate` 升级为两级（全局总量 + 单 caller 配额=全局一半），rewrite 链路以智能体 id 为 caller（unifiedSearch 新增 `caller` 参数）；embed/reindex 现无 gate（无需升级）。
+- 实测（2026-09-05，浏览器 + HTTP e2e）：双/三智能体并行流互不打断、后台完成正确计数未读、第 4 路发送被上界拦截并提示、客户端中途断开 → 服务端日志出现「上游流错误，提前收尾」（abort 信号到达 LLM）、两智能体限流各自独立计数（remaining 均 29）。
+
+落地路线见 `docs/ROADMAP.md` §3.3 / §4：M4 多智能体并行（已完成）、M5 多用户/多实例（条件性、暂缓）。
 
 ## 背景
 

@@ -43,7 +43,13 @@ export function pipeStream(res, webStream, { sessionId, onAssistantText } = {}) 
   res.status(200)
 
   if (typeof onAssistantText !== 'function') {
-    Readable.fromWeb(webStream).pipe(res)
+    const plain = Readable.fromWeb(webStream)
+    // 上游错误（含客户端断开触发的 abort）→ 销毁响应并留痕，不让 error 事件逃逸
+    plain.on('error', (err) => {
+      log.warn({ msg: err.message }, '[pipeStream] 上游流错误，提前收尾')
+      res.destroy()
+    })
+    plain.pipe(res)
     return
   }
 
@@ -169,7 +175,13 @@ export function pipeStream(res, webStream, { sessionId, onAssistantText } = {}) 
     _fireOnAssistantText()
   })
 
-  Readable.fromWeb(webStream).pipe(accumTransform).pipe(res)
+  const upstream = Readable.fromWeb(webStream)
+  // 上游错误（含客户端断开触发的 abort）→ 销毁响应并留痕，不让 error 事件逃逸
+  upstream.on('error', (err) => {
+    log.warn({ msg: err.message }, '[pipeStream] 上游流错误，提前收尾')
+    res.destroy()
+  })
+  upstream.pipe(accumTransform).pipe(res)
 }
 
 /** 解析 tags：兼容多种提交格式（数组 / JSON 字符串 / 逗号分隔字符串 / multer 多值） */

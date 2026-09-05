@@ -214,7 +214,7 @@ function buildFallbackAnswer(steps) {
  * @param {{ query:string, docId?:string, text?:string, history?:Array }} params
  * @returns {Promise<ReadableStream<Uint8Array>>} AI SDK data-stream 协议流
  */
-export async function runDocAgent({ query, docId = '', text = '', history = [] }) {
+export async function runDocAgent({ query, docId = '', text = '', history = [], signal }) {
   const ctx = buildDocContext(docId, text)
 
   return new ReadableStream({
@@ -241,6 +241,7 @@ export async function runDocAgent({ query, docId = '', text = '', history = [] }
           const prompt = buildAgentPrompt({ ctx, history, steps, query, directive })
           const { text: llmOut } = await generateText({
             model: getChatModel({ role: 'chat.doc.react', agentId: 'doc-processor' }),
+            abortSignal: signal,
             system: buildSystemPrompt(),
             prompt,
           })
@@ -399,7 +400,7 @@ const OP_GUIDANCE = {
  * @param {{ opReport:{ op:string, docId?:string, instruction?:string, chunkCount?:number, totalChunks?:number, totalChars?:number, ms?:number }, history?:Array }} params
  * @returns {Promise<ReadableStream<Uint8Array>>} AI SDK data-stream 协议流
  */
-export async function streamOpReport({ opReport, history = [] }) {
+export async function streamOpReport({ opReport, history = [], signal }) {
   const op = String(opReport.op || '')
   const docId = String(opReport.docId || '')
   const cacheKey = docId || '__ephemeral__'
@@ -513,6 +514,7 @@ export async function streamOpReport({ opReport, history = [] }) {
     try {
       const { text: out } = await generateText({
         model: getChatModel({ role: 'chat.doc.react', agentId: 'doc-processor' }),
+        abortSignal: signal,
         system: OP_REPORT_SYSTEM_PROMPT,
         prompt: `${buildHistoryBlock(history)}\n\n## 操作结果\n${facts}\n\n请向用户简要汇报。`,
       })
