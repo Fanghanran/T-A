@@ -31,16 +31,20 @@ export function DocumentRow({
         }
       }}
       className={cn(
-        'group flex cursor-pointer flex-col gap-1.5 rounded-md border p-3 transition-colors',
+        'group relative flex cursor-pointer flex-col gap-1.5 rounded-lg border p-3 transition-all duration-150',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
         active
-          ? 'border-primary/50 bg-accent'
+          ? 'border-primary/40 bg-primary/[0.06] shadow-soft'
           : selected
             ? 'border-emerald-400/60 bg-emerald-50/40 dark:bg-emerald-950/20'
-            : 'border-transparent hover:bg-accent/50',
+            : 'border-transparent hover:border-border/70 hover:bg-accent/40',
         removing && 'opacity-50 pointer-events-none',
       )}
     >
+      {/* 激活刻度线（与侧边栏同语言） */}
+      {active && (
+        <span className="absolute left-0 top-1/2 h-7 w-[3px] -translate-y-1/2 rounded-full bg-primary" />
+      )}
       <div className="flex items-start gap-2">
         {hasBatch && (
           <div
@@ -66,7 +70,9 @@ export function DocumentRow({
             issues={[`切片质量均分（启发式） · 共 ${doc.chunkCount ?? '?'} 块`]}
           />
         )}
-        <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+        {/* 操作按钮常显（弱化 60% 透明度，hover 行时全显强调）——
+            此前 opacity-0 需悬停才出现，用户看不到以为按钮丢失 */}
+        <div className="flex items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100">
           {onEdit && (
             <Button
               type="button"

@@ -7,11 +7,15 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env index.js",
     "dev": "node --env-file-if-exists=.env --watch index.js",
-    "test": "node --test test/**/*.test.mjs",
-    "check:layers": "node scripts/check-layers.mjs"
+    "test": "node --test --experimental-test-module-mocks test/**/*.test.mjs",
+    "check:layers": "node scripts/check-layers.mjs",
+    "e2e": "node scripts/e2e-main-flow.mjs",
+    "backup": "node --env-file-if-exists=.env scripts/backup-milvus.mjs export",
+    "backup:restore": "node --env-file-if-exists=.env scripts/backup-milvus.mjs restore"
   },
   "dependencies": {
     "@ai-sdk/openai": "^1.0.0",
+    "@elastic/elasticsearch": "^8.14.0",
     "@zilliz/milvus2-sdk-node": "^3.0.5",
     "ai": "^3.4.0",
     "better-sqlite3": "12.10.1",

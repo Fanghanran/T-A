@@ -80,6 +80,7 @@ export function TunablesSection({ onError }) {
       icon={<SlidersHorizontal className="h-3.5 w-3.5" />}
       title="调优参数"
       hint="切片 / 评分 / 去重 / 查询改写阈值，修改即热生效并持久化"
+      defaultOpen
       badge={
         data?.modified > 0 ? (
           <Badge variant="secondary" className="text-[10px]">

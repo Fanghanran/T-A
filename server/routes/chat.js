@@ -358,12 +358,12 @@ async function handleActionRouter({ query, history, req, res, sessionId, onAssis
       docId = doc.id
     }
     const t0 = performance.now()
-    const { chunkList, vectors } = await prepareDocChunksAndVectors(text, {
+    const { chunkList, vectors, questionVectors } = await prepareDocChunksAndVectors(text, {
       strategy: cached?.strategy || strategy,
       delimiter: cached?.strategy === 'delimiter' ? cached.opts?.delimiter : delimiter,
       maxChars: cached?.opts?.maxChars || maxChars,
     })
-    await store.addChunks(docId, chunkList, vectors, { category: '', tags: [] })
+    await store.addChunks(docId, chunkList, vectors, { category: '', tags: [], questionVectors })
     clearCachedPreview(cacheKey)
     const ms = Math.round(performance.now() - t0)
     const totalChars = chunkList.reduce((s, c) => s + (typeof c.text === 'string' ? c.text.length : 0), 0)

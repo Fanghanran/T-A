@@ -1,5 +1,12 @@
 import * as React from 'react'
-import { BookOpen, LayoutDashboard, Settings2, History } from 'lucide-react'
+import {
+  BookOpen,
+  LayoutDashboard,
+  Network,
+  Settings2,
+  Database,
+  Layers,
+} from 'lucide-react'
 import {
   Navigate,
   Route,
@@ -10,6 +17,7 @@ import {
 } from 'react-router-dom'
 import { getAgent, getDefaultAgent } from '@/lib/agentRegistry'
 import { ChatRegistryProvider, useChatRegistry } from '@/lib/chatRegistry'
+import { cn } from '@/lib/utils'
 import { Sidebar } from '@/components/layout/Sidebar'
 import { Header } from '@/components/layout/Header'
 import { Suspense } from 'react'
@@ -18,9 +26,24 @@ import { AuthTokenDialog } from '@/components/layout/AuthTokenDialog'
 
 const ChatPage = React.lazy(() => import('@/pages/ChatPage'))
 const KnowledgeBasePage = React.lazy(() => import('@/pages/KnowledgeBasePage'))
+const KnowledgeGraphPage = React.lazy(() => import('@/pages/KnowledgeGraphPage'))
 const DashboardPage = React.lazy(() => import('@/pages/DashboardPage'))
-const ManagementPage = React.lazy(() => import('@/pages/ManagementPage'))
-const AuditPage = React.lazy(() => import('@/pages/AuditPage'))
+const RegistryManagePage = React.lazy(
+  () => import('@/components/management/RegistryManagePage'),
+)
+const ParamsManagePage = React.lazy(
+  () => import('@/components/management/ParamsManagePage'),
+)
+const AuditManagePage = React.lazy(
+  () => import('@/components/management/AuditManagePage'),
+)
+const ModelsManagePage = React.lazy(
+  () => import('@/components/management/ModelsManagePage'),
+)
+const VectorStructurePage = React.lazy(
+  () => import('@/pages/VectorStructurePage'),
+)
+const VectorDataPage = React.lazy(() => import('@/pages/VectorDataPage'))
 
 // 确保内置智能体注册副作用已执行（constants 会间接导入，但路由可独立使用）
 import '@/lib/agentDefinitions'
@@ -28,6 +51,31 @@ import '@/lib/agentDefinitions'
 /** 路由参数 agentId 无效时回退默认智能体 */
 function resolveChatAgent(agentId) {
   return getAgent(agentId) ?? getDefaultAgent()
+}
+
+/** 系统管理五个子视图的 Header 展示元数据 */
+const MGMT_HEADER_META = {
+  mgmtWorkflows: {
+    name: '工作流管理',
+    description: '工作流启停与运行统计；禁用后对应聊天分支回退关键词路由',
+  },
+  mgmtTools: {
+    name: '工具管理',
+    description:
+      '工具启停与运行统计；禁用后智能体 System Prompt 不再列出该工具',
+  },
+  mgmtParams: {
+    name: '参数管理',
+    description: '调优参数 · ES 关键词索引 · 用户令牌',
+  },
+  mgmtAudit: {
+    name: '操作审计',
+    description: '管理操作记录 · 启停开关 · 历史查询',
+  },
+  mgmtModels: {
+    name: '模型管理',
+    description: '多模型 profile · 可搜索路由绑定 · 思考模式开关',
+  },
 }
 
 function RouteLoadingFallback() {
@@ -45,11 +93,13 @@ function RouteLoadingFallback() {
  * AppShell —— 应用外壳（React Router 路由 + 侧边栏 + Header）
  *
  * 路由：
- *   /chat/:agentId  聊天智能体（插件化注册）
- *   /dashboard      知识库仪表盘
- *   /knowledge      文档管理
- *   /management     系统管理
- *   /audit          操作审计
+ *   /chat/:agentId                 聊天智能体（插件化注册）
+ *   /dashboard                     知识库仪表盘
+ *   /knowledge                     文档管理
+ *   /knowledge/graph               知识网络（切片网络图 + LLM Wiki 词条）
+ *   /management/workflows|tools|params|audit|models   系统管理子菜单
+ *   /vector-structure|/vector-data 向量库只读浏览
+ *   /audit                         旧入口 → 重定向操作审计子菜单
  *
  * 新增智能体只需 registerAgent()；ChatRoute 会自动匹配 /chat/:agentId。
  *
@@ -71,6 +121,25 @@ function AppShellInner() {
   const registry = useChatRegistry()
   const [mobileSidebarOpen, setMobileSidebarOpen] = React.useState(false)
   const [viewLoading, setViewLoading] = React.useState(false)
+  // 桌面侧边栏折叠态（图标栏模式），localStorage 持久化
+  const [sidebarCollapsed, setSidebarCollapsed] = React.useState(() => {
+    try {
+      return localStorage.getItem('ui:sidebar-collapsed') === '1'
+    } catch {
+      return false
+    }
+  })
+  const toggleSidebarCollapsed = React.useCallback(() => {
+    setSidebarCollapsed((v) => {
+      const next = !v
+      try {
+        localStorage.setItem('ui:sidebar-collapsed', next ? '1' : '0')
+      } catch {
+        /* 隐私模式等场景下静默忽略 */
+      }
+      return next
+    })
+  }, [])
 
   const currentAgent = React.useMemo(() => {
     const match = location.pathname.match(/^\/chat\/([^/]+)/)
@@ -79,13 +148,25 @@ function AppShellInner() {
 
   const activeView = location.pathname.startsWith('/dashboard')
     ? 'dashboard'
-    : location.pathname.startsWith('/knowledge')
-      ? 'knowledge'
-      : location.pathname.startsWith('/management')
-        ? 'management'
-        : location.pathname.startsWith('/audit')
-          ? 'audit'
-          : 'chat'
+    : location.pathname.startsWith('/knowledge/graph')
+      ? 'knowledgeGraph'
+      : location.pathname.startsWith('/knowledge')
+        ? 'knowledge'
+        : location.pathname.startsWith('/management/workflows')
+        ? 'mgmtWorkflows'
+        : location.pathname.startsWith('/management/tools')
+          ? 'mgmtTools'
+          : location.pathname.startsWith('/management/params')
+            ? 'mgmtParams'
+            : location.pathname.startsWith('/management/audit')
+              ? 'mgmtAudit'
+              : location.pathname.startsWith('/management/models')
+                ? 'mgmtModels'
+                : location.pathname.startsWith('/vector-structure')
+                  ? 'vectorStructure'
+                  : location.pathname.startsWith('/vector-data')
+                    ? 'vectorData'
+                    : 'chat'
 
   const handleSelectAgent = React.useCallback(
     (agent) => {
@@ -101,8 +182,15 @@ function AppShellInner() {
       const routes = {
         dashboard: '/dashboard',
         knowledge: '/knowledge',
-        management: '/management',
-        audit: '/audit',
+        knowledgeGraph: '/knowledge/graph',
+        mgmtWorkflows: '/management/workflows',
+        mgmtTools: '/management/tools',
+        mgmtParams: '/management/params',
+        mgmtAudit: '/management/audit',
+        mgmtModels: '/management/models',
+        vectorStructure: '/vector-structure',
+        vectorData: '/vector-data',
+        audit: '/management/audit',
         chat: `/chat/${currentAgent.id}`,
       }
       navigate(routes[view] ?? '/dashboard')
@@ -122,30 +210,47 @@ function AppShellInner() {
           available: true,
         }
       : activeView === 'knowledge'
-        ? {
-            id: '__knowledge_admin__',
-            name: '文档管理',
-            description: '知识库文档录入、分类/标签、检索与批量管理',
-            icon: BookOpen,
-            available: true,
-          }
-        : activeView === 'management'
+          ? {
+              id: '__knowledge_admin__',
+              name: '文档管理',
+              description: '知识库文档录入、分类/标签、检索与批量管理',
+              icon: BookOpen,
+              available: true,
+            }
+          : activeView === 'knowledgeGraph'
+            ? {
+                id: '__knowledge_graph__',
+                name: '知识网络',
+                description:
+                  '切片语义网络 + LLM Wiki 词条：文档筛选、关键词定位、词条生成与详情',
+                icon: Network,
+                available: true,
+              }
+        : activeView.startsWith('mgmt')
           ? {
               id: '__management__',
-              name: '系统管理',
-              description: '智能体工具与工作流的注册、启停管理',
+              name: MGMT_HEADER_META[activeView].name,
+              description: MGMT_HEADER_META[activeView].description,
               icon: Settings2,
               available: true,
             }
-          : activeView === 'audit'
+          : activeView === 'vectorStructure'
             ? {
-                id: '__audit__',
-                name: '操作审计',
-                description: '启停 / 调优参数修改 / 恢复默认的历史记录',
-                icon: History,
+                id: '__vector_structure__',
+                name: '数据结构',
+                description: 'Milvus 集合结构与索引的只读浏览',
+                icon: Database,
                 available: true,
               }
-            : currentAgent
+            : activeView === 'vectorData'
+              ? {
+                  id: '__vector_data__',
+                  name: '数据明细',
+                  description: '文档切片与双向量明细的只读浏览',
+                  icon: Layers,
+                  available: true,
+                }
+              : currentAgent
 
   // 聊天视图：焦点窗格忙（流式/加载历史）→ Header 思考态
   const chatBusy = React.useMemo(() => {
@@ -158,18 +263,25 @@ function AppShellInner() {
 
   return (
     <div className="flex h-dvh w-full overflow-hidden bg-background">
-      {/* 桌面端侧边栏 */}
-      <aside className="hidden w-64 shrink-0 border-r md:block">
+      {/* 桌面端侧边栏（可折叠为图标栏） */}
+      <aside
+        className={cn(
+          'hidden shrink-0 border-r transition-[width] duration-200 ease-out md:block',
+          sidebarCollapsed ? 'w-[3.75rem]' : 'w-64',
+        )}
+      >
         <Sidebar
           currentAgentId={currentAgent.id}
           activeView={activeView}
           chatStates={registry.chats}
+          collapsed={sidebarCollapsed}
+          onToggleCollapse={toggleSidebarCollapsed}
           onSelectAgent={handleSelectAgent}
           onNavigateView={handleNavigateView}
         />
       </aside>
 
-      {/* 移动端抽屉侧边栏 */}
+      {/* 移动端抽屉侧边栏（始终展开形态） */}
       <Dialog open={mobileSidebarOpen} onOpenChange={setMobileSidebarOpen}>
         <DialogContent className="left-0 top-0 h-dvh w-72 max-w-[80vw] translate-x-0 translate-y-0 rounded-none rounded-r-2xl p-0">
           <DialogTitle className="sr-only">导航</DialogTitle>
@@ -184,8 +296,8 @@ function AppShellInner() {
         </DialogContent>
       </Dialog>
 
-      {/* 主区域 */}
-      <main className="flex h-dvh min-w-0 flex-1 flex-col">
+      {/* 主区域（app-canvas：顶部极淡靛蓝晕染，营造纵深） */}
+      <main className="app-canvas flex h-dvh min-w-0 flex-1 flex-col">
         <Header
           agent={headerAgent}
           status={viewLoading ? 'thinking' : 'online'}
@@ -202,10 +314,7 @@ function AppShellInner() {
               path="/chat"
               element={<Navigate to={`/chat/${currentAgent.id}`} replace />}
             />
-            <Route
-              path="/chat/:agentId"
-              element={<ChatRoute />}
-            />
+            <Route path="/chat/:agentId" element={<ChatRoute />} />
             <Route
               path="/dashboard"
               element={<DashboardPage onLoadingChange={setViewLoading} />}
@@ -215,10 +324,57 @@ function AppShellInner() {
               element={<KnowledgeBasePage onLoadingChange={setViewLoading} />}
             />
             <Route
-              path="/management"
-              element={<ManagementPage onLoadingChange={setViewLoading} />}
+              path="/knowledge/graph"
+              element={<KnowledgeGraphPage onLoadingChange={setViewLoading} />}
             />
-            <Route path="/audit" element={<AuditPage />} />
+            {/* 系统管理子菜单：/management 兜底跳工作流管理 */}
+            <Route
+              path="/management"
+              element={<Navigate to="/management/workflows" replace />}
+            />
+            <Route
+              path="/management/workflows"
+              element={
+                <RegistryManagePage
+                  kind="workflows"
+                  onLoadingChange={setViewLoading}
+                />
+              }
+            />
+            <Route
+              path="/management/tools"
+              element={
+                <RegistryManagePage
+                  kind="tools"
+                  onLoadingChange={setViewLoading}
+                />
+              }
+            />
+            <Route
+              path="/management/params"
+              element={<ParamsManagePage onLoadingChange={setViewLoading} />}
+            />
+            <Route
+              path="/management/audit"
+              element={<AuditManagePage onLoadingChange={setViewLoading} />}
+            />
+            <Route
+              path="/management/models"
+              element={<ModelsManagePage onLoadingChange={setViewLoading} />}
+            />
+            <Route
+              path="/vector-structure"
+              element={<VectorStructurePage onLoadingChange={setViewLoading} />}
+            />
+            <Route
+              path="/vector-data"
+              element={<VectorDataPage onLoadingChange={setViewLoading} />}
+            />
+            {/* 旧入口兼容：/audit → 操作审计子菜单 */}
+            <Route
+              path="/audit"
+              element={<Navigate to="/management/audit" replace />}
+            />
             <Route
               path="*"
               element={<Navigate to={`/chat/${currentAgent.id}`} replace />}
@@ -262,9 +418,12 @@ function ChatPaneHost({ focusedAgentId }) {
   }, [focusedAgentId, openChat])
 
   return (
-    <div className="flex h-full min-w-0 flex-1">
+    <div className="flex min-h-0 min-w-0 flex-1">
       {chats.map((c) => (
-        <div key={c.agentId} className={c.agentId === focusedAgentId ? 'contents' : 'hidden'}>
+        <div
+          key={c.agentId}
+          className={c.agentId === focusedAgentId ? 'contents' : 'hidden'}
+        >
           <ChatPage
             agent={resolveChatAgent(c.agentId)}
             focused={c.agentId === focusedAgentId}

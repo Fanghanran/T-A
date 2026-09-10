@@ -328,6 +328,306 @@ export async function listAllDocuments() {
   return (r?.data ?? []).map(rowToDoc)
 }
 
+// ============ 向量库浏览（管理端只读，Admin 视角跨 owner） ============
+
+/** Milvus 时间戳精度不固定（ns/μs/ms 均有），按位数归一到毫秒再转 ISO */
+function tsToIso(v) {
+  const n = Number(v ?? 0)
+  if (!n) return null
+  if (n > 1e17) return new Date(Math.round(n / 1e6)).toISOString()
+  if (n > 1e14) return new Date(Math.round(n / 1e3)).toISOString()
+  return new Date(n).toISOString()
+}
+
+/** 强一致统计集合行数（与 getStats 同口径：Strong 查询主键，未 flush 的写入也可见） */
+async function countRowsStrong(name, pk) {
+  const r = await getClient().query({
+    collection_name: name,
+    filter: `${pk} != ""`,
+    output_fields: [pk],
+    limit: 16384,
+    consistency_level: 'Strong',
+  })
+  return (r?.data ?? []).length
+}
+
+/**
+ * 向量库存储总览：连接信息 + 三个集合的结构描述。
+ * 每个集合含：Strong 口径行数、字段列表（含向量维度）、索引描述、创建时间。
+ * 供管理端「向量库浏览」展示集合卡片（只读，不触碰数据）。
+ */
+export async function describeStoreInfo() {
+  const c = getClient()
+  const collections = []
+  for (const name of [DOC_COL, CHUNK_COL, MEM_COL]) {
+    const desc = await c.describeCollection({ collection_name: name })
+    const d = desc?.data ?? desc ?? {}
+    // 字段结构：data_type 为字符串名（如 VarChar），type_params 携带 max_length/dim
+    const fields = (d.schema?.fields ?? []).map((f) => {
+      const params = {}
+      for (const p of f.type_params ?? []) params[p.key] = p.value
+      return {
+        name: f.name,
+        type: f.data_type ?? '',
+        isVector: f.data_type === 'FloatVector',
+        isPrimaryKey: !!f.is_primary_key,
+        dim: params.dim ? Number(params.dim) : null,
+        maxLength: params.max_length ? Number(params.max_length) : null,
+      }
+    })
+    // 索引描述：params 为 [{key,value}] 数组，取 index_type / metric_type
+    let indexes = []
+    try {
+      const idxR = await c.describeIndex({ collection_name: name })
+      indexes = (idxR?.index_descriptions ?? []).map((x) => {
+        const kv = {}
+        for (const p of x.params ?? []) kv[p.key] = p.value
+        return {
+          field: x.field_name ?? '',
+          indexType: kv.index_type ?? '',
+          metricType: kv.metric_type ?? '',
+          indexedRows: Number(x.indexed_rows ?? 0),
+          state: x.state ?? '',
+        }
+      })
+    } catch {
+      // 集合无索引时 describeIndex 报错，浏览场景按空索引处理
+    }
+    collections.push({
+      name,
+      rowCount: await countRowsStrong(name, name === DOC_COL ? 'doc_id' : name === CHUNK_COL ? 'chunk_id' : 'mem_id'),
+      fields,
+      indexes,
+      createdTime: tsToIso(d.created_utc_timestamp),
+    })
+  }
+  return {
+    address: ADDRESS,
+    ready,
+    dim,
+    metric: METRIC,
+    collections,
+  }
+}
+
+/**
+ * 轻量文档行（不含 content / title_vector 大字段），管理端浏览列表用。
+ */
+export async function listDocRowsLite() {
+  const r = await getClient().query({
+    collection_name: DOC_COL,
+    filter: 'doc_id != ""',
+    output_fields: [
+      'doc_id', 'owner_id', 'title', 'category', 'tags',
+      'size', 'source', 'status', 'uploaded_at', 'indexed_at',
+    ],
+    limit: 16384,
+    consistency_level: 'Strong',
+  })
+  return (r?.data ?? []).map((row) => ({
+    id: row.doc_id,
+    ownerId: row.owner_id ?? 'local',
+    title: row.title ?? '',
+    category: row.category ?? '',
+    tags: parseJsonArr(row.tags),
+    size: Number(row.size ?? 0),
+    source: row.source ?? 'upload',
+    status: row.status ?? 'indexed',
+    uploadedAt: row.uploaded_at ? new Date(Number(row.uploaded_at)).toISOString() : null,
+    indexedAt: row.indexed_at ? new Date(Number(row.indexed_at)).toISOString() : null,
+  }))
+}
+
+/** 全量切片按 doc_id 计数聚合（浏览列表展示每篇文档的切片数） */
+export async function countChunksByDoc() {
+  const r = await getClient().query({
+    collection_name: CHUNK_COL,
+    filter: 'chunk_id != ""',
+    output_fields: ['doc_id'],
+    limit: 16384,
+    consistency_level: 'Strong',
+  })
+  const map = new Map()
+  for (const row of r?.data ?? []) {
+    const k = row.doc_id ?? ''
+    map.set(k, (map.get(k) ?? 0) + 1)
+  }
+  return map
+}
+
+/** 向量预览：维度 / 范数 / 是否零向量 / 前 8 维值（4 位小数），避免全量向量出网 */
+function vectorPreview(v) {
+  const arr = Array.isArray(v) ? v : []
+  let sumSq = 0
+  let allZero = true
+  for (const x of arr) {
+    sumSq += x * x
+    if (x !== 0) allZero = false
+  }
+  return {
+    dim: arr.length,
+    norm: Math.round(Math.sqrt(sumSq) * 1e4) / 1e4,
+    isZero: allZero,
+    preview: arr.slice(0, 8).map((x) => Math.round(x * 1e4) / 1e4),
+  }
+}
+
+/**
+ * 指定文档的全部切片（Admin 视角，跨 owner），携带双向量预览。
+ * 向量只出预览（dim/范数/前 8 维），全量 1024 维值不出网，payload 可控。
+ */
+export async function listChunkRowsOfDocWithVectors(docId) {
+  const LIMIT = 500
+  const r = await getClient().query({
+    collection_name: CHUNK_COL,
+    filter: `doc_id == "${esc(docId)}"`,
+    output_fields: [
+      'chunk_id', 'owner_id', 'doc_id', 'idx', 'text',
+      'text_vector', 'question_vector',
+      'heading', 'topic', 'questions', 'display_title',
+      'category', 'tags', 'status', 'indexed_at',
+    ],
+    limit: LIMIT,
+    consistency_level: 'Strong',
+  })
+  const items = (r?.data ?? []).map((row) => ({
+    id: row.chunk_id,
+    ownerId: row.owner_id ?? 'local',
+    idx: Number(row.idx ?? 0),
+    text: row.text ?? '',
+    heading: row.heading ?? '',
+    topic: row.topic ?? '',
+    questions: parseJsonArr(row.questions),
+    displayTitle: row.display_title ?? '',
+    category: row.category ?? '',
+    tags: parseJsonArr(row.tags),
+    status: row.status ?? 'indexed',
+    indexedAt: row.indexed_at ? new Date(Number(row.indexed_at)).toISOString() : null,
+    textVector: vectorPreview(row.text_vector),
+    questionVector: vectorPreview(row.question_vector),
+  }))
+  items.sort((a, b) => a.idx - b.idx)
+  return { items, truncated: items.length >= LIMIT }
+}
+
+/**
+ * 知识网络图：切片 kNN 相似网络构图（Admin 跨 owner 视角，只读）。
+ *
+ * 节点 = 知识切片（按文档着色），边 = text_vector 余弦相似度。
+ * 采用 Milvus 向量索引批量 kNN 检索（AUTOINDEX/HNSW，O(n·log n)）替代
+ * JS 全对计算（O(n²·d)，万级切片不可行）：每条切片以自身向量查
+ * top(K+1) 近邻，过滤自身与低于 threshold 的命中，无向去重。
+ * 语义与「全对 + 每节点 topK」等价：全局 topK+1 近邻中 ≥ threshold
+ * 的子集 = 该节点 threshold 之上最强 topK 邻居。
+ * 向量仅作为查询输入在服务端内存流转，不出网。
+ *  - threshold：边的相似度下限，低于该值的命中不成边
+ *  - topK：每个节点保留的最强邻居数（无向去重前），控制图密度上限
+ */
+export async function buildChunkGraph({ threshold = 0.55, topK = 6 } = {}) {
+  const c = getClient()
+  // 1. 全量切片（text_vector 仅作批量查询输入）
+  const r = await c.query({
+    collection_name: CHUNK_COL,
+    filter: 'chunk_id != ""',
+    output_fields: [
+      'chunk_id', 'doc_id', 'idx', 'heading', 'topic', 'text',
+      'category', 'status', 'text_vector',
+    ],
+    limit: 16384,
+    consistency_level: 'Strong',
+  })
+  const rows = r?.data ?? []
+  const n = rows.length
+
+  // 2. 文档元信息（节点着色 / 图例 / 检索用标题）
+  const docRows = await listDocRowsLite()
+  const docIdsWithChunks = new Set(rows.map((row) => row.doc_id ?? ''))
+  const docs = docRows
+    .filter((d) => docIdsWithChunks.has(d.id))
+    .map((d) => ({ id: d.id, title: d.title || d.id, category: d.category }))
+  const docTitle = new Map(docs.map((d) => [d.id, d.title]))
+
+  // 3. 批量 kNN 检索近邻（零向量切片不查询，作为孤立节点保留）
+  const idxById = new Map(rows.map((row, i) => [row.chunk_id, i]))
+  const isZero = rows.map(
+    (row) =>
+      !Array.isArray(row.text_vector) ||
+      row.text_vector.length === 0 ||
+      row.text_vector.every((x) => x === 0),
+  )
+  const queryIdx = []
+  for (let i = 0; i < n; i++) {
+    if (!isZero[i]) queryIdx.push(i)
+  }
+  const edgeMap = new Map()
+  const BATCH = 256
+  for (let s = 0; s < queryIdx.length; s += BATCH) {
+    const batch = queryIdx.slice(s, s + BATCH)
+    const sr = await c.search({
+      collection_name: CHUNK_COL,
+      data: batch.map((i) => rows[i].text_vector),
+      anns_field: 'text_vector',
+      limit: topK + 1,
+      consistency_level: 'Strong',
+      output_fields: ['chunk_id'],
+    })
+    // 批量查询：results[queryIndex] 为该查询向量的命中列表
+    const results = sr?.results ?? []
+    batch.forEach((i, q) => {
+      for (const hit of results[q] ?? []) {
+        if (hit.chunk_id === rows[i].chunk_id) continue
+        const j = idxById.get(hit.chunk_id)
+        if (j === undefined) continue
+        const sim = Number(hit.score ?? 0)
+        if (sim < threshold) continue
+        const key = i < j ? `${i}|${j}` : `${j}|${i}`
+        if (!edgeMap.has(key)) {
+          edgeMap.set(key, {
+            i: Math.min(i, j),
+            j: Math.max(i, j),
+            sim,
+          })
+        }
+      }
+    })
+  }
+
+  // 4. 组装输出（节点携带度数，前端按度数映射节点大小）
+  const degree = new Array(n).fill(0)
+  const edges = [...edgeMap.values()].map(({ i, j, sim }) => {
+    degree[i]++
+    degree[j]++
+    return {
+      source: rows[i].chunk_id,
+      target: rows[j].chunk_id,
+      similarity: Math.round(sim * 1e4) / 1e4,
+    }
+  })
+  const nodes = rows.map((row, i) => ({
+    // 节点类型预留：LLM Wiki 词条节点将以 type='wiki' 进入同一数据结构
+    type: 'chunk',
+    id: row.chunk_id,
+    docId: row.doc_id ?? '',
+    docTitle: docTitle.get(row.doc_id) ?? row.doc_id ?? '',
+    idx: Number(row.idx ?? 0),
+    heading: row.heading ?? '',
+    topic: row.topic ?? '',
+    snippet: (row.text ?? '').slice(0, 120),
+    category: row.category ?? '',
+    status: row.status ?? 'indexed',
+    isZeroVector: isZero[i],
+    degree: degree[i],
+  }))
+  return {
+    threshold,
+    topK,
+    docs,
+    nodes,
+    edges,
+    generatedAt: new Date().toISOString(),
+  }
+}
+
 // ============ 切片 ============
 
 export function rowToChunk(r) {
@@ -441,7 +741,7 @@ export async function listAllChunks() {
     collection_name: CHUNK_COL,
     filter: 'chunk_id != ""',
     output_fields: [
-      'chunk_id', 'doc_id', 'idx', 'text', 'heading', 'topic', 'questions',
+      'chunk_id', 'owner_id', 'doc_id', 'idx', 'text', 'heading', 'topic', 'questions',
       'display_title', 'pre_context', 'post_context', 'category', 'tags', 'status', 'indexed_at',
     ],
     limit: 16384,

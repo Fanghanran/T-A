@@ -43,11 +43,11 @@ trae/
 
 | 层 | 职责 | 模块 | 允许引用 |
 |----|------|------|----------|
-| **L0** 基础设施 | 环境、配置、日志、错误、追踪、安全、缓存、共享工具 | `env.js` `config.js` `logger.js` `errors.js` `requestTrace.js` `security.js` `tunables.js` `cache.js` `mathUtils.js` `textUtils.js` `streamUtils.js` `llmProvider.js` | 无内部依赖 |
-| **L1** 存储 | 数据持久化（Milvus / SQLite / JSON） | `milvusStore.js` `vectorStore.js` `sessionStore.js` `questionBank.js` | L0 |
-| **L2** 算法 | 纯计算 / 无外部服务调用 | `chunker.js` `embed.js` `queryRewriter.js` | L0–L1 |
+| **L0** 基础设施 | 环境、配置、日志、错误、追踪、安全、缓存、共享工具 | `env.js` `config.js` `logger.js` `errors.js` `requestTrace.js` `security.js` `tunables.js` `cache.js` `mathUtils.js` `textUtils.js` `streamUtils.js` `llmProvider.js` `metrics.js` | 无内部依赖 |
+| **L1** 存储 | 数据持久化（Milvus / SQLite / JSON / ES） | `milvusStore.js` `vectorStore.js` `sessionStore.js` `questionBank.js` `esStore.js` `wikiStore.js` | L0 |
+| **L2** 算法 | 纯计算 / 无外部服务调用 | `chunker.js` `embed.js` `queryRewriter.js` `hyde.js` | L0–L1 |
 | **L3** LLM | 大模型流式调用 | `llm.js` | L0–L2 |
-| **L4** 领域 | 业务编排（跨模块协调） | `docProcessor.js` `unifiedSearch.js` `chunkAudit.js` `agents/builtin/*` | L0–L3 |
+| **L4** 领域 | 业务编排（跨模块协调） | `docProcessor.js` `unifiedSearch.js` `chunkAudit.js` `memoryService.js` `wikiBuilder.js` `agents/builtin/*` | L0–L3 |
 | **L5** 注册表 | 工具/工作流注册与发现 + 智能体注册表 | `management/registry.js` `management/audit.js` `agents/agentRegistry.js` | L0 |
 | **L5.5** 意图 | 用户意图解析 | `intents.js` | L0–L5 |
 | **L6** 工具 | 注册的具体工具实现 | `tools/docTools.js` | L0–L4（禁止引用 L7） |

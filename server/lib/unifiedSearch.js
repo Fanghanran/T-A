@@ -1,9 +1,12 @@
 import { Buffer } from 'node:buffer'
 import * as store from './vectorStore.js'
 import * as questionBank from './questionBank.js'
+import * as esStore from './esStore.js'
 import { embedTexts } from './embed.js'
 import { rewrite } from './queryRewriter.js'
-import { queryRewriterConfig } from './config.js'
+import { hypothesize } from './hyde.js'
+import { queryRewriterConfig, hydeConfig, esConfig } from './config.js'
+import { incr, observe } from './metrics.js'
 import { childLogger } from './logger.js'
 import { AppError } from './errors.js'
 
@@ -19,6 +22,11 @@ const QUESTION_WEIGHT = Number(process.env.QUESTION_VECTOR_WEIGHT ?? 0.9)
  * 取值需保守 —— 早期用 0.5 会让双路命中分数直接顶到 1.0 饱和，三条结果同分、排序失效。
  */
 const BOTH_HIT_BONUS = Number(process.env.BOTH_HIT_BONUS ?? 0.15)
+/**
+ * HyDE 假设答案命中的权重：假设答案是 LLM 猜出来的间接匹配（比 question 锚点
+ * 还多隔一层「LLM 对答案的想象」），再降一档，避免颠覆首轮排序。
+ */
+const HYDE_WEIGHT = Number(process.env.HYDE_WEIGHT ?? 0.8)
 
 /**
  * 单 query KB 检索 helper（双路召回：正文向量 + 检索锚点向量）
@@ -92,6 +100,7 @@ async function _searchOneQueryKB(query, { overK, topK, ownerId }) {
  */
 export async function unifiedSearch(opts = {}) {
   const q = opts?.q ?? ''
+  const metricsT0 = performance.now()
   const scope = ['question', 'knowledge', 'all'].includes(opts.scope) ? opts.scope : 'all'
   const topK = Math.max(1, Math.min(20, Number(opts.topK) || 5))
   const history = Array.isArray(opts.history) ? opts.history : []
@@ -195,6 +204,52 @@ export async function unifiedSearch(opts = {}) {
         }
         arr.sort((a, b) => b.score - a.score)
 
+        // 4.4) ES BM25 关键词召回（第三通道，2026-09-07 引入）：
+        //  纯向量对「精确术语出现在语义不相干块」有结构性盲区——目标块进不了向量
+        //  top-50 候选池，2-gram 池内加权救不回（评估案例 vectorStore/SQLite 等）。
+        //  ES 走倒排索引独立召回：term 直查不依赖 embedding 相似度，与向量互补。
+        //  只用原始 q（关键词意图就是原词，改写 query 反而稀释）。
+        //  融合规则（BM25 分数无界，先集合内归一化 s = score/maxScore ∈ (0,1]）：
+        //    仅 ES 命中        → s × KEYWORD_WEIGHT（间接匹配降档，与锚点同级）
+        //    向量 + ES 双命中  → max(向量分, s×W, avg×(1+BOTH_HIT_BONUS))——双通道认可强信号
+        //  ES 命中块的 item 需从内存镜像补齐 payload（ES 只存文本元数据不取向量）。
+        let esInfo = null
+        if (esConfig.esEnabled && q) {
+          const esT0 = performance.now()
+          const { hits, degraded } = await esStore.search(q, {
+            topK: esConfig.esTopK,
+            category,
+            tag,
+            ownerId,
+          })
+          const esMs = Math.round(performance.now() - esT0)
+          const esById = new Map() // 仅 ES 命中的块（向量池没有，需补 payload 入池）
+          if (hits.length) {
+            const maxScore = Math.max(...hits.map((h) => h.score)) || 1
+            for (const h of hits) {
+              const s = (h.score / maxScore) * esConfig.keywordWeight
+              const exist = arr.find((x) => x.item.id === h.id)
+              if (exist) {
+                // 双通道命中：平均后小幅加成（与双向量融合同款语义）
+                const avg = (exist.score + s) / 2
+                exist.score = Math.max(exist.score, s, avg * (1 + BOTH_HIT_BONUS))
+              } else {
+                // 仅 ES 命中：从内存镜像补齐 payload（无向量字段的完整元数据）；
+                // snippet 与 milvus search 路口径一致（前 240 字，4.6 去重键依赖它）
+                const full = store.getChunkById(h.id, ownerId)
+                if (full)
+                  esById.set(h.id, {
+                    item: { ...full, snippet: (full.text ?? '').slice(0, 240), score: s },
+                    score: s,
+                  })
+              }
+            }
+            if (esById.size) arr.push(...esById.values())
+            arr.sort((a, b) => b.score - a.score)
+          }
+          esInfo = { hits: hits.length, added: esById?.size ?? 0, degraded, ms: esMs }
+        }
+
         // 4.5) 关键词混合加权（CJK 2-gram 覆盖率，2026-09-03「还招外卖员吗」案例）：
         //  纯向量对口语短查询不稳——语义分虚高的讲义同质块（44%）压住字面精确命中的
         //  FAQ 块。用「原始 q 的 2-gram 被片段覆盖的比例 ×0.2」加分：
@@ -220,11 +275,85 @@ export async function unifiedSearch(opts = {}) {
                 cov = hit / qGrams.size
               }
               return cov > 0
-                ? { item, score: Math.min(1, score + 0.2 * cov) }
-                : { item, score }
-            })
+            ? { item, score: Math.min(1, score + 0.2 * cov) }
+            : { item, score }
+        })
           : arr
         boosted.sort((a, b) => b.score - a.score)
+
+        // 4.55) HyDE 级联触发（2026-09-06）：首轮（含 2-gram 加权）top1 分数低于阈值 →
+        //  LLM 生成假设答案 → 答案向量查 text 路（假设答案与库内正文同为陈述句语体，
+        //  补「问句 vs 陈述句」的语体差）→ 融合进候选池重新排序。
+        //  级联的意义：多数查询 top1 达标 → 完全跳过，零额外延迟；只有难查询多花一次 LLM。
+        let hydeInfo = null
+        const topScore = boosted.length ? Number(boosted[0].score) || 0 : 0
+        if (hydeConfig.hydeEnabled !== false && topScore < hydeConfig.minScore) {
+          incr('hyde_evaluations') // 低分候选进入 HyDE 判定（触发率分母）
+          const hydeT0 = performance.now()
+          const hyp = await hypothesize(q) // 超时/开关关/LLM 不可用 → null，绝不抛错
+          if (hyp) {
+            try {
+              // 假设答案 embed（能力不可用等结构性错误按 ADR-009 穿透提醒）
+              const [hv] = await embedTexts([hyp.text])
+              if (Array.isArray(hv) && hv.length > 0) {
+                const hydeHits = await store
+                  .search(hv, { topK: overK, field: 'text', ownerId })
+                  .catch(() => [])
+                // 融合规则：命中分 × HYDE_WEIGHT（间接匹配降档）；同样适用 2-gram 字面加权；
+                // 与首轮同 id 命中取 max（两轮都认可 = 强信号）；category/tag 过滤口径与首轮一致
+                const existing = new Map(boosted.map((x) => [x.item.id, x]))
+                let added = 0
+                for (const it of hydeHits) {
+                  if (!it?.id) continue
+                  if (category && it.category !== category) continue
+                  if (tag && !(Array.isArray(it.tags) && it.tags.includes(tag))) continue
+                  let final = Math.min(1, (Number(it.score) || 0) * HYDE_WEIGHT)
+                  if (qGrams.size) {
+                    const sNorm = normKey(it.text || it.snippet)
+                    if (sNorm) {
+                      const sGrams = new Set()
+                      for (let i = 0; i < sNorm.length - 1; i++) sGrams.add(sNorm.slice(i, i + 2))
+                      let hit = 0
+                      for (const g of qGrams) if (sGrams.has(g)) hit++
+                      const cov = hit / qGrams.size
+                      if (cov > 0) final = Math.min(1, final + 0.2 * cov)
+                    }
+                  }
+                  const exist = existing.get(it.id)
+                  if (exist) {
+                    exist.score = Math.max(exist.score, final)
+                  } else {
+                    boosted.push({ item: it, score: final })
+                    existing.set(it.id, boosted[boosted.length - 1])
+                    added++
+                  }
+                }
+                boosted.sort((a, b) => b.score - a.score)
+                hydeInfo = {
+                  triggered: true,
+                  source: hyp.source,
+                  reason: `top1=${topScore.toFixed(4)} < ${hydeConfig.minScore}`,
+                  added,
+                  ms: Math.round(performance.now() - hydeT0),
+                }
+                incr('hyde_triggered', { source: hyp.source })
+                log.info(`[unifiedSearch] HyDE 触发（${hydeInfo.reason}）：新增 ${added} 条候选`)
+              } else {
+                incr('hyde_retrieval_failed') // 假设答案 embed 为空，增强轮未生效
+                hydeInfo = { triggered: false, reason: 'embed_empty', ms: Math.round(performance.now() - hydeT0) }
+              }
+            } catch (err) {
+              if (err instanceof AppError) throw err // 能力不可用等结构性错误必须穿透提醒
+              // HyDE 检索侧异常：增强轮失败保留首轮结果（warn 记录，非静默）
+              incr('hyde_retrieval_failed')
+              log.warn(`[unifiedSearch] HyDE 二次检索异常：${err.message}`)
+              hydeInfo = { triggered: false, reason: err.message, ms: Math.round(performance.now() - hydeT0) }
+            }
+          } else {
+            incr('hyde_generate_failed') // 假设答案生成不可用（超时/LLM 异常/开关关）
+            hydeInfo = { triggered: false, reason: 'generate_failed', ms: Math.round(performance.now() - hydeT0) }
+          }
+        }
 
         // 4.6) 近重复折叠 + 单文档配额：同一大文档互相近似的切片（讲义逐页同质段）
         //  会霸占 topK。规则：① snippet 归一化前 64 字作近似键，同键留最高分；
@@ -258,6 +387,10 @@ export async function unifiedSearch(opts = {}) {
           items: finalItems,
           rewritten: Boolean(rewriteRes.rewritten),
           queries, // 调试信息（传给前端面板可展示 —— 但当前前端没消费，未来可加 chip 展示"实际检索的 queries"）
+          // HyDE 级联调试信息：null = 未触发（top1 达标或开关关闭）；触发时含 added/ms/reason
+          hyde: hydeInfo,
+          // ES 关键词通道调试信息：null = 未启用或无原始 q；degraded = ES 不可用（带标注降级）
+          es: esInfo,
         }
       })
     : null
@@ -285,6 +418,10 @@ export async function unifiedSearch(opts = {}) {
           log.warn({ details: kbSettled.reason?.message }, '[unifiedSearch] knowledge 检索异常（降级为空）')
           return { total: 0, searchMs: 0, items: [] }
         })()
+
+  // 检索延迟指标（全程含改写/HyDE 增强轮，与路由层 searchMs 同口径）
+  incr('search_total', { scope })
+  observe('search_latency_ms', Math.round(performance.now() - metricsT0), { scope })
 
   return {
     scope,

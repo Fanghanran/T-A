@@ -1,0 +1,115 @@
+# 一键全栈启动：前端（nginx）+ 后端（node）
+#
+# 用法：
+#   docker compose up -d --build     # 构建 + 启动
+#   docker compose logs -f backend   # 看后端日志
+#   docker compose down              # 停止（数据保留在 ./server/data 与 Milvus 卷中）
+#
+# 前提依赖（外部常驻容器，不在本文件编排，需先启动）：
+#   - Milvus（宿主机 19530）：用本项目 milvus-compose.yml 或已有 milvus 容器
+#     docker compose -f milvus-compose.yml up -d
+#   - Ollama（宿主机 11434）：已拉取 bge-m3 与 qwen2.5-coder:14b
+# 容器内通过 host.docker.internal 访问宿主机端口，无需加入同一网络。
+#
+# 端口：前端 http://localhost:8080（FRONTEND_PORT 可覆盖），
+#       后端 http://localhost:3000（BACKEND_PORT 可覆盖；与本地 npm start 互斥，
+#       同时运行会端口冲突——两套后端共享同一 Milvus 与 server/data，不建议并行），
+#       ES http://localhost:9200（ES_PORT 可覆盖；关键词混合检索用，ES_ENABLED=off 可整体停用）。
+
+services:
+  # Elasticsearch：BM25 关键词召回（混合检索第三通道；向量仍在 Milvus，ES 不存向量）
+  elasticsearch:
+    build: ./es
+    container_name: interview-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      # 单机场景关闭磁盘水位保护误报（Docker Desktop 磁盘占用统计偏差）
+      - cluster.routing.allocation.disk.threshold_enabled=true
+      - cluster.routing.allocation.disk.watermark.low=512mb
+      - cluster.routing.allocation.disk.watermark.high=256mb
+      - cluster.routing.allocation.disk.watermark.flood_stage=128mb
+    ports:
+      - '${ES_PORT:-9200}:9200'
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'curl -fs http://127.0.0.1:9200/_cluster/health || exit 1'
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      target: backend
+    container_name: interview-backend
+    environment:
+      # 外部依赖：连接宿主机上的 Milvus / Ollama
+      MILVUS_ADDRESS: 'host.docker.internal:19530'
+      EMBED_BASE_URL: '${EMBED_BASE_URL:-http://host.docker.internal:11434/v1}'
+      EMBED_API_KEY: '${EMBED_API_KEY:-ollama}'
+      EMBED_MODEL: '${EMBED_MODEL:-bge-m3}'
+      LLM_BASE_URL: '${LLM_BASE_URL:-http://host.docker.internal:11434/v1}'
+      LLM_API_KEY: '${LLM_API_KEY:-ollama}'
+      LLM_MODEL: '${LLM_MODEL:-qwen3:14b}'
+      # 与本地 server/.env 保持同口径：空题库不灌种子、复用干净会话库
+      QUESTION_SEED: '${QUESTION_SEED:-off}'
+      SESSIONS_DB_FILE: '${SESSIONS_DB_FILE:-data/sessions/sessions_clean.db}'
+      LOG_TO_FILE: '${LOG_TO_FILE:-1}'
+      # 共享 data/management/models.json 里的 localhost 服务地址在容器内不可达，
+      # 消费时改写为 host.docker.internal（见 lib/models.js remapBaseUrl）
+      MODELS_REMAP_LOCALHOST: '${MODELS_REMAP_LOCALHOST:-1}'
+      # ES 关键词混合检索：容器内直连同 compose 网络的 elasticsearch 服务
+      ES_ENABLED: '${ES_ENABLED:-on}'
+      ES_URL: 'http://elasticsearch:9200'
+    ports:
+      - '${BACKEND_PORT:-3000}:3000'
+    volumes:
+      # 运行数据（题库 / 切片策略 / 调优参数 / 日志）落在宿主机，与本地 dev 共享、down 不丢
+      - ./server/data:/app/server/data
+      # 例外：会话 SQLite 用命名卷——Windows bind mount（9p/gRPC-FUSE）不支持
+      # WAL 所需的 -shm 共享内存文件，会报 SQLITE_IOERR_SHMOPEN；
+      # 命名卷跑在 Linux VM 原生文件系统上可正常 WAL。
+      # 代价：容器内会话库与本地 dev 的 sessions_clean.db 不互通（各自独立）。
+      - sessions_data:/app/server/data/sessions
+    extra_hosts:
+      # Linux 宿主机上也能解析 host.docker.internal（Docker Desktop 自带）
+      - 'host.docker.internal:host-gateway'
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)throw new Error(r.status)}).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      target: frontend
+    container_name: interview-frontend
+    ports:
+      - '${FRONTEND_PORT:-8080}:80'
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  sessions_data:
+    driver: local
+  esdata:
+    driver: local

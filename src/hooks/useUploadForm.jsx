@@ -1,7 +1,60 @@
 import * as React from 'react'
-import { prepareDocument, commitDocument, getUploadJob } from '@/lib/knowledgeApi'
+import { prepareDocument, commitDocument, getUploadJob, cancelUploadJob, listDocuments } from '@/lib/knowledgeApi'
 import { listTemplates } from '@/lib/docProcessorApi'
 import { MAX_CHARS_MIN, MAX_CHARS_MAX, OVERLAP_MIN, OVERLAP_MAX, UPLOAD_CONCURRENCY, STAGE_LABELS } from '@/lib/chunkPresets'
+
+// 未完成入库 job 的 sessionStorage 键：页面刷新/轮询中断后用于恢复轮询（后端 job 保留 10 分钟）
+const PENDING_JOBS_KEY = 'upload:pending-jobs'
+
+/** 登记一个进行中的入库 job（commit 拿到 jobId 后调用） */
+function jobStoreAdd(jobId, title, startedAt) {
+  try {
+    const list = JSON.parse(sessionStorage.getItem(PENDING_JOBS_KEY) || '[]')
+    list.push({ jobId, title, startedAt })
+    sessionStorage.setItem(PENDING_JOBS_KEY, JSON.stringify(list))
+  } catch { /* 存储不可用时忽略（仅影响刷新恢复） */ }
+}
+
+/** 移除一个已结算的 job（done/error/最终判定后调用） */
+function jobStoreRemove(jobId) {
+  try {
+    const list = JSON.parse(sessionStorage.getItem(PENDING_JOBS_KEY) || '[]')
+    const next = list.filter((j) => j.jobId !== jobId)
+    sessionStorage.setItem(PENDING_JOBS_KEY, JSON.stringify(next))
+  } catch { /* 忽略 */ }
+}
+
+/** 读取全部未结算的 job（挂载恢复用） */
+function jobStoreList() {
+  try {
+    const list = JSON.parse(sessionStorage.getItem(PENDING_JOBS_KEY) || '[]')
+    return Array.isArray(list) ? list : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 按标题核对文档是否已实际入库（进度通道中断时的兜底核对）。
+ * 条件：标题完全一致 + 入库时间不早于本次 commit 开始时间（容忍 5 秒时钟偏差）。
+ * @returns {Promise<object|null>} 命中的文档元数据，未命中返回 null
+ */
+async function verifyIndexedByTitle(title, startedAt) {
+  if (!title || !Number.isFinite(startedAt)) return null
+  try {
+    const res = await listDocuments({ q: title, pageSize: 20 })
+    const items = Array.isArray(res?.items) ? res.items : []
+    return (
+      items.find(
+        (d) =>
+          d?.title === title &&
+          new Date(d.uploadedAt).getTime() >= startedAt - 5_000,
+      ) ?? null
+    )
+  } catch {
+    return null
+  }
+}
 
 /**
  * useUploadForm —— 上传文档对话框的全部状态与两段式上传编排（纯逻辑不含 UI；UI 见 DocumentUploader / ChunkStrategyForm / UploadFileList）。
@@ -29,6 +82,45 @@ export function useUploadForm({ onUploaded, uploading } = {}) {
   const [previewData, setPreviewData] = React.useState(null)
   const filesRef = React.useRef(files) // workers 里读最新 files（避免闭包拿到旧数组）
   filesRef.current = files
+  const onUploadedRef = React.useRef(onUploaded) // 恢复轮询时读最新回调（避免闭包旧值）
+  onUploadedRef.current = onUploaded
+
+  // 挂载恢复：页面刷新/轮询中断后，sessionStorage 里可能遗留未结算的入库 job（后端保留 10 分钟）。
+  // 逐个恢复轮询直到结算；轮询不可达或 job 已过期（404）时按标题核对文档列表——
+  // 实际已入库则视为成功并刷新列表，避免「数据在库里、前端却显示失败」的不一致。
+  React.useEffect(() => {
+    const pending = jobStoreList()
+    if (pending.length === 0) return
+    let alive = true
+    ;(async () => {
+      for (const rec of pending) {
+        if (!alive) break
+        const POLL_MS = 1000 // 恢复轮询节奏放缓（无 UI 条目，无需高频刷新）
+        const RETRY_MS = 2000
+        const FAIL_LIMIT = 3
+        let settled = false
+        let job = null
+        for (let fails = 0; !settled; ) {
+          await new Promise((r) => setTimeout(r, fails > 0 ? RETRY_MS : POLL_MS))
+          if (!alive) return
+          try {
+            job = await getUploadJob(rec.jobId)
+            fails = 0
+          } catch {
+            fails++
+            if (fails >= FAIL_LIMIT) break
+            continue
+          }
+          if (job.stage === 'done' || job.stage === 'error') settled = true
+        }
+        // 轮询断线 / job 过期：兜底核对文档是否已实际入库
+        const hit = settled ? null : await verifyIndexedByTitle(rec.title, rec.startedAt)
+        if ((settled && job?.stage === 'done') || hit) onUploadedRef.current?.()
+        jobStoreRemove(rec.jobId)
+      }
+    })()
+    return () => { alive = false }
+  }, [])
   // 当前切片策略指纹：参数变了，已 prepare 的预览全部失效（分隔符不 trim，保留 \n 类空白符）
   const strategyKey = `${chunkStrategy}|${delimiter}|${maxChars}|${overlapChars}`
 
@@ -117,26 +209,74 @@ export function useUploadForm({ onUploaded, uploading } = {}) {
       return null
     }
   }
-  /** ④ commit 单个文件：异步 job + 轮询进度，实时更新条目 stage */
+  /** ④ commit 单个文件：异步 job + 轮询进度，实时更新条目 stage。
+   * 轮询容错：单次查询失败（网络波动 / 后端重启窗口）不判死，连续 3 次失败才判定上传失败；
+   * 判定失败后请求后端取消任务（未入库的拦截、已入库的回滚删除），保持前后端状态一致。 */
   const commitOne = async (idx) => {
     let entry = filesRef.current[idx]
     if (!entry) return false
     if (!entry.previewId || entry.strategyKey !== strategyKey) entry = await prepareOne(idx)
     if (!entry) return false
     updateEntry(idx, { status: 'committing', stage: '入库中…' })
+    const POLL_MS = 600 // 正常轮询间隔
+    const POLL_FAIL_RETRY_MS = 2000 // 查询失败后的重试间隔（给后端重启留窗口）
+    const POLL_FAIL_LIMIT = 3 // 连续失败判定阈值
+    let jobId = null
+    const startedAt = Date.now()
     try {
-      const { jobId } = await commitDocument(entry.previewId, { category, tags, withQuestions, async: true })
+      const r = await commitDocument(entry.previewId, { category, tags, withQuestions, async: true })
+      jobId = r.jobId
+      // 登记 job：页面刷新/轮询中断后可在挂载时恢复（后端 job 保留 10 分钟）
+      jobStoreAdd(jobId, entry.file.name, startedAt)
+      let pollFails = 0
       for (;;) {
-        await new Promise((r) => setTimeout(r, 600))
-        const job = await getUploadJob(jobId).catch((e) => { throw new Error(e?.message || '进度查询失败') })
+        await new Promise((r) => setTimeout(r, pollFails > 0 ? POLL_FAIL_RETRY_MS : POLL_MS))
+        let job
+        try {
+          job = await getUploadJob(jobId)
+          pollFails = 0
+        } catch (e) {
+          pollFails++
+          if (pollFails >= POLL_FAIL_LIMIT) {
+            throw new Error(
+              `进度查询连续 ${POLL_FAIL_LIMIT} 次失败（${e?.message || '网络异常'}），已取消入库；请稍后刷新文档列表确认`,
+            )
+          }
+          // 单次失败不判死：条目显示重试警告，稍后自动重试
+          updateEntry(idx, { stage: `进度查询失败，重试中 (${pollFails}/${POLL_FAIL_LIMIT})…` })
+          continue
+        }
         updateEntry(idx, { stage: STAGE_LABELS[job.stage] ?? job.stage, chunkCount: job.chunkCount ?? entry.chunkCount })
         if (job.stage === 'done') {
+          jobStoreRemove(jobId)
           updateEntry(idx, { status: 'ok', stage: null })
           return true
         }
-        if (job.stage === 'error') throw new Error(job.error || '入库失败')
+        if (job.stage === 'error') {
+          jobStoreRemove(jobId)
+          throw new Error(job.error || '入库失败')
+        }
       }
     } catch (e) {
+      // 前端已判定失败 → 请求后端取消任务：未入库的拦截、已入库的回滚，保持前后端一致
+      // （best effort：取消请求本身失败不掩盖本地错误文案）
+      let cancelResult = null
+      if (jobId) {
+        try {
+          cancelResult = (await cancelUploadJob(jobId))?.result ?? null
+        } catch { /* 取消通道不可达（后端重启 / job 已过期清理） */ }
+      }
+      // 兜底核对：取消不可达（后端可能在任务完成后重启过 / job 过期）或后端已判失败时，
+      // 文档可能已实际入库（进度通道中断≠数据没写入）——按标题核对，命中则改判成功，避免误报
+      if (cancelResult === null || cancelResult === 'alreadyFailed') {
+        const hit = await verifyIndexedByTitle(entry.file.name, startedAt)
+        if (hit) {
+          if (jobId) jobStoreRemove(jobId)
+          updateEntry(idx, { status: 'ok', stage: null })
+          return true
+        }
+      }
+      if (jobId) jobStoreRemove(jobId)
       updateEntry(idx, { status: 'fail', stage: null, error: e?.message || '入库失败' })
       return false
     }

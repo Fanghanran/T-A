@@ -1,5 +1,6 @@
 import { embedMany } from 'ai'
 import * as models from './models.js'
+import { incr, observe } from './metrics.js'
 import { childLogger } from './logger.js'
 import { ServiceUnavailableError } from './errors.js'
 
@@ -54,15 +55,21 @@ export async function embedTexts(texts) {
     )
   }
   try {
+    const t0 = performance.now()
     const { embeddings } = await embedMany({
       model: models.getEmbedModel(),
       values: texts,
     })
     circ.state = 'closed'
+    // Embedding 指标：调用耗时直方图 + 批大小累计（检索/入库共用同一路径）
+    observe('embed_ms', Math.round(performance.now() - t0))
+    incr('embed_total')
+    incr('embed_texts_total', null, texts.length)
     return embeddings
   } catch (err) {
     circ.state = 'open'
     circ.openedAt = Date.now()
+    incr('embed_failures')
     log.error(`[embed] Embedding 调用失败：${err.message}`)
     throw new ServiceUnavailableError(
       `Embedding 调用失败：${err.message}。请检查 Embedding 服务（EMBED_BASE_URL / EMBED_MODEL）状态。`,

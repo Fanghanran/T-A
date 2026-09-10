@@ -1,0 +1,1089 @@
+openapi: 3.1.0
+info:
+  title: Interview Agent RAG API
+  version: 1.0.0
+  description: |
+    面试知识库 RAG 系统后端 HTTP 接口（主要端点）。
+
+    链路：文档上传（两段式 prepare/commit）→ 切片 + 双向量嵌入（text_vector + question_vector）
+    → 混合检索（语义 + 问题锚点 + 2-gram 关键词加权，低分级联 HyDE）→ RAG 流式问答（AI SDK data-stream）。
+
+    ## 认证
+    - 默认 `AUTH_MODE=disabled`（本地单机）：所有 /api 数据请求视为 local 单一用户，无需令牌。
+    - 设置 `AUTH_TOKENS`（user-token 模式）后：除 /api/health、/api/metrics、/api/management 外的
+      /api 路由必须携带 `Authorization: Bearer <用户令牌>`，跨用户数据互相不可见。
+    - /api/management/* 始终要求 `Authorization: Bearer <ADMIN_TOKEN>`。
+
+    ## 流式端点
+    /api/knowledge/ask 与 /api/chat 返回 AI SDK data-stream 协议（Content-Type: text/plain; charset=utf-8），
+    按行分片：`0:"文本分片"`（增量正文）、`2:[{...}]`（message annotations，如检索命中卡片）、
+    `d:{...}`（结束帧，含 finishReason/usage）。客户端应逐行解析。
+servers:
+  - url: http://localhost:3000
+    description: 本地开发 / Docker 部署
+tags:
+  - name: system
+    description: 健康检查与运行指标
+  - name: documents
+    description: 知识库文档生命周期（两段式上传 / 列表 / 详情 / 编辑 / 删除）
+  - name: governance
+    description: 分类、标签与重复块治理
+  - name: retrieval
+    description: 检索与 RAG 问答
+  - name: chat
+    description: 智能体对话（流式）
+  - name: sessions
+    description: 会话管理
+  - name: interview
+    description: 结构化面试题库
+  - name: management
+    description: 管理接口（需管理员令牌）
+
+paths:
+  /api/health:
+    get:
+      tags: [system]
+      summary: 健康检查（含 Milvus / LLM / Embedding 连通性与库内统计）
+      security: []
+      responses:
+        '200':
+          description: 服务健康
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+                  llm:
+                    type: string
+                    description: 当前对话模型描述（如 "openai-compatible:qwen2.5-coder:14b"）
+                  embedding:
+                    type: string
+                    description: 当前 Embedding 模型描述
+                  documents:
+                    type: integer
+                  chunks:
+                    type: integer
+                  questions:
+                    type: integer
+                  orphanDocuments:
+                    type: integer
+        '503':
+          description: 依赖不可用（Milvus 连接失败等）
+
+  /api/metrics:
+    get:
+      tags: [system]
+      summary: 运行指标快照（HTTP 计数 / 检索延迟 / HyDE 触发 / 缓存命中 / LLM 调用）
+      security: []
+      responses:
+        '200':
+          description: 指标快照（进程内存态，重启清零）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  process:
+                    type: object
+                    properties:
+                      uptimeSec:
+                        type: integer
+                  counters:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      additionalProperties:
+                        type: number
+                    description: '计数器，形如 { "http_requests_total": { "GET:/api/health": 12 } }'
+                  histograms:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      additionalProperties:
+                        type: object
+                        properties:
+                          count: { type: integer }
+                          sum: { type: number }
+                          min: { type: number }
+                          max: { type: number }
+                          recent:
+                            type: array
+                            items: { type: number }
+
+  # ---------------- 文档：两段式上传 ----------------
+  /api/knowledge/documents/prepare:
+    post:
+      tags: [documents]
+      summary: 两段式上传·第一阶段（抽文本 + 切片 + 启发式评分，零向量开销）
+      description: |
+        multipart 上传文件（md/txt/pdf/docx 等），同步返回切片预览与质量评分；
+        正文缓存在服务端（TTL 30 分钟），commit 时才做 embedding。
+        内容哈希与已有文档重复时返回 409。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: 文档文件（md/txt/pdf/docx…）
+                chunkStrategy:
+                  type: string
+                  enum: [semantic, delimiter]
+                  default: semantic
+                  description: 切片策略；delimiter 需搭配 delimiter 字段
+                delimiter:
+                  type: string
+                  description: 分隔符（字面字符串，不 trim；仅 chunkStrategy=delimiter 时生效）
+                maxChars:
+                  type: integer
+                  minimum: 50
+                  maximum: 5000
+                  description: 单块字符上限（仅 delimiter 策略）
+                overlapChars:
+                  type: integer
+                  minimum: 0
+                  maximum: 500
+                  default: 0
+                  description: 相邻块滑动窗口重叠字符数（仅 delimiter 策略）
+      responses:
+        '200':
+          description: 预览成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [previewId, chunkCount]
+                properties:
+                  previewId:
+                    type: string
+                    description: 预览凭证（commit 一次性使用，30 分钟过期）
+                  title: { type: string }
+                  size: { type: integer, description: 字节数 }
+                  chunkCount: { type: integer }
+                  avgScore:
+                    type: number
+                    description: 启发式评分均分（0~100）
+                  chunks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        idx: { type: integer }
+                        heading: { type: string, description: 所属标题层级 }
+                        text: { type: string }
+                        chars: { type: integer }
+                        preContext: { type: string, description: 前文上下文 }
+                        postContext: { type: string, description: 后文上下文 }
+                        score: { type: number }
+                        level: { type: string, description: 质量分级 }
+                        issues:
+                          type: array
+                          items: { type: string }
+        '400':
+          description: 缺少 file / 格式不支持 / 策略参数非法 / 文件解析失败
+        '409':
+          description: 内容与已有文档重复
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  duplicate: { type: boolean, const: true }
+                  existingId: { type: string }
+
+  /api/knowledge/documents/commit:
+    post:
+      tags: [documents]
+      summary: 两段式上传·第二阶段（embedding + 入库；支持异步 job）
+      description: previewId 一次性使用；async=true 返回 202 + jobId 供轮询。重复内容返回 409。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [previewId]
+              properties:
+                previewId: { type: string }
+                category:
+                  type: string
+                  default: ''
+                  description: 分类（空串为未分类）
+                tags:
+                  type: array
+                  items: { type: string }
+                  description: 标签（每项 ≤20 字符，最多 10 项）
+                withQuestions:
+                  type: boolean
+                  default: false
+                  description: 是否用 LLM 生成检索锚点问题（Q&A 格式文本自动解析，不走 LLM）
+                async:
+                  type: boolean
+                  default: false
+                  description: true 时返回 202 + jobId
+      responses:
+        '201':
+          description: 同步入库成功，返回文档对象
+        '202':
+          description: 异步任务已受理
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId: { type: string }
+        '400': { description: 缺少 previewId }
+        '409': { description: 内容重复 }
+        '410': { description: 预览不存在或已过期 }
+
+  /api/knowledge/documents/jobs/{id}:
+    get:
+      tags: [documents]
+      summary: 查询异步入库任务进度
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 任务状态（完成任务保留 10 分钟）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  title: { type: string }
+                  stage:
+                    type: string
+                    enum: [chunking, embedding, indexing, done, error]
+                  chunkCount: { type: integer, nullable: true }
+                  doc:
+                    type: object
+                    nullable: true
+                    description: done 时携带入库后的文档对象（含 id）
+                  error: { type: string, nullable: true }
+                  updatedAt: { type: integer, description: 毫秒时间戳 }
+        '404': { description: 任务不存在或已完成清理 }
+
+  /api/knowledge/documents/jobs/{id}/cancel:
+    post:
+      tags: [documents]
+      summary: 取消异步入库任务（前端判定失败后回滚，保证前后端状态一致）
+      description: |
+        进行中 → 标记取消（入库前拦截 / 入库后回滚删除）；
+        已完成 → 直接删除已入库文档（回滚）；已失败 → 幂等返回。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 取消结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+                    enum: [cancelling, rolledBack, alreadyFailed]
+        '404': { description: 任务不存在 }
+
+  # ---------------- 文档：查询 / 管理 ----------------
+  /api/knowledge/documents:
+    get:
+      tags: [documents]
+      summary: 文档列表（过滤 + 排序 + 分页，附启发式评分均分）
+      parameters:
+        - { name: category, in: query, schema: { type: string }, description: 按分类过滤 }
+        - { name: tag, in: query, schema: { type: string }, description: 按标签过滤 }
+        - { name: q, in: query, schema: { type: string }, description: 标题/正文关键词 }
+        - { name: sort, in: query, schema: { type: string, default: uploadedAtDesc } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200':
+          description: 分页列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/DocumentMeta' }
+                  total: { type: integer }
+                  page: { type: integer }
+                  pageSize: { type: integer }
+    post:
+      tags: [documents]
+      summary: 旧版一段式上传（兼容保留；推荐两段式 prepare/commit）
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                category: { type: string }
+                tags: { type: string, description: 逗号分隔 }
+                withQuestions: { type: boolean }
+      responses:
+        '201': { description: 入库成功，返回文档对象 }
+        '409': { description: 内容重复 }
+
+  /api/knowledge/documents/{id}:
+    get:
+      tags: [documents]
+      summary: 文档详情（含正文）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: 文档对象
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentDetail' }
+        '404': { description: 文档不存在 }
+    patch:
+      tags: [documents]
+      summary: 编辑文档（元数据毫秒级；正文触发重切片 + 重嵌入 + 增量向量复用）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: 字段全部选填；只传元数据走 patchMeta，传 content 走重切片
+              properties:
+                title: { type: string, maxLength: 200 }
+                category: { type: string }
+                tags:
+                  type: array
+                  maxItems: 10
+                  items: { type: string, maxLength: 20 }
+                source: { type: string }
+                content:
+                  type: string
+                  minLength: 10
+                  maxLength: 500000
+      responses:
+        '200': { description: 更新后的文档对象 }
+        '400': { description: 字段校验失败 }
+        '404': { description: 文档不存在 }
+    delete:
+      tags: [documents]
+      summary: 删除文档（同步移除全部切片与向量）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: 删除成功 }
+        '404': { description: 文档不存在 }
+
+  /api/knowledge/documents/{id}/status:
+    get:
+      tags: [documents]
+      summary: 文档索引状态（轻量，不含正文；上传/重建后轮询用）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: 索引状态
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  title: { type: string }
+                  status: { type: string, description: 如 indexed / indexing }
+                  indexError: { type: string, nullable: true }
+                  chunkCount: { type: integer, description: 强一致核实计数 }
+                  orphan: { type: boolean, description: true=元数据标记已索引但库里 0 片 }
+        '404': { description: 文档不存在 }
+
+  /api/knowledge/documents/{id}/chunks:
+    get:
+      tags: [documents]
+      summary: 文档切片列表（混合评分：启发式 + 语义信号，结果缓存 10 分钟）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: 切片列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        displayTitle: { type: string }
+                        heading: { type: string }
+                        text: { type: string }
+                        chars: { type: integer }
+                        category: { type: string }
+                        tags: { type: array, items: { type: string } }
+                        score: { type: number }
+                        level: { type: string }
+                        issues: { type: array, items: { type: string } }
+                  total: { type: integer }
+                  avgScore: { type: number }
+                  scoreMode: { type: string, description: heuristic | hybrid（是否有语义信号） }
+        '404': { description: 文档不存在 }
+
+  /api/knowledge/documents/manual:
+    post:
+      tags: [documents]
+      summary: 手动录入单条知识（与上传同一条切片 + 向量化链路）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, content]
+              properties:
+                title: { type: string, maxLength: 200 }
+                content: { type: string, minLength: 10, maxLength: 500000 }
+                category: { type: string, default: '' }
+                tags: { type: array, items: { type: string } }
+                source: { type: string }
+      responses:
+        '201': { description: 入库成功，返回文档对象 }
+        '400': { description: 字段校验失败 }
+        '409': { description: 内容重复 }
+
+  /api/knowledge/documents/batch:
+    post:
+      tags: [documents]
+      summary: 批量操作（delete / setCategory / addTags / removeTag）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, op]
+              properties:
+                ids:
+                  type: array
+                  minItems: 1
+                  items: { type: string }
+                op:
+                  type: string
+                  enum: [delete, setCategory, addTags, removeTag]
+                category: { type: string, description: op=setCategory 时必填 }
+                tags: { type: array, items: { type: string }, description: op=addTags/removeTag 时必填 }
+      responses:
+        '200':
+          description: 批量结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  op: { type: string }
+                  updated: { type: array, items: { type: string } }
+                  failed: { type: array, items: { type: string } }
+        '400': { description: 参数非法 }
+
+  /api/knowledge/preview-chunks:
+    post:
+      tags: [documents]
+      summary: 预览切片（不入库，零副作用，上传前实时预览）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string }
+                strategy: { type: string, enum: [semantic, delimiter], default: semantic }
+                delimiter: { type: string }
+                maxChars: { type: integer, minimum: 50, maximum: 5000 }
+                overlapChars: { type: integer, minimum: 0, maximum: 500 }
+      responses:
+        '200':
+          description: 切片预览（无评分，纯切片）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  chunks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        idx: { type: integer }
+                        heading: { type: string }
+                        text: { type: string }
+                        chars: { type: integer }
+                        preContext: { type: string }
+                        postContext: { type: string }
+                  total: { type: integer }
+        '400': { description: 参数非法 }
+
+  # ---------------- 治理 ----------------
+  /api/knowledge/categories:
+    get:
+      tags: [governance]
+      summary: 分类聚合（含每分类文档数）
+      responses:
+        '200':
+          description: 分类列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name: { type: string }
+                    count: { type: integer }
+
+  /api/knowledge/tags:
+    get:
+      tags: [governance]
+      summary: 标签聚合
+      responses:
+        '200':
+          description: 标签列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name: { type: string }
+                    count: { type: integer }
+
+  /api/knowledge/categories/rename:
+    post:
+      tags: [governance]
+      summary: 分类重命名（to='' 并入未分类）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from]
+              properties:
+                from: { type: string }
+                to: { type: string, maxLength: 50, default: '' }
+      responses:
+        '200':
+          description: 重命名结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  renamed: { type: integer }
+                  affected: { type: array, items: { type: string } }
+                  failed: { type: array, items: { type: string } }
+
+  /api/knowledge/tags/merge:
+    post:
+      tags: [governance]
+      summary: '标签合并（from: string|string[] → to）'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to]
+              properties:
+                from:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items: { type: string }
+                to: { type: string, maxLength: 20 }
+      responses:
+        '200':
+          description: 合并结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merged: { type: integer }
+                  from: { type: array, items: { type: string } }
+                  to: { type: string }
+                  affected: { type: array, items: { type: string } }
+                  failed: { type: array, items: { type: string } }
+
+  /api/knowledge/duplicates/scan:
+    post:
+      tags: [governance]
+      summary: 库内查重扫描（存量切片两两余弦，与入库去重共用阈值）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                maxChunks:
+                  type: integer
+                  minimum: 50
+                  maximum: 2000
+                  default: 800
+      responses:
+        '200': { description: 重复切片对列表 }
+
+  /api/knowledge/duplicates/delete:
+    post:
+      tags: [governance]
+      summary: 清理选中的重复块（保留一个，删其余）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chunkIds]
+              properties:
+                chunkIds:
+                  type: array
+                  minItems: 1
+                  items: { type: string }
+      responses:
+        '200':
+          description: 删除统计
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: integer }
+                  failed: { type: array, items: { type: string } }
+
+  /api/knowledge/orphans/reconcile:
+    post:
+      tags: [governance]
+      summary: 孤儿文档对账重建（元数据标记已索引但库里 0 片的文档重新入库）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                limit: { type: integer, maximum: 50, default: 50 }
+      responses:
+        '200':
+          description: 对账结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scanned: { type: integer }
+                  processed: { type: integer }
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        ok: { type: boolean }
+                        chunkCount: { type: integer }
+                        error: { type: string }
+
+  # ---------------- 检索与问答 ----------------
+  /api/search/query:
+    post:
+      tags: [retrieval]
+      summary: 统一知识检索（结构化题库 + 知识库向量，scope 切换；支持多轮改写与 HyDE 级联）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [q]
+              properties:
+                q: { type: string, maxLength: 20000, description: 查询文本 }
+                scope:
+                  type: string
+                  enum: [question, knowledge, all]
+                  default: all
+                topK: { type: integer, minimum: 1, maximum: 20, default: 5 }
+                category: { type: string }
+                tag: { type: string }
+                techStack: { type: array, items: { type: string }, description: 仅面试题有效 }
+                difficulty: { type: string, description: 仅面试题有效 }
+                company: { type: string, description: 仅面试题有效 }
+                history:
+                  type: array
+                  maxItems: 50
+                  description: 多轮对话上下文（query 改写用）
+                  items:
+                    type: object
+                    properties:
+                      role: { type: string }
+                      content: { type: string }
+      responses:
+        '200':
+          description: 双数据源检索结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  searchMs: { type: integer }
+                  scope: { type: string }
+                  topK: { type: integer }
+                  questionResults:
+                    type: object
+                    nullable: true
+                    description: 结构化题库结果（scope 含 question 时）
+                    properties:
+                      total: { type: integer }
+                      searchMs: { type: integer }
+                      items: { type: array, items: { type: object } }
+                  knowledgeResults:
+                    type: object
+                    nullable: true
+                    description: 知识库向量结果（scope 含 knowledge 时）
+                    properties:
+                      total: { type: integer }
+                      searchMs: { type: integer }
+                      rewritten: { type: boolean, description: 是否触发了 query 改写 }
+                      queries: { type: array, items: { type: string }, description: 实际使用的 query 列表 }
+                      hyde:
+                        type: object
+                        description: HyDE 级联调试信息（未触发时无此字段）
+                        properties:
+                          triggered: { type: boolean }
+                          source: { type: string, description: miss | cache }
+                          reason: { type: string }
+                          added: { type: integer }
+                          ms: { type: integer }
+                      items:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string }
+                            docId: { type: string }
+                            title: { type: string }
+                            heading: { type: string }
+                            snippet: { type: string }
+                            score: { type: number }
+                            category: { type: string }
+                            tags: { type: array, items: { type: string } }
+        '400': { description: q 缺失或非法 }
+
+  /api/knowledge/search:
+    post:
+      tags: [retrieval]
+      summary: 纯知识库语义检索（走 unifiedSearch，返回片段 + 相似度）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                category: { type: string }
+                tag: { type: string }
+                history:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      role: { type: string }
+                      content: { type: string }
+      responses:
+        '200':
+          description: 检索结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results: { type: array, items: { type: object } }
+                  rewritten: { type: boolean }
+                  queries: { type: array, items: { type: string } }
+
+  /api/knowledge/ask:
+    post:
+      tags: [retrieval]
+      summary: RAG 流式问答（AI SDK data-stream）
+      description: |
+        先检索知识库（支持 history 多轮改写 + HyDE 级联），再流式生成回答。
+        响应体按行分片：`0:"..."` 正文增量、`2:[{type:"search_results",results:[...]}]` 检索命中注解、
+        `d:{finishReason,usage}` 结束帧。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string, maxLength: 20000 }
+                category: { type: string }
+                tag: { type: string }
+                history:
+                  type: array
+                  maxItems: 50
+                  items:
+                    type: object
+                    properties:
+                      role: { type: string }
+                      content: { type: string }
+      responses:
+        '200':
+          description: data-stream 流式响应
+          content:
+            text/plain:
+              schema:
+                type: string
+                description: '按行的 data-stream 协议（0:/2:/d: 前缀）'
+
+  # ---------------- 对话与会话 ----------------
+  /api/chat:
+    post:
+      tags: [chat]
+      summary: 智能体对话（流式 data-stream；会话持久化 SQLite）
+      description: 按消息路由到内置智能体（知识库问答 / 简历分析 / 模拟面试 / 文档处理等），流式返回。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                messages:
+                  type: array
+                  maxItems: 100
+                  items:
+                    type: object
+                    properties:
+                      role: { type: string, enum: [user, assistant, system, tool] }
+                      content: { type: string, maxLength: 32000 }
+                sessionId: { type: string, description: 不传则新建会话 }
+                agentName: { type: string }
+                resumeText: { type: string, maxLength: 200000, description: 简历分析智能体 }
+                jd: { type: string, maxLength: 20000, description: 岗位 JD }
+      responses:
+        '200':
+          description: data-stream 流式响应
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /api/sessions:
+    get:
+      tags: [sessions]
+      summary: 会话列表
+      responses:
+        '200':
+          description: 会话摘要列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string }
+                    title: { type: string }
+                    updatedAt: { type: integer }
+    post:
+      tags: [sessions]
+      summary: 新建会话
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+      responses:
+        '201': { description: 会话对象 }
+
+  /api/sessions/{id}:
+    get:
+      tags: [sessions]
+      summary: 会话详情（含消息）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 会话对象 }
+        '404': { description: 会话不存在 }
+    patch:
+      tags: [sessions]
+      summary: 更新会话（如标题）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 更新后对象 }
+    delete:
+      tags: [sessions]
+      summary: 删除会话
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: 删除成功 }
+
+  # ---------------- 面试题库 ----------------
+  /api/interview/questions:
+    get:
+      tags: [interview]
+      summary: 面试题列表（支持分类过滤）
+      responses:
+        '200': { description: 题目列表 }
+    post:
+      tags: [interview]
+      summary: 新增面试题
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '201': { description: 创建成功 }
+
+  /api/interview/search:
+    post:
+      tags: [interview]
+      summary: 面试题搜索
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200': { description: 搜索结果 }
+
+  /api/interview/stats:
+    get:
+      tags: [interview]
+      summary: 题库统计
+      responses:
+        '200': { description: 各分类题量统计 }
+
+  # ---------------- 管理（需 ADMIN_TOKEN） ----------------
+  /api/management/overview:
+    get:
+      tags: [management]
+      summary: 运行总览（工具/工作流启停状态 + 运行统计）
+      responses:
+        '200': { description: 管理总览 }
+        '401': { description: 管理员令牌缺失或无效 }
+
+  /api/management/tools:
+    get:
+      tags: [management]
+      summary: 工具注册表（含启停状态、依赖关系、调用统计）
+      responses:
+        '200': { description: 工具列表 }
+
+  /api/management/workflows:
+    get:
+      tags: [management]
+      summary: 工作流注册表
+      responses:
+        '200': { description: 工作流列表 }
+
+  /api/management/tunables:
+    get:
+      tags: [management]
+      summary: 调优参数当前值（chunker/scoring/dedup/rewrite/hyde 分组）
+      responses:
+        '200': { description: 参数表 }
+
+  /api/management/tunables/reset:
+    post:
+      tags: [management]
+      summary: 恢复全部调优参数为默认值
+      responses:
+        '200': { description: 恢复结果 }
+
+  /api/management/audit:
+    get:
+      tags: [management]
+      summary: 操作审计（启停/参数修改/恢复默认，追加写 audit.jsonl）
+      responses:
+        '200': { description: 审计记录 }
+
+  /api/management/models/settings:
+    put:
+      tags: [management]
+      summary: 更新模型运行时设置（qwen3 思考模式开关），热生效
+      description: |
+        thinking=false 时对 qwen3 系列模型的 chat 请求注入 reasoning_effort:'none'
+        （OpenAI 标准参数，Ollama 兼容端点支持），跳过思维链直接作答。
+        仅影响 qwen3* 模型；随 models.json 持久化。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                thinking: { type: boolean, description: 思考模式（默认 true 开启） }
+      responses:
+        '200': { description: 更新后的设置 }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        管理接口用 ADMIN_TOKEN；user-token 模式下数据接口用用户令牌。
+        AUTH_MODE=disabled（默认本地模式）时无需认证。
+  schemas:
+    DocumentMeta:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        category: { type: string }
+        tags: { type: array, items: { type: string } }
+        size: { type: integer, description: 正文字节数 }
+        status: { type: string, description: indexed / indexing / failed }
+        chunkCount: { type: integer }
+        avgScore: { type: number, description: 启发式评分均分（0~100） }
+        uploadedAt: { type: integer, format: int64, description: 毫秒时间戳 }
+        indexedAt: { type: integer, format: int64, nullable: true }
+        indexError: { type: string, nullable: true }
+    DocumentDetail:
+      allOf:
+        - $ref: '#/components/schemas/DocumentMeta'
+        - type: object
+          properties:
+            content: { type: string, description: 文档正文 }
+            source: { type: string, description: 来源 }
+
+security:
+  - bearerAuth: []

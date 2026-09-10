@@ -1,5 +1,6 @@
 import { streamText, generateText } from 'ai'
 import { llmAvailable } from './config.js'
+import { incr, observe } from './metrics.js'
 import { childLogger } from './logger.js'
 import { getChatModel } from './llmProvider.js'
 import { stubStream, prependAnnotation } from './streamUtils.js'
@@ -7,6 +8,30 @@ import { stripToJson } from './textUtils.js'
 import { ServiceUnavailableError } from './errors.js'
 
 const log = childLogger('llm')
+
+/**
+ * LLM 调用指标打点（供 /api/metrics）：
+ *  - timedGenerateText：generateText 全程计时（llm_generate_ms / llm_generate_total，按 op 分标签）
+ *  - streamText 不等待流结束（返回即可），只记发起次数（llm_stream_total，按 fn 分标签）
+ */
+async function timedGenerateText(opts, op) {
+  const t0 = performance.now()
+  try {
+    const r = await generateText(opts)
+    observe('llm_generate_ms', Math.round(performance.now() - t0), { op })
+    incr('llm_generate_total', { op })
+    return r
+  } catch (err) {
+    incr('llm_generate_failures', { op })
+    throw err
+  }
+}
+
+/** 流式生成发起计数（streamText 返回即结束、不等待流完，只记次数不记耗时） */
+async function countedStreamText(opts, fn) {
+  incr('llm_stream_total', { fn })
+  return streamText(opts)
+}
 
 /**
  * Fail-Fast 守卫（ADR-009）：模型未连接时显式报错，禁止降级为占位/假回答。
@@ -144,7 +169,7 @@ export async function streamRagAnswer({ query, chunks, searchMs = 0, history, ag
   const hasChunks = chunks.length > 0
   const historyCtx = buildHistoryContext(history, query)
 
-  const result = await streamText({
+  const result = await countedStreamText({
     model: getChatModel({ role: 'chat.rag', agentId }),
     abortSignal: signal,
     system: withMemory(
@@ -157,7 +182,7 @@ export async function streamRagAnswer({ query, chunks, searchMs = 0, history, ag
       memoryBlock,
     ),
     prompt: `${historyCtx}知识库片段：\n${context}\n\n用户问题：${query}`,
-  })
+  }, 'rag')
   return prependAnnotation(result.toDataStream(), annotation)
 }
 
@@ -175,12 +200,11 @@ export async function streamChat({ query, techStack, history, agentId, memoryBlo
     + (historyCtx ? ' 如果提供了「历史对话上下文」段落，请结合前文语境延续对话，不要当作孤立单轮。' : ''),
     memoryBlock,
   )
-  const result = await streamText({
+  const result = await countedStreamText({
     model: getChatModel({ role: 'chat.general', agentId }),
-    abortSignal: signal,
     system,
     prompt: `${historyCtx}${query}`,
-  })
+  }, 'chat')
   return result.toDataStream()
 }
 
@@ -202,7 +226,7 @@ async function generateStructuredJSON({ system, prompt, label, role, agentId, si
   let lastErr = null
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const { text: out } = await generateText({ model: getChatModel({ role, agentId }), system, prompt, abortSignal: signal })
+      const { text: out } = await timedGenerateText({ model: getChatModel({ role, agentId }), system, prompt, abortSignal: signal }, label)
       return JSON.parse(stripToJson(out))
     } catch (e) {
       lastErr = e
@@ -310,12 +334,12 @@ export async function streamMockInterview({ query, techStack, history, results, 
     `第一题：请讲讲 React 中 key 的作用，如果用数组索引作 key 会有什么问题？\n（考察点：列表 diff 机制与常见坑）\n` +
     `输出为自然语言，不要输出 JSON。` +
     sampleQs
-  const result = await streamText({
+  const result = await countedStreamText({
     model: getChatModel({ role: 'chat.interview.qa', agentId }),
     abortSignal: signal,
     system: withMemory(system, memoryBlock),
     prompt: `${historyCtx}候选人：${query}`,
-  })
+  }, 'mock-interview')
   return result.toDataStream()
 }
 
@@ -461,12 +485,12 @@ export async function streamInterviewAnswer({
     prompt = `${historyCtx}用户问题：${query}`
   }
 
-  const inner = await streamText({
+  const inner = await countedStreamText({
     model: getChatModel({ role: 'chat.interview', agentId }),
     abortSignal: signal,
     system: withMemory(system, memoryBlock),
     prompt,
-  })
+  }, 'interview')
   return prependAnnotation(inner.toDataStream(), annotations)
 }
 
@@ -483,7 +507,7 @@ export async function streamInterviewAnswer({
  * @param {{questionsPerChunk?:number, timeoutMs?:number}} opts
  * @returns {Promise<Array<{topic:string, questions:string[]}>>} 长度与 chunks 一一对应
  */
-export async function generateChunkAnnotations(chunks, { questionsPerChunk = 3, timeoutMs = 8000, agentId = 'doc-processor' } = {}) {
+export async function generateChunkAnnotations(chunks, { questionsPerChunk = 3, timeoutMs = 20000, agentId = 'doc-processor' } = {}) {
   const safeChunks = Array.isArray(chunks) ? chunks : []
   // 默认降级结果（先占好位置，LLM 成功时再按 idx 覆盖）
   const fallback = (c) => ({
@@ -497,14 +521,37 @@ export async function generateChunkAnnotations(chunks, { questionsPerChunk = 3, 
 
   requireLLM() // 无 LLM 显式报错；调用方（prepareDocChunksAndVectors）catch 后按「无标注」降级并记录日志
 
+  const qpc = Math.max(1, Math.min(10, Number.isFinite(questionsPerChunk) ? questionsPerChunk : 3))
+
+  // 分批调用：本地小模型单次生成过多块的 (topic+问题) JSON 输出 token 过大，
+  // 在超时预算内几乎必失败（实测 16 块 8s 全量调用超时 → questions 静默丢失）。
+  // 每批 4 块独立调用、独立超时，失败批仅自身降级不影响其他批。
+  const BATCH_SIZE = 4
+  for (let s = 0; s < safeChunks.length; s += BATCH_SIZE) {
+    const batch = safeChunks.slice(s, s + BATCH_SIZE)
+    try {
+      await _annotateBatch(batch, s, qpc, timeoutMs, agentId, results)
+    } catch (err) {
+      log.warn(
+        `[llm.generateChunkAnnotations] 批次 ${s}~${s + batch.length - 1} 生成失败（${err.message}），该批降级 heading/30字 兜底`,
+      )
+    }
+  }
+  return results
+}
+
+/**
+ * 单批标注：构造 prompt → LLM 调用（race 超时兜底）→ 解析 JSON 写回全局 results。
+ * batch 内切片在 prompt 中使用全局 idx（baseIdx 起），LLM 输出按 idx 对齐写回。
+ * 抛错由调用方（generateChunkAnnotations 分批循环）捕获并降级该批。
+ */
+async function _annotateBatch(batch, baseIdx, qpc, timeoutMs, agentId, results) {
   // 只送有意义的字段：heading + text 前 600 字（避免 prompt 爆长）
-  const promptPayload = safeChunks.map((c, i) => ({
-    idx: i,
+  const promptPayload = batch.map((c, i) => ({
+    idx: baseIdx + i,
     heading: c.heading || '',
     text: typeof c.text === 'string' ? c.text.slice(0, 600) : '',
   }))
-
-  const qpc = Math.max(1, Math.min(10, Number.isFinite(questionsPerChunk) ? questionsPerChunk : 3))
 
   const prompt =
     `你是知识切片标注专家。请为以下每个"文档切片"生成：\n` +
@@ -517,59 +564,52 @@ export async function generateChunkAnnotations(chunks, { questionsPerChunk = 3, 
     `输入切片 JSON：\n${JSON.stringify(promptPayload, null, 0)}\n`
 
   let raw = ''
-  try {
-    // 用 Promise.race 兜底超时（abortSignal 在 streamText 上实测不可靠，会卡死）
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
+  // 用 Promise.race 兜底超时（abortSignal 在 streamText 上实测不可靠，会卡死）
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
 
-    const llmPromise = generateText({
-      model: getChatModel({ role: 'chat.annotations', agentId }),
-      temperature: 0,
-      prompt,
-      abortSignal: controller.signal,
-    })
+  const llmPromise = timedGenerateText({
+    model: getChatModel({ role: 'chat.annotations', agentId }),
+    temperature: 0,
+    prompt,
+    abortSignal: controller.signal,
+  }, 'chunk-annotations')
 
-    // 关键：abort 会让 llmPromise reject。外层虽有 try/catch，但只要还有**任何一处**
-    // 引用它却没挂 rejection handler，就会变成 unhandled rejection 直接打挂进程
-    // （实测：上传 PDF 触发标注超时，服务当场崩溃）。这里显式标记「已处理」，
-    // 真正的失败仍由下面的 race 捕获并降级。
-    llmPromise.catch(() => {})
+  // 关键：abort 会让 llmPromise reject。外层虽有 try/catch，但只要还有**任何一处**
+  // 引用它却没挂 rejection handler，就会变成 unhandled rejection 直接打挂进程
+  // （实测：上传 PDF 触发标注超时，服务当场崩溃）。这里显式标记「已处理」，
+  // 真正的失败仍由下面的 race 捕获并降级。
+  llmPromise.catch(() => {})
 
-    const timeoutPromise = new Promise((_, reject) => {
-      const t = setTimeout(() => reject(new Error(`generateText 超时 ${timeoutMs}ms`)), timeoutMs + 2000)
-      // 让 Promise.race 完成后能清理这个 timer。同样要吞掉 reject，否则 abort 时
-      // 这条链会把进程带崩。
-      Promise.race([llmPromise])
-        .finally(() => clearTimeout(t))
-        .catch(() => {})
-    })
+  const timeoutPromise = new Promise((_, reject) => {
+    const t = setTimeout(() => reject(new Error(`generateText 超时 ${timeoutMs}ms`)), timeoutMs + 2000)
+    // 让 Promise.race 完成后能清理这个 timer。同样要吞掉 reject，否则 abort 时
+    // 这条链会把进程带崩。
+    Promise.race([llmPromise])
+      .finally(() => clearTimeout(t))
+      .catch(() => {})
+  })
 
-    const result = await Promise.race([llmPromise, timeoutPromise])
-    clearTimeout(timer)
-    raw = result?.text ?? ''
-    if (!raw) return results
-    // 尝试解 JSON：容忍前后 ```json 包裹 / 非 JSON 前缀
-    const jsonStr = stripToJson(raw)
-    const arr = JSON.parse(jsonStr)
-    if (!Array.isArray(arr)) return results
-    for (const it of arr) {
-      const i = Number.isInteger(it?.idx) ? it.idx : -1
-      if (i < 0 || i >= results.length) continue
-      const topic = typeof it.topic === 'string' ? it.topic.trim().slice(0, 120) : ''
-      const questions = Array.isArray(it.questions)
-        ? it.questions
-            .map((q) => (typeof q === 'string' ? q.trim() : ''))
-            .filter((q) => q && q.length <= 160)
-            .slice(0, qpc + 2)
-        : []
-      if (topic) results[i].topic = topic
-      if (questions.length) results[i].questions = questions
-    }
-    return results
-  } catch (err) {
-    // 所有异常（超时 / 解析失败 / 网络错）→ 降级，不吞默认 warning 便于排查
-    log.warn(`[llm.generateChunkAnnotations] 生成失败（${err.message}），降级 heading/30字 兜底`)
-    return results
+  const result = await Promise.race([llmPromise, timeoutPromise])
+  clearTimeout(timer)
+  raw = result?.text ?? ''
+  if (!raw) return
+  // 尝试解 JSON：容忍前后 ```json 包裹 / 非 JSON 前缀
+  const jsonStr = stripToJson(raw)
+  const arr = JSON.parse(jsonStr)
+  if (!Array.isArray(arr)) return
+  for (const it of arr) {
+    const i = Number.isInteger(it?.idx) ? it.idx : -1
+    if (i < 0 || i >= results.length) continue
+    const topic = typeof it.topic === 'string' ? it.topic.trim().slice(0, 120) : ''
+    const questions = Array.isArray(it.questions)
+      ? it.questions
+          .map((q) => (typeof q === 'string' ? q.trim() : ''))
+          .filter((q) => q && q.length <= 160)
+          .slice(0, qpc + 2)
+      : []
+    if (topic) results[i].topic = topic
+    if (questions.length) results[i].questions = questions
   }
 }
 
@@ -594,7 +634,7 @@ export async function summarizeSession({ prevSummary, turns, budgetChars = 600, 
   const prompt =
     `已有摘要（可能为空）：\n${prevSummary || '（无）'}\n\n新增对话：\n${memoryDialog(turns)}\n\n` +
     `请输出合并后的摘要，不超过 ${Math.ceil(budgetChars)} 字。`
-  const { text } = await generateText({ model: getChatModel({ role, agentId }), system, prompt })
+  const { text } = await timedGenerateText({ model: getChatModel({ role, agentId }), system, prompt }, 'summarize')
   const out = String(text ?? '').trim()
   if (!out) {
     throw new ServiceUnavailableError(
@@ -633,6 +673,157 @@ export async function extractMemories({ turns, maxFacts = 5, role, agentId }) {
     out.push({ text: t, scope: it?.scope === 'global' ? 'global' : 'session' })
   }
   return out.slice(0, maxFacts)
+}
+
+/* ===================== LLM Wiki（知识网络词条生成，wikiBuilder 调用） ===================== */
+
+/**
+ * 带超时的 generateText：Promise.race 竞速 + AbortController（wiki 生成任务
+ * 专用，防单个 LLM 调用挂死拖住整个后台 job）。unhandled rejection 防护
+ * 与 _annotateBatch 同款：llmPromise 显式挂 rejection handler + timeout
+ * 链自清理，真正的失败仍由 race 捕获向上抛。
+ */
+async function generateTextWithTimeout(opts, op, timeoutMs) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const llmPromise = timedGenerateText({ ...opts, abortSignal: controller.signal }, op)
+  llmPromise.catch(() => {})
+  const timeoutPromise = new Promise((_, reject) => {
+    const t = setTimeout(() => reject(new Error(`generateText 超时 ${timeoutMs}ms`)), timeoutMs + 2000)
+    Promise.race([llmPromise]).finally(() => clearTimeout(t)).catch(() => {})
+  })
+  try {
+    return await Promise.race([llmPromise, timeoutPromise])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * 实体抽取：为一批切片识别核心概念/术语/技术/产品等 wiki 词条候选。
+ * 输入 [{ idx, heading, text }]，输出按 idx 对齐的 Map：idx → [{ name, type, context }]。
+ * @param {Array<{idx:number,heading?:string,text:string}>} batch 一批切片（建议 ≤4）
+ * @param {{entitiesPerChunk?:number, timeoutMs?:number, agentId?:string}} [opts]
+ * @returns {Promise<Map<number, Array<{name:string,type:string,context:string}>>>}
+ */
+export async function extractWikiEntities(batch, { entitiesPerChunk = 5, timeoutMs = 60000, agentId } = {}) {
+  requireLLM()
+  const prompt =
+    `你是知识库实体抽取专家。请从以下每个"文档切片"中识别值得建百科词条的核心实体：\n` +
+    `技术概念、框架、语言、算法、协议、产品、工具、人物、机构、业务领域术语等。\n\n` +
+    `要求：\n` +
+    `- 输出 STRICT JSON，不要任何 markdown 代码块/解释文字。\n` +
+    `- 根是数组，每项形如 {"idx":0,"entities":[{"name":"实体名","type":"concept|tech|product|person|org|term","context":"该实体出现的原句（截取含实体的一句话，不超过 80 字）"}]}。\n` +
+    `- 每个切片最多 ${entitiesPerChunk} 个实体；只抽"会被单独提问/值得解释"的实体，跳过普通词。\n` +
+    `- name 用原文中最规范完整的写法；context 必须是原文子串。\n` +
+    `- 没有值得抽的实体就输出空数组 entities:[]。\n\n` +
+    `输入切片 JSON：\n${JSON.stringify(batch, null, 0)}\n`
+  const r = await generateTextWithTimeout(
+    { model: getChatModel({ role: 'chat.wiki', agentId }), temperature: 0, prompt },
+    'wiki-extract',
+    timeoutMs,
+  )
+  const out = new Map()
+  const arr = JSON.parse(stripToJson(r?.text ?? ''))
+  if (!Array.isArray(arr)) return out
+  for (const it of arr) {
+    const i = Number.isInteger(it?.idx) ? it.idx : -1
+    if (i < 0 || !batch.some((b) => b.idx === i)) continue
+    const entities = (Array.isArray(it?.entities) ? it.entities : [])
+      .map((e) => ({
+        name: typeof e?.name === 'string' ? e.name.trim().slice(0, 80) : '',
+        type: typeof e?.type === 'string' ? e.type.trim().slice(0, 20) : 'term',
+        context: typeof e?.context === 'string' ? e.context.trim().slice(0, 120) : '',
+      }))
+      .filter((e) => e.name.length >= 2)
+      .slice(0, entitiesPerChunk)
+    out.set(i, entities)
+  }
+  return out
+}
+
+/**
+ * 实体归一：把不同写法/别名的同名实体合并成组（如 "RAG" 与 "检索增强生成"）。
+ * @param {string[]} names 去重后的实体名列表（建议每批 ≤40）
+ * @param {{timeoutMs?:number, agentId?:string}} [opts]
+ * @returns {Promise<Array<{canonical:string, aliases:string[]}>>} 归组结果（并集=输入集合）
+ */
+export async function normalizeWikiEntities(names, { timeoutMs = 60000, agentId } = {}) {
+  requireLLM()
+  const prompt =
+    `你是知识库实体归一专家。下面是知识库抽取出的实体名列表，请把指向同一事物的名字合并成一组：\n` +
+    `- 同一概念的中英文写法（"RAG" 与 "检索增强生成"）\n` +
+    `- 简称与全称（"Milvus" 与 "Milvus 向量数据库"若指同一产品）\n` +
+    `- 大小写/分隔符差异（"NodeJS" 与 "Node.js"）\n\n` +
+    `要求：\n` +
+    `- 输出 STRICT JSON，不要任何 markdown 代码块/解释文字。\n` +
+    `- 根是数组，每项形如 {"canonical":"规范名","aliases":["其他写法1","其他写法2"]}。\n` +
+    `- canonical 选用最规范常用、信息量充分的写法；aliases 只放列表中出现过的其他写法。\n` +
+    `- 没有可合并的就单项自成一组（aliases 为空数组）；不得发明列表中不存在的名字。\n` +
+    `- 所有输入名字都必须恰好出现在某一个组里（canonical 或 aliases），不重不漏。\n\n` +
+    `输入实体名 JSON：\n${JSON.stringify(names, null, 0)}\n`
+  const r = await generateTextWithTimeout(
+    { model: getChatModel({ role: 'chat.wiki', agentId }), temperature: 0, prompt },
+    'wiki-normalize',
+    timeoutMs,
+  )
+  const groups = []
+  const arr = JSON.parse(stripToJson(r?.text ?? ''))
+  if (!Array.isArray(arr)) throw new Error('归一输出不是数组')
+  const seen = new Set()
+  for (const g of arr) {
+    const canonical = typeof g?.canonical === 'string' ? g.canonical.trim().slice(0, 80) : ''
+    if (!canonical) continue
+    const aliases = (Array.isArray(g?.aliases) ? g.aliases : [])
+      .map((a) => (typeof a === 'string' ? a.trim().slice(0, 80) : ''))
+      .filter((a) => a && a !== canonical)
+    const all = [canonical, ...aliases].filter((n) => {
+      if (seen.has(n)) return false
+      seen.add(n)
+      return true
+    })
+    if (all.length) groups.push({ canonical: all[0], aliases: all.slice(1) })
+  }
+  // 兜底：LLM 漏掉的名字各自成组（保证不重不漏的输入覆盖）
+  for (const n of names) {
+    if (!seen.has(n)) groups.push({ canonical: n, aliases: [] })
+  }
+  return groups
+}
+
+/**
+ * 词条摘要：根据词条名、别名与全部提及上下文，生成百科式摘要。
+ * @param {{name:string, aliases?:string[], contexts:string[]}} entry
+ * @param {{budgetChars?:number, timeoutMs?:number, agentId?:string}} [opts]
+ * @returns {Promise<string>} 摘要正文（≤ budgetChars）
+ */
+export async function summarizeWikiEntry({ name, aliases = [], contexts }, { budgetChars = 400, timeoutMs = 60000, agentId } = {}) {
+  requireLLM()
+  const ctx = (Array.isArray(contexts) ? contexts : [])
+    .map((c) => String(c ?? '').trim())
+    .filter(Boolean)
+    .slice(0, 24) // 提及上下文截断（防 prompt 膨胀）
+  const prompt =
+    `请为知识库词条「${name}」写一段百科式摘要。\n\n` +
+    `别名：${aliases.length ? aliases.join('、') : '（无）'}\n\n` +
+    `知识库中提及该词条的原文片段：\n${ctx.map((c, i) => `【${i + 1}】${c}`).join('\n')}\n\n` +
+    `要求：\n` +
+    `- 优先依据上述原文片段下定义、讲清楚它在本知识库语境下的含义与作用。\n` +
+    `- 只输出摘要正文（不超过 ${budgetChars} 字），禁止标题、编号列表、markdown 符号与"摘要："之类前缀。\n` +
+    `- 原文片段信息不足时，可用你的通用知识补充，但不要与原文冲突。`
+  const r = await generateTextWithTimeout(
+    { model: getChatModel({ role: 'chat.wiki', agentId }), temperature: 0.2, prompt },
+    'wiki-summary',
+    timeoutMs,
+  )
+  const out = String(r?.text ?? '').trim()
+  if (!out) {
+    throw new ServiceUnavailableError(
+      `词条「${name}」摘要生成失败：模型返回空内容`,
+      'LLM_OUTPUT_INVALID',
+    )
+  }
+  return out.slice(0, budgetChars)
 }
 
 export { llmAvailable }

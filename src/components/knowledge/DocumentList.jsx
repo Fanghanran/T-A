@@ -73,13 +73,13 @@ export function DocumentList({
   const selN = hasBatch ? selectedIds.length : 0
 
   const selectClass = cn(
-    'h-9 rounded-md border border-input bg-background px-2 text-xs',
-    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
+    'h-8 rounded-md border border-input bg-background px-2 text-xs',
+    'transition-colors focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30',
   )
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* 顶部工具栏：排序 + 搜索占位 */}
+      {/* 顶部工具栏：排序 + 计数 */}
       <div className="flex items-center gap-2 border-b px-3 py-2">
         <div className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
           <ArrowUpDown className="h-3.5 w-3.5" />
@@ -99,7 +99,11 @@ export function DocumentList({
         </select>
         <div className="ml-auto text-[11px] text-muted-foreground tabular-nums">
           {total != null ? `${total.toLocaleString()} 篇` : null}
-          {selN > 0 ? ` · 已选 ${selN}` : null}
+          {selN > 0 ? (
+            <span className="ml-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-primary">
+              已选 {selN}
+            </span>
+          ) : null}
         </div>
       </div>
 
@@ -126,9 +130,16 @@ export function DocumentList({
           )}
 
           {!loading && documents.length === 0 && (
-            <div className="flex flex-col items-center gap-2 py-12 text-center text-sm text-muted-foreground">
-              <Inbox className="h-8 w-8" />
-              <span>暂无文档，点击右上角上传或手动录入</span>
+            <div className="flex flex-col items-center gap-3 py-14 text-center">
+              <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-dashed bg-muted/30">
+                <Inbox className="h-5 w-5 text-muted-foreground/70" />
+              </div>
+              <div className="flex flex-col gap-1">
+                <p className="text-sm text-foreground/80">暂无文档</p>
+                <p className="text-xs text-muted-foreground">
+                  点击上方「上传」或「新建知识」录入第一篇
+                </p>
+              </div>
             </div>
           )}
 

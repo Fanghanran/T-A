@@ -194,7 +194,7 @@ export function ChatPage({
           />
         )}
         {isInterview && !isLoading && (
-          <div className="flex items-center justify-end gap-2 px-4 pb-1 md:px-6">
+          <div className="flex shrink-0 items-center justify-end gap-2 px-4 pb-1 md:px-6">
             <Button
               type="button"
               size="sm"

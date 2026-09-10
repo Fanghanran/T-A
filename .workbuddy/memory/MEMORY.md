@@ -5,12 +5,29 @@
 ## 技术栈
 - 前端：React 18 + Vite + Tailwind + shadcn/ui + Vercel AI SDK（`src/`，无 react-router，`AppShell` 用 `view` state 三态切换）
 - 后端：Node + Express（`server/`，`index.js` 单文件 57KB 承载全部 30 条路由，`lib/` 12 个模块）
-- 存储：SQLite（会话/消息/标注，better-sqlite3）+ JSON（文档/切片元数据）+ vectra（向量）
-- 模型：本地 Ollama，`qwen2.5-coder:14b` 生成 + `nomic-embed-text` 向量化，端口 3000
+- 存储：SQLite（会话/消息/标注，better-sqlite3）+ Milvus（向量，1024 维）+ Elasticsearch（BM25 第三通道）
+- 模型：本地 Ollama，`qwen3:14b` 生成 + `bge-m3` 向量化（dim=1024），端口 3000
 
 ## ⚠️ 环境硬约束
 **Windows，没有 VS C++ Build Tools。** 所有需要编译原生 C++ 的依赖都装不上（faiss-node 即因此放弃）。
 今后引入任何新依赖，优先选纯 JS/TS 实现或提供预编译二进制的包。
+
+### ⚠️ 必须用 Node 24 跑后端（不是 Node 22）
+`better-sqlite3` 的原生模块是用 **Node 24（ABI 137）** 编译的。用 Node 22（ABI 127）启动会报：
+```
+ERR_DLOPEN_FAILED ... NODE_MODULE_VERSION 137 vs 127
+```
+后果很隐蔽：后端**能起来、检索问答都正常**，但会话接口全挂（`SESSION_DB_UNAVAILABLE`），
+因为 sessionStore 走进了只读降级分支 —— 只看健康检查发现不了。
+
+- 正确启动：`"C:/Program Files/nodejs/node.exe" --env-file-if-exists=.env index.js`（v24.17.0）
+- 若重装/升级 Node，需 `npm rebuild better-sqlite3` 或重装该包以对齐 ABI
+
+## 服务启动顺序（后端强依赖 Milvus）
+1. Milvus：`docker compose -f milvus-compose.yml up -d`（三容器 healthy）
+2. Ollama：本地服务，需有 qwen3:14b + bge-m3
+3. Elasticsearch：`docker compose -f docker-compose.yml up -d elasticsearch`（`ES_ENABLED=on` 时必需，约 5 秒就绪）
+4. 后端（Node 24）→ 5. 前端 `npm run dev`
 
 ## 向量数据库选型
 | 阶段 | 选型 | 状态 |

@@ -70,7 +70,7 @@ export function MessageList({ messages, isLoading, chatId, onAdjust }) {
     (!lastMessage || lastMessage.role === 'user' || !lastMessage.content)
 
   return (
-    <ScrollArea className="flex-1 scrollbar-thin">
+    <ScrollArea className="min-h-0 flex-1 scrollbar-thin">
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-6 md:px-6">
         {messages.length === 0 && !isLoading && (
           <div className="mt-16 text-center text-sm text-muted-foreground">

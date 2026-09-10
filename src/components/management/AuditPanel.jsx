@@ -10,7 +10,7 @@ import { fetchAudit } from '@/lib/managementApi'
  * 自包含：挂载即拉取数据，右上角自带「刷新」。数据来源：
  * GET /api/management/audit?limit（append-only audit.jsonl，时间倒序）。
  *
- * 使用方：pages/AuditPage.jsx（侧边栏「操作审计」独立菜单视图）。
+ * 使用方：AuditManagePage（操作审计页 · 历史记录区）。
  *
  * @param {Object} [props]
  * @param {number} [props.limit=50] 拉取条数上限

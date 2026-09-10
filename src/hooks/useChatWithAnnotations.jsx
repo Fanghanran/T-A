@@ -103,7 +103,18 @@ export function useChatWithAnnotations(options) {
 
       const stream = new ReadableStream({
         async pull(controller) {
-          const { done, value } = await reader.read()
+          let done, value
+          try {
+            ;({ done, value } = await reader.read())
+          } catch (err) {
+            // 读取中途被中止（stop / 离开页面 / 请求被取消）：底层 read() 抛
+            // AbortError 时下游不会调 cancel()、也到不了 done 分支，槽位必须
+            // 在此显式释放，否则 streamGate 计数泄漏，3 次后永久「并行流上限」。
+            // 释放后照常向上传播：SDK（ai@3 triggerRequest）对 AbortError 静默
+            // 返回 null，不会进 error 态，UI 行为不受影响。
+            release()
+            throw err
+          }
           if (done) {
             // 流结束：处理残留缓冲（协议上每行都应以 \n 结尾，此处兜底）
             if (lineBuf) {

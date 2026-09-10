@@ -14,6 +14,7 @@ import { errorHandler } from './lib/errors.js'
 import { requestTrace } from './lib/requestTrace.js'
 import { corsOptions, securityHeaders, adminAuth, rateLimiters } from './lib/security.js'
 import * as principal from './lib/principal.js'
+import { runWithActor } from './lib/management/audit.js'
 import {
   llmMode,
   embeddingMode,
@@ -30,6 +31,7 @@ import { embedTexts } from './lib/embed.js'
 
 // ── 路由层（app 唯一消费者；路由内部再各自依赖 lib 领域模块）──
 import { healthRouter } from './routes/health.js'
+import { metricsRouter } from './routes/metrics.js'
 import { sessionsRouter } from './routes/sessions.js'
 import { interviewRouter } from './routes/interview.js'
 import { knowledgeRouter } from './routes/knowledge.js'
@@ -79,7 +81,17 @@ app.use(express.json({ limit: '8mb' }))
 
 // ── 路由挂载（顺序无关：各 Router 内部使用绝对路径）──
 app.use(healthRouter) // / 、/api/health（健康探针不要求用户主体）
+app.use(metricsRouter) // /api/metrics（运行指标快照：纯计数/延迟统计，与 health 同级公开）
 // M5a 用户主体守卫（ADR-008）：AUTH_MODE=disabled 时所有请求视为 local 单一用户（零回归）；
+// M5b：把当前 principal 放进 AsyncLocalStorage，使请求链路中任意深度的
+// appendAudit 都能自动带上 ownerId（16 处调用点无需改动）。
+// 放在 /api 守卫之前：管理路由不走该守卫，这里统一解析一次即可。
+// disabled 模式恒为 local；user-token 模式下令牌缺失/无效为 null，审计回落 local。
+app.use((req, res, next) => {
+  const p = principal.principalOf(req)
+  runWithActor(p, () => next())
+})
+
 // user-token 模式下除 health/management 外的 /api 路由必须携带有效用户令牌，跨用户数据互相不可见。
 // management 路由走 adminAuth（管理员令牌），不在此守卫范围内。
 app.use('/api', (req, res, next) => {

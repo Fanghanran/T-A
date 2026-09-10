@@ -262,7 +262,18 @@ export function commitDocument(previewId, opts = {}) {
  * @returns {Promise<{id:string, title:string, stage:'chunking'|'embedding'|'indexing'|'done'|'error', chunkCount:number|null, doc:object|null, error:string|null}>}
  */
 export function getUploadJob(jobId) {
-  return get(`/documents/jobs/${jobId}`)
+  // 轮询禁用 HTTP 缓存：job 响应带 ETag，浏览器会发起 304 协商并返回缓存的旧状态
+  return request(`${KNOWLEDGE_API_BASE}/documents/jobs/${jobId}`, { cache: 'no-store' })
+}
+
+/**
+ * 取消/回滚异步入库任务（前端判定上传失败后调用，保持前后端一致）。
+ * 后端语义：进行中的任务标记取消（入库前拦截）；已完成入库的任务回滚删除；已失败的任务幂等返回。
+ * @param {string} jobId
+ * @returns {Promise<{result:'rolledBack'|'alreadyFailed'|'cancelling'}>}
+ */
+export function cancelUploadJob(jobId) {
+  return postJson(`/documents/jobs/${jobId}/cancel`, {})
 }
 
 // ---------- 分类 / 标签聚合治理 ----------

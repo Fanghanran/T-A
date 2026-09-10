@@ -728,6 +728,22 @@ function reindex(chunks) {
   return chunks.map((c, i) => ({ ...c, idx: i }))
 }
 
+/**
+ * Q&A 结构化解析：从「问：xxx\n答：xxx」格式切片正文提取问题文本。
+ * 一问一答语料（如面试题库）的问题就在正文里，无需 LLM 生成假设问题——
+ * 直接解析取用作为 question_vector 检索锚点，零 LLM 成本且比假设问题更准。
+ * @param {string} text 切片正文
+ * @returns {string|null} 问题文本；非 Q&A 格式或问题过短视为噪音返回 null
+ */
+export function parseQaQuestion(text) {
+  if (typeof text !== 'string' || !text) return null
+  // 多行模式匹配行首「问/Q/q + 冒号」开头的问题行（兼容中英文冒号）
+  const m = text.match(/^[ \t]*(?:问|Q|q)\s*[:：]\s*(.+?)[ \t]*$/m)
+  if (!m) return null
+  const q = m[1].trim()
+  return q.length >= 4 ? q : null
+}
+
 /* ===================== 导出为 Markdown ===================== */
 
 export function exportChunksAsMarkdown(chunks) {
@@ -838,19 +854,55 @@ export async function prepareDocChunksAndVectors(text, opts = {}) {
   let annots = []
   // ⑤ 问题按需生成：withQuestions=false 时跳过 LLM 标注（topic 用 heading 兜底、questions 置空），
   // 省一次 LLM 调用；普通资料库不需要检索增强问题，面试题库等场景再开
-  if (opts.withQuestions !== false) {
+  // 问题向量化：questions 文本单独 embed 成 question_vector（检索锚点），否则入库时退化用 text 向量
+  // 2026-09-06 追加 Q&A 结构化解析优先：一问一答语料的问题就在切片正文里（如「问：xxx\n答：xxx」），
+  // 直接解析取用——零 LLM 成本、锚点比 LLM 假设问题更准；解析不出的块才走 LLM 标注（原逻辑不变）。
+  // 解析不受 withQuestions 开关控制：开关语义是「是否花 LLM 成本生成假设问题」，
+  // 文档自带的问题属于数据本身，始终写入 questions 作为 question_vector 检索锚点。
+  const qaQuestions = chunks.map((c) => parseQaQuestion(c.text))
+  const qaHitCount = qaQuestions.filter(Boolean).length
+  if (qaHitCount > 0) {
+    log.info(`[prepareDocChunksAndVectors] Q&A 结构化解析命中 ${qaHitCount}/${chunks.length} 块，问题直接取自正文`)
+  }
+  // 待 LLM 标注的块：仅解析未命中的（全部命中时为空数组 → 完全跳过 LLM 调用）
+  const pendingChunks = chunks.filter((c, i) => !qaQuestions[i])
+  let subAnnots = []
+  if (opts.withQuestions !== false && pendingChunks.length > 0) {
     try {
-      annots = await generateChunkAnnotations(chunks, { questionsPerChunk: chunkerConfig?.questionsPerChunk ?? 3 })
+      subAnnots = await generateChunkAnnotations(pendingChunks, { questionsPerChunk: chunkerConfig?.questionsPerChunk ?? 3 })
     } catch (err) {
       log.warn(`[prepareDocChunksAndVectors] generateChunkAnnotations 异常：${err.message}`)
-      annots = []
+      subAnnots = []
     }
   }
+  // 组装：解析命中 → questions=[问题]（topic 用 heading 兜底，heading 空则用问题文本）；
+  // 未命中 → LLM 标注（无标注时为 null，走下方兜底）
+  let k = 0
+  annots = chunks.map((c, i) => {
+    if (qaQuestions[i]) {
+      return {
+        topic: (typeof c.heading === 'string' && c.heading.trim()) ? c.heading.trim() : qaQuestions[i],
+        questions: [qaQuestions[i]],
+      }
+    }
+    const a = subAnnots[k++] ?? null
+    return a ? { topic: a.topic ?? '', questions: Array.isArray(a.questions) ? a.questions : [] } : null
+  })
   if (!Array.isArray(annots) || annots.length !== chunks.length) {
     annots = chunks.map((c) => ({
       topic: (typeof c.heading === 'string' && c.heading.trim()) ? c.heading.trim() : ((c.text || '').slice(0, 30).trim() + ((c.text || '').length > 30 ? '…' : '')),
       questions: [],
     }))
+  } else if (annots.some((a) => !a)) {
+    // null 块（解析未命中且无 LLM 标注）补 heading 兜底，与原「LLM 失败/跳过」降级行为一致
+    annots = annots.map((a, i) => {
+      if (a) return a
+      const c = chunks[i]
+      return {
+        topic: (typeof c.heading === 'string' && c.heading.trim()) ? c.heading.trim() : ((c.text || '').slice(0, 30).trim() + ((c.text || '').length > 30 ? '…' : '')),
+        questions: [],
+      }
+    })
   }
 
   const chunkList = chunks.map((c, i) => ({
@@ -865,7 +917,24 @@ export async function prepareDocChunksAndVectors(text, opts = {}) {
     sentenceEnd: Number.isInteger(c.sentenceEnd) ? c.sentenceEnd : 0,
   }))
 
-  return { chunkList, vectors: vectorsByChunk, reusedCount: _reusedCount }
+  // 问题向量：把每块的 questions（数组）join 成单条文本批量 embed，作为 question_vector 检索锚点。
+  // 无 questions 的块占位 null，addChunks 侧对 null 退化用 text 向量（字段始终有值）；
+  // embed 失败整批退化（warn 记录），与 addChunks 既有缺省语义一致。
+  let questionVectors = null
+  const qTexts = chunkList.map((c) =>
+    Array.isArray(c.questions) && c.questions.length ? c.questions.join('\n') : null,
+  )
+  if (qTexts.some((t) => typeof t === 'string' && t.length > 0)) {
+    try {
+      const embedded = await embedTexts(qTexts.map((t) => t ?? ''))
+      questionVectors = qTexts.map((t, i) => (t ? embedded[i] : null))
+    } catch (err) {
+      log.warn(`[prepareDocChunksAndVectors] 问题向量 embed 失败：${err.message}，question_vector 退化用 text 向量`)
+      questionVectors = null
+    }
+  }
+
+  return { chunkList, vectors: vectorsByChunk, questionVectors, reusedCount: _reusedCount }
 }
 
 /* ===================== 预览缓存（跨 action 保持切片状态） ===================== */

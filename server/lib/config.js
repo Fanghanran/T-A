@@ -128,3 +128,90 @@ export const queryRewriterConfig = {
   maxConcurrency: 3,
   maxPending: 10,
 }
+
+/**
+ * HyDE（Hypothetical Document Embeddings）级联检索配置。
+ *
+ * 动机：纯向量对「问法与正文语体差异大」的查询不稳（用户问句 vs 讲义陈述句）。
+ * 让 LLM 先生成一段假设答案，用答案向量查 text 路——答案与库内正文同语体，更易命中。
+ * 级联触发：仅当首轮检索 top1 分数 < minScore 才启动（多数查询零额外延迟）。
+ *
+ * 前 3 个调优项来自 tunables.js（getter 委托 → 在线修改热生效），
+ * 其余为静态实现细节（缓存 / 答案长度），不开放在线调整。
+ */
+export const hydeConfig = {
+  // 总开关：关闭后低分查询也只走首轮检索
+  get hydeEnabled() {
+    return tunables.hyde.hydeEnabled
+  },
+  // 触发阈值：首轮（含 2-gram 加权后）top1 分数低于此值才触发 HyDE
+  get minScore() {
+    return tunables.hyde.minScore
+  },
+  // 假设答案生成超时（ms）：超时放弃本轮 HyDE，保留首轮结果，不阻塞主链路
+  get timeoutMs() {
+    return tunables.hyde.timeoutMs
+  },
+  // 假设答案最大字符数：过长会稀释向量语义，150~300 字为宜
+  maxAnswerChars: 300,
+  // 假设答案缓存（TTL LRU）：重复的低分查询直接复用，跳过 LLM
+  cacheSize: 64,
+  cacheTtlMs: 10 * 60 * 1000,
+}
+
+/**
+ * Elasticsearch 关键词混合检索配置。
+ *
+ * esEnabled / url 为部署配置（env，结构性，改后需重启）；调优参数（keywordWeight /
+ * esTopK / exactBoost）委托 tunables.es 在线热生效。
+ */
+export const esConfig = {
+  get esEnabled() {
+    return process.env.ES_ENABLED !== 'off'
+  },
+  // 容器内由 compose 注入 http://elasticsearch:9200；本地 dev 直连宿主机
+  url: process.env.ES_URL || 'http://127.0.0.1:9200',
+  // ES BM25 命中的融合权重（与 question 锚点同级的间接匹配降档）
+  get keywordWeight() {
+    return tunables.es.keywordWeight
+  },
+  // ES 检索取回条数（与向量路 overK 同口径的召回池大小）
+  get esTopK() {
+    return tunables.es.esTopK
+  },
+  // text.exact 整词精确命中的 BM25 加权（兜底连字符标识符）
+  get exactBoost() {
+    return tunables.es.exactBoost
+  },
+}
+
+/**
+ * LLM Wiki 词条配置（知识网络图词条生成）。
+ * 全部为调优参数，委托 tunables.wiki 在线热生效（下次生成任务即用新值）。
+ */
+export const wikiConfig = {
+  // 单切片一次抽取最多识别的概念/术语数量
+  get entitiesPerChunk() {
+    return tunables.wiki.entitiesPerChunk
+  },
+  // 归一合并后保留的词条总数（按提及数排序截断）
+  get maxEntries() {
+    return tunables.wiki.maxEntries
+  },
+  // 单批实体抽取 LLM 超时
+  get extractTimeoutMs() {
+    return tunables.wiki.extractTimeoutMs
+  },
+  // 单词条摘要生成超时
+  get summaryTimeoutMs() {
+    return tunables.wiki.summaryTimeoutMs
+  },
+  // 单词条摘要最大字符数
+  get summaryBudgetChars() {
+    return tunables.wiki.summaryBudgetChars
+  },
+  // 每个提及位置截取的上下文字符数
+  get mentionContextChars() {
+    return tunables.wiki.mentionContextChars
+  },
+}

@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto'
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { childLogger } from './logger.js'
 import * as milvus from './milvusStore.js'
+import * as es from './esStore.js'
 
 /**
  * vectorStore —— 知识库存储层（Milvus 后端）
@@ -37,6 +41,71 @@ function sha256(s) {
   return createHash('sha256')
     .update(String(s ?? ''), 'utf8')
     .digest('hex')
+}
+
+// ---------- 文档切片策略持久化（本地 JSON，模式同 data/management/registry.json） ----------
+// 动机：Milvus schema 固定（enable_dynamic_field=false），加字段需重建集合，成本过高；
+// 而上传时选定的切片策略（strategy/delimiter/maxChars/overlapChars）必须跨请求存活，
+// 否则「编辑正文 / reindex / 孤儿对账」等重切场景会静默退回默认语义感知策略，
+// 丢失用户上传时选定的分隔符/参数，导致切片格式变化。
+// 仅存非默认策略（semantic 无参数，无需记录）；docId -> 策略参数。
+const __dirnameVs = dirname(fileURLToPath(import.meta.url))
+const STRATEGY_FILE = join(__dirnameVs, '..', 'data', 'knowledge', 'doc-strategies.json')
+/** @type {Map<string, {strategy:string, delimiter?:string, maxChars?:number, overlapChars?:number}>} */
+const docStrategies = new Map()
+
+function _loadStrategies() {
+  try {
+    if (!existsSync(STRATEGY_FILE)) return
+    const raw = JSON.parse(readFileSync(STRATEGY_FILE, 'utf8'))
+    if (raw && typeof raw === 'object') {
+      for (const [docId, meta] of Object.entries(raw)) {
+        if (meta && typeof meta === 'object' && typeof meta.strategy === 'string') {
+          docStrategies.set(docId, meta)
+        }
+      }
+    }
+  } catch (err) {
+    log.warn(`[vectorStore] 读取切片策略文件失败（${err.message}），重切将走默认策略`)
+  }
+}
+_loadStrategies()
+
+function _persistStrategies() {
+  try {
+    mkdirSync(dirname(STRATEGY_FILE), { recursive: true })
+    writeFileSync(STRATEGY_FILE, JSON.stringify(Object.fromEntries(docStrategies), null, 2), 'utf8')
+  } catch (err) {
+    log.warn(`[vectorStore] 写入切片策略文件失败（${err.message}），策略仅本次进程生效`)
+  }
+}
+
+/**
+ * 记录文档入库时使用的切片策略（编辑正文重切时按此恢复，格式不漂移）。
+ * 只需记录 delimiter 类策略；semantic 走默认即可。
+ */
+export function setDocStrategy(docId, meta) {
+  if (!docId || !meta || typeof meta !== 'object') return
+  if (meta.strategy !== 'delimiter') {
+    // 语义感知策略无参数：若此前存过旧策略（如先 delimiter 入库又被覆盖），清除避免残留
+    if (docStrategies.has(docId)) {
+      docStrategies.delete(docId)
+      _persistStrategies()
+    }
+    return
+  }
+  docStrategies.set(docId, {
+    strategy: 'delimiter',
+    delimiter: typeof meta.delimiter === 'string' ? meta.delimiter : undefined,
+    maxChars: Number.isFinite(meta.maxChars) ? meta.maxChars : undefined,
+    overlapChars: Number.isFinite(meta.overlapChars) ? meta.overlapChars : 0,
+  })
+  _persistStrategies()
+}
+
+/** 读取文档的切片策略；未记录返回 null（调用方走默认语义感知策略） */
+export function getDocStrategy(docId) {
+  return docStrategies.get(docId) ?? null
 }
 
 function _hashAdd(content, docId) {
@@ -130,6 +199,21 @@ export async function flushSync() {
 
 export function stats() {
   return { documents: documents.size, chunks: chunks.size }
+}
+
+/**
+ * 按 owner 统计用量（M5b：per-user 配额与用量视图的基础）。
+ * 基于内存缓存遍历，O(n)；个人部署量级下开销可忽略。
+ * @param {string} ownerId
+ * @returns {{documents: number, chunks: number}}
+ */
+export function statsByOwner(ownerId) {
+  if (!ownerId) throw new Error('statsByOwner 需要 ownerId（越权防护）')
+  let docs = 0
+  let chunkCount = 0
+  for (const d of documents.values()) if (d.ownerId === ownerId) docs++
+  for (const c of chunks.values()) if (c.ownerId === ownerId) chunkCount++
+  return { documents: docs, chunks: chunkCount }
 }
 
 // ============ 文档 ============
@@ -253,6 +337,8 @@ export async function patchMetaAsync(id, patch = {}, ownerId) {
     }, ownerId)
     for (const ch of await milvus.listChunksOfDoc(id, ownerId)) chunks.set(ch.id, ch)
     if (n) log.debug(`[vectorStore] 已同步 ${n} 个切片的分类/标签`)
+    // ES 过滤字段（category/tags）同步（ES_ENABLED=off 时 no-op）
+    await es.updateDocMeta(id, { category: next.category, tags: next.tags })
   }
   documents.set(id, next)
   return publicDoc(next)
@@ -266,9 +352,16 @@ export async function deleteDocument(id, ownerId) {
   // 先删切片再删文档：Milvus 侧任一步失败都会抛出，由调用方感知（不再静默留孤儿）
   await milvus.deleteChunksOfDoc(id, ownerId)
   await milvus.deleteDoc(id, ownerId)
+  // ES 关键词索引同步清理（一致性优先；ES_ENABLED=off 时 no-op）
+  await es.deleteByDocId(id)
   for (const [cid, ch] of chunks) if (ch.docId === id) chunks.delete(cid)
   documents.delete(id)
   _hashRemove(doc?.content, id)
+  // 同步清理切片策略记录，防止策略文件累积已删文档的残留
+  if (docStrategies.has(id)) {
+    docStrategies.delete(id)
+    _persistStrategies()
+  }
   return true
 }
 
@@ -290,6 +383,8 @@ export async function deleteChunksByIds(ids, ownerId) {
   if (valid.length === 0) return { deleted: [], failed }
   try {
     await milvus.deleteChunksById(valid)
+    // ES 关键词索引同步删除（同口径；ES_ENABLED=off 时 no-op）
+    await es.deleteByChunkIds(valid)
     for (const id of valid) chunks.delete(id)
     return { deleted: valid, failed }
   } catch (e) {
@@ -357,6 +452,16 @@ export async function batchPatchMetaAsync(ids, opts = {}) {
 }
 
 // ============ 切片 ============
+
+/**
+ * 按 chunk id 查切片（内存镜像，owner 隔离）。
+ * ES 关键词召回的「仅 ES 命中」块从这补齐 payload（ES 只存文本元数据）。
+ */
+export function getChunkById(id, ownerId) {
+  const ch = chunks.get(id)
+  if (!ch || ch.ownerId !== ownerId) return null
+  return { ...ch }
+}
 
 export function listChunksOf(docId, ownerId) {
   if (!ownerId) throw new Error('listChunksOf 需要 ownerId（越权防护）')
@@ -489,6 +594,10 @@ export async function addChunks(docId, chunkList, vectors, opts = {}) {
   await milvus.flush([milvus.getCollections().doc])
   documents.set(docId, nextDoc)
   log.info(`[vectorStore] 文档 ${docId} 入库核实通过：${persisted} 块已落库`)
+
+  // ES 关键词索引双写：写路径一致性优先（失败显式报错，ADR-009），ES_ENABLED=off 时 no-op
+  const esIndexed = await es.indexChunks(rows)
+  if (esIndexed) log.info(`[vectorStore] 文档 ${docId} ES 关键词索引 ${esIndexed} 块`)
 }
 
 export async function updateContentWithPrepared(
@@ -513,6 +622,8 @@ export async function updateContentWithPrepared(
   _hashAdd(newContent, id)
 
   await milvus.deleteChunksOfDoc(id, opts.ownerId)
+  // ES 关键词索引同步清理旧切片（新增切片由下方 addChunks 双写补齐）
+  await es.deleteByDocId(id)
   for (const [cid, ch] of chunks) if (ch.docId === id) chunks.delete(cid)
 
   if (chunkList.length) {

@@ -58,6 +58,24 @@
   }
 }
 
+/* 精密仪器质感：主区顶部一道极淡的靛蓝晕染，营造空间纵深而非平面纯色 */
+@layer base {
+  .app-canvas {
+    background-image: radial-gradient(
+      ellipse 80% 40% at 50% -8%,
+      hsl(var(--primary) / 0.05),
+      transparent 70%
+    );
+  }
+  .dark .app-canvas {
+    background-image: radial-gradient(
+      ellipse 80% 40% at 50% -8%,
+      hsl(var(--primary) / 0.09),
+      transparent 70%
+    );
+  }
+}
+
 @layer base {
   * {
     @apply border-border;
@@ -84,6 +102,21 @@
   }
   .shadow-soft-md {
     box-shadow: var(--shadow-md);
+  }
+  /* 页面进场：内容块轻微上浮淡入（150ms，克制不抢戏） */
+  .animate-page-in {
+    animation: page-in 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+}
+
+@keyframes page-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 

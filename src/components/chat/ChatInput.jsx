@@ -204,7 +204,7 @@ export function ChatInput({
   }
 
   return (
-    <div className="border-t bg-background/80 backdrop-blur">
+    <div className="shrink-0 border-t bg-background/80 backdrop-blur">
       <div className="mx-auto w-full max-w-3xl px-4 py-3 md:px-6">
         {/* 内联错误提示 */}
         {error && (

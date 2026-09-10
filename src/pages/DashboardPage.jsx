@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { RefreshCw, Loader2, LayoutDashboard } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { PageHeader } from '@/components/layout/PageHeader'
 import { useDocumentStats } from '@/hooks/useDocumentStats'
 import { KbStatsPanel } from '@/components/knowledge/KbStatsPanel'
 
@@ -8,6 +9,7 @@ import { KbStatsPanel } from '@/components/knowledge/KbStatsPanel'
  * DashboardPage —— 仪表盘（独立菜单视图）
  *
  * 只加载知识库统计数据，不触发文档列表、筛选或 facet 请求。
+ * 知识网络图已从仪表盘移除（2026-09-10，独立页面 /knowledge-graph 保留）。
  *
  * 数据来源：/api/health → { documents, chunks, knowledgeByCategory }
  *
@@ -42,25 +44,17 @@ export function DashboardPage({ onLoadingChange }) {
 
   return (
     <div className="flex h-full flex-col">
-      {/* 顶栏：标题 + 更新时间 + 刷新按钮 */}
-      <div className="flex items-center gap-2 border-b px-4 py-3 md:px-6">
-        <LayoutDashboard className="h-4 w-4 text-muted-foreground" />
-        <h2 className="text-sm font-semibold tracking-tight">仪表盘</h2>
-        <span className="text-[11px] text-muted-foreground">
-          知识库与系统总览
-          {statsState.stats?.updatedAt && !loading
-            ? ` · 更新于 ${new Date(statsState.stats.updatedAt).toLocaleTimeString('zh-CN', {
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-              })}`
-            : ''}
-        </span>
+      {/* 统一页头：标题 + 更新时间 + 刷新 */}
+      <PageHeader icon={LayoutDashboard} title="仪表盘" description={<>知识库与系统总览{statsState.stats?.updatedAt && !loading ? ` · 更新于 ${new Date(statsState.stats.updatedAt).toLocaleTimeString('zh-CN', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      })}` : ''}</>}>
         <Button
           type="button"
           size="sm"
           variant="ghost"
-          className="ml-auto h-8 gap-1.5"
+          className="h-8 gap-1.5"
           onClick={handleRefresh}
           disabled={loading}
         >
@@ -71,11 +65,11 @@ export function DashboardPage({ onLoadingChange }) {
           )}
           {loading ? '刷新中…' : '刷新'}
         </Button>
-      </div>
+      </PageHeader>
 
       {/* 主体：统计面板（居中限宽，避免宽屏拉伸条形图过窄难比较） */}
       <div className="flex-1 overflow-auto scrollbar-thin">
-        <div className="mx-auto max-w-5xl px-4 py-6 md:px-6">
+        <div className="mx-auto max-w-5xl animate-page-in px-4 py-6 md:px-6">
           <KbStatsPanel stats={statsState.stats} loading={loading} />
         </div>
       </div>

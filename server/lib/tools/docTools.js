@@ -86,7 +86,22 @@ export async function prepareAdjustedChunks(chunks) {
     sentenceStart: 0,
     sentenceEnd: 0,
   }))
-  return { chunkList, vectors }
+  // 问题向量：questions join 后批量 embed（与 prepareDocChunksAndVectors 同口径）；
+  // 无 questions 的块占位 null，入库时退化用 text 向量
+  let questionVectors = null
+  const qTexts = chunkList.map((c) =>
+    Array.isArray(c.questions) && c.questions.length ? c.questions.join('\n') : null,
+  )
+  if (qTexts.some((t) => typeof t === 'string' && t.length > 0)) {
+    try {
+      const embedded = await embedTexts(qTexts.map((t) => t ?? ''))
+      questionVectors = qTexts.map((t, i) => (t ? embedded[i] : null))
+    } catch (err) {
+      log.warn(`[docTools] prepareAdjustedChunks 问题向量 embed 失败：${err.message}，question_vector 退化用 text 向量`)
+      questionVectors = null
+    }
+  }
+  return { chunkList, vectors, questionVectors }
 }
 
 /**
@@ -95,13 +110,19 @@ export async function prepareAdjustedChunks(chunks) {
  *  ② 跨文档去重：对批内保留的每块向量在 Milvus 检索 top-1，与库中已有块
  *     近似完全重复（cos ≥ 0.985）时跳过入库（多份文档合并场景）。
  * 导出供 index.js 的 REST 入库端点复用，聊天/操作栏两条链路口径一致。
- * @returns {{ chunkList:Array, vectors:Array, skippedWithin:number, skippedCross:number }}
+ * @param {Array} questionVectors 问题向量（可空；块被过滤时同步过滤，防止索引错位）
+ * @returns {{ chunkList:Array, vectors:Array, questionVectors:Array|null, skippedWithin:number, skippedCross:number }}
  */
-export async function dedupPreparedChunks(chunkList, vectors) {
+export async function dedupPreparedChunks(chunkList, vectors, questionVectors = null) {
   const batch = dedupWithinBatch(chunkList, vectors)
+  // 批内去重后原索引失效：按原 chunkList 的 text 反查过滤后的问题向量
+  const qvByText = Array.isArray(questionVectors)
+    ? new Map(chunkList.map((c, i) => [c, questionVectors[i] ?? null]))
+    : null
   let skippedCross = 0
   const keptList = []
   const keptVecs = []
+  const keptQVecs = []
   for (let i = 0; i < batch.chunkList.length; i++) {
     const v = Array.isArray(batch.vectors[i]) ? batch.vectors[i] : []
     let dup = false
@@ -121,8 +142,15 @@ export async function dedupPreparedChunks(chunkList, vectors) {
     }
     keptList.push(batch.chunkList[i])
     keptVecs.push(v)
+    keptQVecs.push(qvByText ? (qvByText.get(batch.chunkList[i]) ?? null) : null)
   }
-  return { chunkList: keptList, vectors: keptVecs, skippedWithin: batch.skipped, skippedCross }
+  return {
+    chunkList: keptList,
+    vectors: keptVecs,
+    questionVectors: qvByText ? keptQVecs : null,
+    skippedWithin: batch.skipped,
+    skippedCross,
+  }
 }
 
 /** 规范化 LLM 给出的 AdjustChunks 参数 → 现有 applyChunkAdjustment 的 adj 结构 */
@@ -275,19 +303,21 @@ toolRegistry.register({
     // 有已调整的预览 → 直接用（保留用户的合并/拆分）；否则走完整链路从原文切
     let chunkList
     let vectors
+    let questionVectors
     if (cached?.chunks?.length) {
-      ;({ chunkList, vectors } = await prepareAdjustedChunks(cached.chunks))
+      ;({ chunkList, vectors, questionVectors } = await prepareAdjustedChunks(cached.chunks))
     } else {
-      ;({ chunkList, vectors } = await prepareDocChunksAndVectors(text, {
+      ;({ chunkList, vectors, questionVectors } = await prepareDocChunksAndVectors(text, {
         strategy: cached?.strategy,
         delimiter: cached?.strategy === 'delimiter' ? cached.opts?.delimiter : undefined,
         maxChars: cached?.opts?.maxChars,
       }))
     }
     // 文档去重（§9 扩展）：批内 + 跨文档（Milvus 检索比对）
-    const deduped = await dedupPreparedChunks(chunkList, vectors)
+    const deduped = await dedupPreparedChunks(chunkList, vectors, questionVectors)
     chunkList = deduped.chunkList
     vectors = deduped.vectors
+    questionVectors = deduped.questionVectors
     // 确保 doc 存在（粘贴文本等场景下还没有 doc）
     let docId = ctx.docId
     if (!docId || !store.getDocument(docId, ctx.ownerId)) {
@@ -303,7 +333,15 @@ toolRegistry.register({
       docId = doc.id
       ctx.docId = docId
     }
-    await store.addChunks(docId, chunkList, vectors, { category: '', tags: [], ownerId: ctx.ownerId })
+    await store.addChunks(docId, chunkList, vectors, { category: '', tags: [], ownerId: ctx.ownerId, questionVectors })
+    // 记录切片策略：后续编辑正文 / reindex 重切时按此恢复，切片格式不漂移
+    // （用户手动调整过的预览块无法重放，但重切仍按原策略口径执行）
+    store.setDocStrategy(docId, {
+      strategy: cached?.strategy === 'delimiter' ? 'delimiter' : 'semantic',
+      delimiter: cached?.strategy === 'delimiter' ? cached.opts?.delimiter : undefined,
+      maxChars: cached?.opts?.maxChars,
+      overlapChars: cached?.opts?.overlapChars,
+    })
     clearCachedPreview(ctx.cacheKey)
     const totalChars = chunkList.reduce((s, c) => s + (typeof c.text === 'string' ? c.text.length : 0), 0)
     log.info(`[docTools] 入库 doc ${docId} | ${chunkList.length} 块 | ${totalChars} 字 | 去重跳过 批内${deduped.skippedWithin} 跨文档${deduped.skippedCross}`)

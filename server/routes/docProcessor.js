@@ -194,21 +194,30 @@ async function commitDocToStore(docId, ownerId) {
   const cached = ctx.cached
   let chunkList
   let vectors
+  let questionVectors
   if (cached?.chunks?.length) {
     // 有预览（含用户调整）→ 直接用，保留合并/拆分结果
-    ;({ chunkList, vectors } = await prepareAdjustedChunks(cached.chunks))
+    ;({ chunkList, vectors, questionVectors } = await prepareAdjustedChunks(cached.chunks))
   } else {
-    ;({ chunkList, vectors } = await prepareDocChunksAndVectors(ctx.text, {
+    ;({ chunkList, vectors, questionVectors } = await prepareDocChunksAndVectors(ctx.text, {
       strategy: cached?.strategy,
       delimiter: cached?.strategy === 'delimiter' ? cached.opts?.delimiter : undefined,
       maxChars: cached?.opts?.maxChars,
     }))
   }
   // 文档去重（与聊天侧 CommitToStore 工具同口径）：批内余弦 + 跨文档 Milvus 检索
-  const deduped = await dedupPreparedChunks(chunkList, vectors)
+  const deduped = await dedupPreparedChunks(chunkList, vectors, questionVectors)
   chunkList = deduped.chunkList
   vectors = deduped.vectors
-  await store.addChunks(docId, chunkList, vectors, { category: ctx.doc?.category || '', tags: ctx.doc?.tags || [], ownerId })
+  questionVectors = deduped.questionVectors
+  await store.addChunks(docId, chunkList, vectors, { category: ctx.doc?.category || '', tags: ctx.doc?.tags || [], ownerId, questionVectors })
+  // 记录切片策略：后续编辑正文 / reindex 重切时按此恢复，切片格式不漂移
+  store.setDocStrategy(docId, {
+    strategy: cached?.strategy === 'delimiter' ? 'delimiter' : 'semantic',
+    delimiter: cached?.strategy === 'delimiter' ? cached.opts?.delimiter : undefined,
+    maxChars: cached?.opts?.maxChars,
+    overlapChars: cached?.opts?.overlapChars,
+  })
   clearCachedPreview(docId)
   const totalChars = chunkList.reduce((s, c) => s + (typeof c.text === 'string' ? c.text.length : 0), 0)
   const ms = Math.round(performance.now() - t0)

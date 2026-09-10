@@ -56,7 +56,7 @@ export function DocActionBar({
   const uncommittedCount = (docs || []).filter((d) => !d.committed).length
 
   return (
-    <div className="border-t bg-background/80 backdrop-blur">
+    <div className="shrink-0 border-t bg-background/80 backdrop-blur">
       <div className="mx-auto w-full max-w-3xl px-4 py-2.5 md:px-6">
         {/* 多文档切换 chips（≥2 份文档时显示） */}
         {docs.length > 1 && (

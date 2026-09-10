@@ -73,6 +73,18 @@ const GROUPS = [
     },
   },
   {
+    key: 'hyde',
+    label: 'HyDE 级联检索',
+    description: '首轮检索低分时触发的假设答案二次检索（hyde.js / unifiedSearch.js）',
+    defaults: {
+      hydeEnabled: true,
+      minScore: 0.45,
+      // 实测（本地 qwen2.5-coder:14b，2026-09-06）：生成 300 字假设答案需 8s+，
+      // 5000ms 必然熔断白等；放宽到 12000 保证一次成功（缓存命中后重复查询仅 ~0.2s）
+      timeoutMs: 12000,
+    },
+  },
+  {
     key: 'memory',
     label: '会话记忆',
     description: '两层记忆参数：短期滚动摘要 + 长期事实提炼（memoryService.js / ADR-007）',
@@ -84,6 +96,29 @@ const GROUPS = [
       summaryBudgetChars: 600,
       factBudgetChars: 800,
       maxFactsPerExtract: 5,
+    },
+  },
+  {
+    key: 'es',
+    label: 'ES 关键词混合检索',
+    description: 'BM25 召回第三通道的融合权重与召回规模（esStore.js / unifiedSearch.js）',
+    defaults: {
+      keywordWeight: 0.7,
+      esTopK: 50,
+      exactBoost: 5,
+    },
+  },
+  {
+    key: 'wiki',
+    label: 'LLM Wiki 词条',
+    description: '知识网络词条生成的抽取与摘要参数（wikiBuilder.js / llm.js）',
+    defaults: {
+      entitiesPerChunk: 5,
+      maxEntries: 300,
+      extractTimeoutMs: 60000,
+      summaryTimeoutMs: 60000,
+      summaryBudgetChars: 400,
+      mentionContextChars: 120,
     },
   },
 ]
@@ -109,12 +144,25 @@ const META = {
   'rewrite.rewriteEnabled': { label: '启用改写', type: 'bool', description: '总开关，关闭后走纯原始 query 检索' },
   'rewrite.queriesPerRequest': { label: '生成查询数', type: 'int', min: 1, max: 8, description: '每次检索生成几个查询（含主查询）' },
   'rewrite.historyTurns': { label: '历史轮数', type: 'int', min: 1, max: 10, description: '改写参考的对话历史窗口轮数' },
+  'hyde.hydeEnabled': { label: '启用 HyDE', type: 'bool', description: '总开关：首轮检索 top1 低于阈值时用假设答案做二次检索' },
+  'hyde.minScore': { label: '触发阈值', type: 'float', min: 0.1, max: 0.9, description: '首轮检索（含 2-gram 加权后）top1 分数低于此值才触发 HyDE，多数查询零额外开销' },
+  'hyde.timeoutMs': { label: '生成超时(ms)', type: 'int', min: 1000, max: 30000, description: '假设答案生成超时即放弃本轮 HyDE，保留首轮结果' },
   'memory.enabled': { label: '启用记忆', type: 'bool', description: '总开关：关闭后不召回、不摘要、不提炼' },
   'memory.summaryEveryTurns': { label: '摘要触发轮数', type: 'int', min: 1, max: 30, description: '新增用户消息达到此轮数后滚动一次会话摘要' },
   'memory.extractEveryTurns': { label: '提炼触发轮数', type: 'int', min: 1, max: 30, description: '新增用户消息达到此轮数后提炼一次长期事实' },
   'memory.recallTopK': { label: '召回条数', type: 'int', min: 1, max: 10, description: '每轮检索召回的长期事实条数上限' },
   'memory.summaryBudgetChars': { label: '摘要字数上限', type: 'int', min: 100, max: 2000, description: '滚动摘要的最大字符数' },
   'memory.factBudgetChars': { label: '事实字数上限', type: 'int', min: 100, max: 2000, description: '单条长期事实注入 prompt 的最大字符数' },
+  'memory.maxFactsPerExtract': { label: '单次提炼条数上限', type: 'int', min: 1, max: 20, description: '每次事实提炼最多写入的长期事实条数' },
+  'es.keywordWeight': { label: 'BM25 融合权重', type: 'float', min: 0.1, max: 1, description: 'ES BM25 命中分数的融合权重（归一化后 × 此权重，与 question 锚点同级降档）' },
+  'es.esTopK': { label: 'ES 召回条数', type: 'int', min: 10, max: 200, description: 'ES 检索取回条数（与向量路 overK 同口径的召回池大小）' },
+  'es.exactBoost': { label: '整词精确加权', type: 'float', min: 1, max: 20, description: 'text.exact 整词 term 命中的 BM25 加权（兜底连字符标识符整词匹配）' },
+  'wiki.entitiesPerChunk': { label: '每块实体数上限', type: 'int', min: 1, max: 15, description: '单个切片一次抽取最多识别的概念/术语数量' },
+  'wiki.maxEntries': { label: '词条数上限', type: 'int', min: 20, max: 2000, description: '归一合并后保留的词条总数（按提及数排序截断）' },
+  'wiki.extractTimeoutMs': { label: '抽取超时(ms)', type: 'int', min: 5000, max: 180000, description: '单批实体抽取 LLM 超时（超时该批降级跳过，续跑时按哈希重试）' },
+  'wiki.summaryTimeoutMs': { label: '摘要超时(ms)', type: 'int', min: 5000, max: 180000, description: '单词条摘要生成超时（超时该条保持待生成，下次续跑）' },
+  'wiki.summaryBudgetChars': { label: '摘要字数上限', type: 'int', min: 100, max: 2000, description: '单个词条摘要的最大字符数' },
+  'wiki.mentionContextChars': { label: '提及上下文长度', type: 'int', min: 40, max: 500, description: '每个提及位置截取的上下文字符数（摘要生成的素材）' },
 }
 
 // ---------- 活对象（导出给消费方，调用时读属性 → 原地改值热生效） ----------

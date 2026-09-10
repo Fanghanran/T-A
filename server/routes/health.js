@@ -27,6 +27,7 @@ healthRouter.get('/', (_req, res) => {
     ...store.stats(),
     endpoints: [
       'GET /api/health',
+      'GET /api/metrics                        运行指标快照（检索延迟 / LLM 耗时 / HyDE 触发率 / 缓存命中 / HTTP 计数）',
       'GET  /api/sessions                     会话列表（?agentName= 过滤）',
       'POST /api/sessions                     创建会话（{agentName, title?}）',
       'GET  /api/sessions/:id                 会话详情 + 历史消息',

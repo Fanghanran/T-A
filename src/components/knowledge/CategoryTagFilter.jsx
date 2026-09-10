@@ -1,4 +1,4 @@
-import { Search, X, RotateCcw } from 'lucide-react'
+import { Search, RefreshCw, RotateCcw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { KNOWLEDGE_CATEGORIES, KNOWLEDGE_TAG_OPTIONS } from '@/lib/constants'
@@ -35,24 +35,24 @@ export function CategoryTagFilter({
     tags.length > 0 ? tags.map((t) => t.name) : KNOWLEDGE_TAG_OPTIONS
 
   const selectClass = cn(
-    'h-9 w-full rounded-md border border-input bg-background px-2 py-1 text-sm',
-    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
+    'h-8 w-full rounded-md border border-input bg-background px-2 py-1 text-[13px]',
+    'transition-colors focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30',
   )
 
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col gap-2.5">
       <div className="relative">
         <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
         <Input
           value={filters.q}
           onChange={(e) => setFilter('q', e.target.value)}
           placeholder="关键词过滤…"
-          className="pl-8"
+          className="h-8 pl-8 text-[13px]"
         />
       </div>
 
       <label className="flex flex-col gap-1">
-        <span className="text-xs text-muted-foreground">分类</span>
+        <span className="text-[11px] font-medium text-muted-foreground">分类</span>
         <select
           value={filters.category}
           onChange={(e) => setFilter('category', e.target.value)}
@@ -68,7 +68,7 @@ export function CategoryTagFilter({
       </label>
 
       <label className="flex flex-col gap-1">
-        <span className="text-xs text-muted-foreground">标签</span>
+        <span className="text-[11px] font-medium text-muted-foreground">标签</span>
         <select
           value={filters.tag}
           onChange={(e) => setFilter('tag', e.target.value)}
@@ -83,12 +83,12 @@ export function CategoryTagFilter({
         </select>
       </label>
 
-      <div className="flex items-center gap-2 pt-1">
+      <div className="flex items-center gap-2 pt-0.5">
         <Button
           type="button"
           variant="ghost"
           size="sm"
-          className="flex-1"
+          className="h-8 flex-1 text-xs"
           onClick={resetFilters}
         >
           <RotateCcw className="mr-1 h-3.5 w-3.5" />
@@ -99,10 +99,10 @@ export function CategoryTagFilter({
             type="button"
             variant="outline"
             size="sm"
-            className="flex-1"
+            className="h-8 flex-1 text-xs"
             onClick={onRefresh}
           >
-            <X className="mr-1 h-3.5 w-3.5" />
+            <RefreshCw className="mr-1 h-3.5 w-3.5" />
             刷新
           </Button>
         )}

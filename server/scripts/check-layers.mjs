@@ -37,15 +37,17 @@ const LAYERS = {
   // L0 基础设施
   'env.js': 0, 'lib/logger.js': 0, 'lib/config.js': 0, 'lib/errors.js': 0, 'lib/requestTrace.js': 0, 'lib/security.js': 0, 'lib/tunables.js': 0,
   'lib/mathUtils.js': 0, 'lib/textUtils.js': 0, 'lib/streamUtils.js': 0, 'lib/llmProvider.js': 0, 'lib/cache.js': 0,
-  'lib/models.js': 0, 'lib/principal.js': 0,
+  'lib/models.js': 0, 'lib/principal.js': 0, 'lib/metrics.js': 0,
   // L1 存储
-  'lib/milvusStore.js': 1, 'lib/vectorStore.js': 1, 'lib/sessionStore.js': 1, 'lib/questionBank.js': 1,
+  'lib/milvusStore.js': 1, 'lib/vectorStore.js': 1, 'lib/sessionStore.js': 1, 'lib/questionBank.js': 1, 'lib/esStore.js': 1, 'lib/wikiStore.js': 1,
   // L2 算法
-  'lib/chunker.js': 2, 'lib/embed.js': 2, 'lib/queryRewriter.js': 2,
+  'lib/chunker.js': 2, 'lib/embed.js': 2, 'lib/queryRewriter.js': 2, 'lib/hyde.js': 2,
+  // L2.5 资源治理（M5b）：依赖 L1 统计，被 L5 management / L8 路由引用
+  'lib/quota.js': 2,
   // L3 LLM
   'lib/llm.js': 3,
   // L4 领域
-  'lib/docProcessor.js': 4, 'lib/unifiedSearch.js': 4, 'lib/chunkAudit.js': 4, 'lib/memoryService.js': 4,
+  'lib/docProcessor.js': 4, 'lib/unifiedSearch.js': 4, 'lib/chunkAudit.js': 4, 'lib/memoryService.js': 4, 'lib/wikiBuilder.js': 4,
   'lib/agents/builtin/knowledgeBase.js': 4, 'lib/agents/builtin/interviewRetrieval.js': 4, 'lib/agents/builtin/defaultChat.js': 4,
   'lib/agents/builtin/resumeAnalysis.js': 4, 'lib/agents/builtin/mockInterview.js': 4,
   // L5 注册表
@@ -61,6 +63,7 @@ const LAYERS = {
   'lib/management/manager.js': 8,
   'routes/shared.js': 8, 'routes/health.js': 8, 'routes/sessions.js': 8, 'routes/interview.js': 8,
   'routes/knowledge.js': 8, 'routes/docProcessor.js': 8, 'routes/chat.js': 8, 'routes/resume.js': 8,
+  'routes/metrics.js': 8,
   // L9 入口
   'index.js': 9,
 }

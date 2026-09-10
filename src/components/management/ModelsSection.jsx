@@ -5,13 +5,15 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card, CardContent } from '@/components/ui/card'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
-import { CollapsibleSection } from '@/components/management/CollapsibleSection'
+import { SearchableModelSelect } from '@/components/ui/SearchableModelSelect'
 import {
   fetchModels,
   saveModelProfile,
   deleteModelProfile,
   updateModelRoutes,
+  updateModelSettings,
   testModelProfile,
+  discoverModels,
 } from '@/lib/managementApi'
 import { cn } from '@/lib/utils'
 
@@ -27,12 +29,29 @@ const EMPTY_DRAFT = {
 }
 
 /**
+ * baseUrl 归一化：容器场景服务发现返回 host.docker.internal，与本地注册的
+ * localhost / 127.0.0.1 视为同源，避免已注册模型重复出现在「未注册」选项区。
+ */
+function normUrl(u) {
+  return (u || '')
+    .replace(/host\.docker\.internal/gi, 'localhost')
+    .replace(/127\.0\.0\.1/g, 'localhost')
+    .replace(/\/+$/, '')
+    .toLowerCase()
+}
+
+/**
  * ModelsSection —— 模型管理分区（ADR-006）
  *
  * 三块：模型 profile 列表（新增/编辑/测试/删除）· 角色路由矩阵 · 智能体绑定。
  * 保存即热生效（服务端重建 provider 缓存）；修改 embedding 默认模型需重建向量集合。
+ *
+ * 服务模型发现：挂载后从已启用 profile 的服务拉取可用模型列表（Ollama /api/tags
+ * 优先，OpenAI /v1/models 回落），未注册模型以「未注册 · 选用即添加」出现在各
+ * 下拉选项中——选中后自动创建 profile（baseUrl/密钥引用继承同源已注册 profile）
+ * 并执行对应路由绑定。
  */
-export function ModelsSection() {
+export function ModelsSection({ onLoadingChange }) {
   const [data, setData] = React.useState(null)
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState('')
@@ -58,10 +77,124 @@ export function ModelsSection() {
     load()
   }, [load])
 
+  React.useEffect(() => {
+    onLoadingChange?.(loading)
+  }, [loading, onLoadingChange])
+
+  // 服务模型发现：挂载后拉取一次（失败置空并保留 errors 供展示，不影响已注册模型使用）
+  const [discovered, setDiscovered] = React.useState(null)
+  React.useEffect(() => {
+    let alive = true
+    discoverModels()
+      .then((d) => alive && setDiscovered(d))
+      .catch(() => alive && setDiscovered({ items: [], errors: [] }))
+    return () => {
+      alive = false
+    }
+  }, [])
+
   const profiles = data?.profiles ?? []
   const roles = data?.roles ?? []
-  const chatProfiles = profiles.filter((p) => p.kind === 'chat')
-  const embedProfiles = profiles.filter((p) => p.kind === 'embedding')
+  const chatProfiles = React.useMemo(
+    () => (data?.profiles ?? []).filter((p) => p.kind === 'chat'),
+    [data],
+  )
+  const embedProfiles = React.useMemo(
+    () => (data?.profiles ?? []).filter((p) => p.kind === 'embedding'),
+    [data],
+  )
+
+  // 已注册模型键集（baseUrl 归一化后与 model 名比对，跨 localhost/host.docker.internal 同源去重）
+  const registeredKeys = React.useMemo(
+    () =>
+      new Set(
+        (data?.profiles ?? []).map(
+          (p) => `${normUrl(p.baseUrl)}|${(p.model || '').toLowerCase()}`,
+        ),
+      ),
+    [data],
+  )
+
+  /** 合并已注册 profile 与服务发现的未注册模型为一个下拉选项集 */
+  const mergeOptions = React.useCallback(
+    (kind, registered) => [
+      ...registered,
+      ...(discovered?.items ?? [])
+        .filter(
+          (d) =>
+            d.kind === kind &&
+            !registeredKeys.has(
+              `${normUrl(d.baseUrl)}|${d.model.toLowerCase()}`,
+            ),
+        )
+        .map((d) => ({
+          id: `new:${d.model}`,
+          label: d.model,
+          model: d.model,
+          unregistered: true,
+        })),
+    ],
+    [discovered, registeredKeys],
+  )
+
+  const chatOptions = React.useMemo(
+    () => mergeOptions('chat', chatProfiles),
+    [mergeOptions, chatProfiles],
+  )
+  const embedOptions = React.useMemo(
+    () => mergeOptions('embedding', embedProfiles),
+    [mergeOptions, embedProfiles],
+  )
+
+  /**
+   * 选用未注册的服务模型：自动建档（id 从模型名 slug 生成并避让已占用；
+   * baseUrl / apiKeyRef 继承同源已注册 profile 的原值，容器与本地地址口径
+   * 以注册表为准）后执行对应路由绑定。
+   */
+  const adoptAndApply = async (pseudoId, kind, applyRoute) => {
+    const model = pseudoId.slice('new:'.length)
+    const entry = (discovered?.items ?? []).find((d) => d.model === model)
+    if (!entry) return
+    setSaving(true)
+    setError('')
+    try {
+      const origin = profiles.find(
+        (p) => p.kind === kind && normUrl(p.baseUrl) === normUrl(entry.baseUrl),
+      )
+      const base =
+        model
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .slice(0, 60) || 'model'
+      let id = base
+      let n = 2
+      while (profiles.some((p) => p.id === id)) id = `${base}-${n++}`
+      const keyRef = origin?.apiKeyRef || entry.apiKeyRef
+      const { profile: saved } = await saveModelProfile({
+        id,
+        kind,
+        label: model,
+        baseUrl: origin?.baseUrl ?? entry.baseUrl,
+        ...(keyRef ? { apiKeyRef: keyRef } : {}),
+        model,
+      })
+      await applyRoute(saved.id)
+    } catch (err) {
+      setError(err.message || '添加模型失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  /** 选择分发：伪 id（new: 前缀，未注册服务模型）走自动建档，否则直接执行路由变更 */
+  const dispatchSelect = (kind, applyRoute) => (id) => {
+    if (typeof id === 'string' && id.startsWith('new:')) {
+      adoptAndApply(id, kind, applyRoute)
+      return
+    }
+    applyRoute(id)
+  }
 
   /** 保存路由 patch 并刷新 */
   const patchRoutes = async (patch) => {
@@ -71,6 +204,19 @@ export function ModelsSection() {
       await load()
     } catch (err) {
       setError(err.message || '保存路由失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  /** 保存运行时设置（思考模式）并刷新 */
+  const patchSettings = async (patch) => {
+    setSaving(true)
+    try {
+      await updateModelSettings(patch)
+      await load()
+    } catch (err) {
+      setError(err.message || '保存设置失败')
     } finally {
       setSaving(false)
     }
@@ -105,37 +251,34 @@ export function ModelsSection() {
   }
 
   const RoleSelect = ({ roleKey, value, disabled }) => (
-    <select
-      className="h-7 rounded-md border border-input bg-background px-1.5 text-xs"
+    <SearchableModelSelect
+      className="min-w-0 flex-1 sm:max-w-56"
       value={value ?? ''}
+      options={chatOptions}
+      emptyOptionLabel="默认"
       disabled={disabled || saving}
-      onChange={(e) =>
-        patchRoutes({ roles: { [roleKey]: e.target.value || null } })
-      }
-      aria-label={`角色 ${roleKey} 绑定的模型`}
-    >
-      <option value="">默认</option>
-      {chatProfiles.map((p) => (
-        <option key={p.id} value={p.id}>
-          {p.label || p.id}
-        </option>
-      ))}
-    </select>
+      onChange={dispatchSelect('chat', (pid) =>
+        patchRoutes({ roles: { [roleKey]: pid || null } }),
+      )}
+    />
   )
 
   return (
-    <CollapsibleSection
-      icon={<Bot className="h-3.5 w-3.5" />}
-      title="模型管理"
-      hint="多模型 profile 与路由绑定，保存即热生效（无需重启）"
-      badge={
-        data?.profiles?.length ? (
-          <Badge variant="secondary" className="text-[10px]">
+    <div className="flex flex-col gap-4">
+      {/* 分区头（独立页面主体，不再折叠） */}
+      <div className="flex items-center gap-2">
+        <Bot className="h-4 w-4 text-muted-foreground" />
+        <h3 className="text-sm font-semibold">模型配置</h3>
+        <span className="text-xs text-muted-foreground">
+          多模型 profile 与路由绑定，保存即热生效（无需重启）
+        </span>
+        {data?.profiles?.length ? (
+          <Badge variant="secondary" className="ml-auto text-[10px]">
             {data.profiles.length} 个模型
           </Badge>
-        ) : null
-      }
-    >
+        ) : null}
+      </div>
+
       {loading && !data && (
         <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -231,14 +374,17 @@ export function ModelsSection() {
               {roles
                 .filter((r) => r.kind === 'chat')
                 .map((r) => (
-                  <div key={r.key} className="flex items-center gap-2 text-xs">
-                    <span className="w-32 shrink-0 text-muted-foreground">
+                  <div
+                    key={r.key}
+                    className="flex flex-wrap items-center gap-2 text-xs"
+                  >
+                    <span className="w-28 shrink-0 text-muted-foreground">
                       {r.label}
                     </span>
                     <code className="rounded bg-muted px-1 py-0.5 text-[10px]">
                       {r.key}
                     </code>
-                    <div className="ml-auto">
+                    <div className="ml-auto flex min-w-40 flex-1 justify-end sm:flex-none">
                       <RoleSelect
                         roleKey={r.key}
                         value={data.routes.roles[r.key]}
@@ -257,32 +403,27 @@ export function ModelsSection() {
             </p>
             <div className="flex flex-col gap-1 rounded-md border p-2.5">
               {data.agents.map((a) => (
-                <div key={a.id} className="flex items-center gap-2 text-xs">
-                  <span className="w-32 shrink-0 text-muted-foreground">
+                <div
+                  key={a.id}
+                  className="flex flex-wrap items-center gap-2 text-xs"
+                >
+                  <span className="w-28 shrink-0 text-muted-foreground">
                     {a.name}
                   </span>
                   <code className="rounded bg-muted px-1 py-0.5 text-[10px]">
                     {a.id}
                   </code>
-                  <div className="ml-auto">
-                    <select
-                      className="h-7 rounded-md border border-input bg-background px-1.5 text-xs"
+                  <div className="ml-auto flex min-w-40 flex-1 justify-end sm:flex-none">
+                    <SearchableModelSelect
+                      className="min-w-0 flex-1 sm:max-w-56"
                       value={data.routes.agents[a.id] ?? ''}
+                      options={chatOptions}
+                      emptyOptionLabel="跟随角色默认"
                       disabled={saving}
-                      onChange={(e) =>
-                        patchRoutes({
-                          agents: { [a.id]: e.target.value || null },
-                        })
-                      }
-                      aria-label={`智能体 ${a.name} 绑定的模型`}
-                    >
-                      <option value="">跟随角色默认</option>
-                      {chatProfiles.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.label || p.id}
-                        </option>
-                      ))}
-                    </select>
+                      onChange={dispatchSelect('chat', (pid) =>
+                        patchRoutes({ agents: { [a.id]: pid || null } }),
+                      )}
+                    />
                   </div>
                 </div>
               ))}
@@ -293,48 +434,64 @@ export function ModelsSection() {
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
             <div>
               <p className="mb-1 text-xs font-medium text-muted-foreground">
-                默认对话模型
+                默认对话模型（可搜索，含服务上未注册模型）
               </p>
-              <select
-                className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs"
+              <SearchableModelSelect
                 value={data.routes.defaults.chat ?? ''}
+                options={chatOptions}
                 disabled={saving}
-                onChange={(e) =>
-                  patchRoutes({ defaults: { chat: e.target.value } })
-                }
-                aria-label="默认对话模型"
-              >
-                {chatProfiles.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.label || p.id}
-                  </option>
-                ))}
-              </select>
+                onChange={dispatchSelect('chat', (pid) =>
+                  patchRoutes({ defaults: { chat: pid } }),
+                )}
+              />
             </div>
             <div>
               <p className="mb-1 text-xs font-medium text-muted-foreground">
                 默认向量模型
               </p>
-              <select
-                className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs"
+              <SearchableModelSelect
                 value={data.routes.defaults.embedding ?? ''}
+                options={embedOptions}
                 disabled={saving}
-                onChange={(e) =>
-                  patchRoutes({ defaults: { embedding: e.target.value } })
-                }
-                aria-label="默认向量模型"
-              >
-                {embedProfiles.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.label || p.id}
-                  </option>
-                ))}
-              </select>
+                onChange={dispatchSelect('embedding', (pid) =>
+                  patchRoutes({ defaults: { embedding: pid } }),
+                )}
+              />
               <p className="mt-1 text-[10px] text-amber-700 dark:text-amber-400">
                 切换不同维度的向量模型需重建向量集合，否则入库/检索会报维度错误。
               </p>
             </div>
           </div>
+
+          {/* 服务发现失败源提示（显式报错不静默，不影响已注册模型使用） */}
+          {discovered?.errors?.length > 0 && (
+            <p className="text-[11px] text-amber-700 dark:text-amber-400">
+              部分模型服务发现失败：
+              {discovered.errors
+                .map((e) => `${e.baseUrl}（${e.error}）`)
+                .join('；')}
+            </p>
+          )}
+
+          {/* 思考模式开关（qwen3 软开关，热生效） */}
+          <label className="flex cursor-pointer items-start gap-2 rounded-md border px-3 py-2">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-3.5 w-3.5"
+              checked={data.settings?.thinking !== false}
+              disabled={saving}
+              onChange={(e) => patchSettings({ thinking: e.target.checked })}
+            />
+            <span className="flex flex-col">
+              <span className="text-xs font-medium">思考模式（qwen3）</span>
+              <span className="text-[11px] text-muted-foreground">
+                开启后 qwen3
+                系列模型先思维链推理再作答（质量更高、耗时更长）；关闭则注入
+                /no_think 软开关跳过思考，RAG 问答与查询改写出字更快。仅影响
+                qwen3 系列模型，切换热生效、随配置持久化。
+              </span>
+            </span>
+          </label>
 
           {/* 新增模型入口 */}
           <div>
@@ -495,7 +652,7 @@ export function ModelsSection() {
           }
         }}
       />
-    </CollapsibleSection>
+    </div>
   )
 }
 

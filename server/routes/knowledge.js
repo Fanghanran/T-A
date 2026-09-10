@@ -12,6 +12,7 @@ import {
   attachChunkScoresAsync,
 } from '../lib/docProcessor.js'
 import { scanDuplicateChunks } from '../lib/chunkAudit.js'
+import { assertQuota } from '../lib/quota.js'
 import { chunkerConfig } from '../lib/config.js'
 import { unifiedSearch } from '../lib/unifiedSearch.js'
 import { validateKnowledgeBody, rateLimiters } from '../lib/security.js'
@@ -22,6 +23,7 @@ import {
   UNSUPPORTED_HINT,
   parseTags,
   dbg,
+  pipeStream,
 } from './shared.js'
 
 /**
@@ -163,12 +165,14 @@ knowledgeRouter.post(
       }
 
       // 阶段 1：切片（按策略）→ 句子向量平均 → topic/questions 标注 → 入库（失败全降级，永不抛）
-      const { chunkList, vectors } = await prepareDocChunksAndVectors(text, {
+      const { chunkList, vectors, questionVectors } = await prepareDocChunksAndVectors(text, {
         strategy: chunkStrategy,
         delimiter,
         maxChars,
         overlapChars,
       })
+      // M5b：per-user 配额检查（切片数此时已知，一次覆盖文档+切片两类配额）
+      assertQuota(ownerId, { addDocuments: 1, addChunks: chunkList.length })
       const doc = await store.createDocument({
         title: originalName,
         category,
@@ -177,7 +181,9 @@ knowledgeRouter.post(
         content: text,
         ownerId,
       })
-      await store.addChunks(doc.id, chunkList, vectors, { category, tags, ownerId })
+      await store.addChunks(doc.id, chunkList, vectors, { category, tags, ownerId, questionVectors })
+      // 记录切片策略：后续编辑正文 / reindex 重切时按此恢复，切片格式不漂移
+      store.setDocStrategy(doc.id, { strategy: chunkStrategy, delimiter, maxChars, overlapChars })
 
       res.status(201).json(doc)
     } catch (err) {
@@ -401,7 +407,7 @@ knowledgeRouter.post(
 
       const run = async () => {
         job && (job.stage = 'embedding')
-        const { chunkList, vectors } = await prepareDocChunksAndVectors(
+        const { chunkList, vectors, questionVectors } = await prepareDocChunksAndVectors(
           entry.text,
           {
             strategy: entry.strategy,
@@ -411,6 +417,13 @@ knowledgeRouter.post(
             withQuestions: withQuestions === true,
           },
         )
+        // 取消检查点①（入库前）：前端已判定失败（轮询连续失败等）并请求取消 → 拦截入库
+        if (job && job.cancelRequested) {
+          job.stage = 'error'
+          job.error = '已取消：任务在入库前被中断，未写入数据'
+          job.updatedAt = Date.now()
+          return null
+        }
         if (job) {
           job.chunkCount = chunkList.length
           job.stage = 'indexing'
@@ -418,6 +431,8 @@ knowledgeRouter.post(
         }
         const parsedTags = parseTags(tags)
         const safeCategory = typeof category === 'string' ? category : ''
+        // M5b：入库前配额检查（与主上传同口径）
+        assertQuota(ownerId, { addDocuments: 1, addChunks: chunkList.length })
         const doc = await store.createDocument({
           title: entry.title,
           category: safeCategory,
@@ -430,8 +445,24 @@ knowledgeRouter.post(
           category: safeCategory,
           tags: parsedTags,
           ownerId,
+          questionVectors,
+        })
+        // 记录切片策略：后续编辑正文 / reindex 重切时按此恢复，切片格式不漂移
+        store.setDocStrategy(doc.id, {
+          strategy: entry.strategy,
+          delimiter: entry.delimiter,
+          maxChars: entry.maxChars,
+          overlapChars: entry.overlapChars,
         })
         if (job) {
+          // 取消检查点②（入库后）：入库期间才收到取消请求 → 回滚删除，保持前后端一致
+          if (job.cancelRequested) {
+            await store.deleteDocument(doc.id, ownerId)
+            job.stage = 'error'
+            job.error = '已取消：文档已入库后被回滚删除'
+            job.updatedAt = Date.now()
+            return null
+          }
           job.stage = 'done'
           job.doc = doc
           job.updatedAt = Date.now()
@@ -468,6 +499,42 @@ knowledgeRouter.get('/api/knowledge/documents/jobs/:id', (req, res) => {
   }
   res.json(job)
 })
+
+// ---------- 两段式·三（补）：取消异步 job（前端判定失败后调用，保持前后端一致） ----------
+// 语义：进行中的任务 → 标记取消，run() 的入库前/入库后检查点拦截或回滚；
+//       已完成的任务 → 直接删除已入库文档（回滚）；已失败的任务 → 幂等返回。
+knowledgeRouter.post(
+  '/api/knowledge/documents/jobs/:id/cancel',
+  jsonLimits.batch,
+  async (req, res, next) => {
+    try {
+      _pruneJobs()
+      const job = uploadJobs.get(req.params.id)
+      // job 按 owner 隔离：他人取消一律 404
+      if (!job || job.ownerId !== req.principal.userId) {
+        return res.status(404).json({ message: '任务不存在或已完成清理' })
+      }
+      if (job.stage === 'done' && job.doc?.id) {
+        // 已入库完成：回滚删除（前端已判定失败，不能留下库里的数据）
+        await store.deleteDocument(job.doc.id, req.principal.userId)
+        job.stage = 'error'
+        job.error = '已取消：已入库文档被回滚删除'
+        job.updatedAt = Date.now()
+        return res.json({ result: 'rolledBack' })
+      }
+      if (job.stage === 'error') {
+        // 后端本来就已失败（未入库成功），幂等返回
+        return res.json({ result: 'alreadyFailed' })
+      }
+      // 进行中：标记取消，由 run() 的检查点决定最终状态（入库前拦截 / 入库后回滚）
+      job.cancelRequested = true
+      job.updatedAt = Date.now()
+      return res.json({ result: 'cancelling' })
+    } catch (err) {
+      next(err)
+    }
+  },
+)
 
 // ---------- 预览切片（不入库，零副作用；前端上传前实时预览） ----------
 knowledgeRouter.post(
@@ -752,11 +819,17 @@ knowledgeRouter.patch(
         } catch {
           reuse = null // 取旧向量失败 → 全量重嵌，不影响正确性
         }
-        const { chunkList, vectors, reusedCount } =
-          await prepareDocChunksAndVectors(content, { reuse })
+        // 读取入库时记录的切片策略：编辑正文重切必须沿用原策略（分隔符/参数），
+        // 否则静默退回默认语义感知策略，切片格式漂移（delimiter 策略全部失效）
+        const docStrategy = store.getDocStrategy(id)
+        const { chunkList, vectors, questionVectors, reusedCount } =
+          await prepareDocChunksAndVectors(content, {
+            ...(docStrategy ?? {}),
+            reuse,
+          })
         if (reuse && reusedCount > 0) {
           dbg(
-            `[PATCH content] 增量复用 ${reusedCount}/${chunkList.length} 块旧向量`,
+            `[PATCH content] 增量复用 ${reusedCount}/${chunkList.length} 块旧向量${docStrategy ? `（策略 ${docStrategy.strategy}）` : ''}`,
           )
         }
         doc = await store.updateContentWithPrepared(
@@ -764,7 +837,7 @@ knowledgeRouter.patch(
           content,
           chunkList,
           vectors,
-          { ownerId: req.principal.userId },
+          { ownerId: req.principal.userId, questionVectors },
         )
         if (!doc) return res.status(404).json({ message: '文档不存在' })
       }
@@ -809,18 +882,26 @@ knowledgeRouter.post(
           .status(400)
           .json({ message: '正文过短或为空，无法重新切片（请先删除该文档）' })
       }
-      const { chunkList, vectors } = await prepareDocChunksAndVectors(content, {
+      // 沿用入库时记录的切片策略（未记录走默认语义感知），切片格式不漂移
+      const docStrategy = store.getDocStrategy(id)
+      const { chunkList, vectors, questionVectors } = await prepareDocChunksAndVectors(content, {
+        ...(docStrategy ?? {}),
         withQuestions: chunkerConfig?.questionsPerChunk > 0,
+      })
+      // M5b：重切是「先删后加」，按净增量检查切片配额（不新增文档）
+      const beforeChunks = store.listChunksOf(id, req.principal.userId).length
+      assertQuota(req.principal.userId, {
+        addChunks: Math.max(0, chunkList.length - beforeChunks),
       })
       const updated = await store.updateContentWithPrepared(
         id,
         content,
         chunkList,
         vectors,
-        { ownerId: req.principal.userId },
+        { ownerId: req.principal.userId, questionVectors },
       )
       if (!updated) return res.status(500).json({ message: '重新入库失败' })
-      dbg(`[reindex] 文档 ${id} 重切片入库完成：${chunkList.length} 块`)
+      dbg(`[reindex] 文档 ${id} 重切片入库完成：${chunkList.length} 块${docStrategy ? `（策略 ${docStrategy.strategy}）` : ''}`)
       res.json({
         id,
         title: updated.title,
@@ -852,9 +933,12 @@ knowledgeRouter.post(
             results.push({ id: o.id, ok: false, error: '无权访问' })
             continue
           }
-          const { chunkList, vectors } = await prepareDocChunksAndVectors(
+          // 沿用入库时记录的切片策略（未记录走默认语义感知），切片格式不漂移
+          const docStrategy = store.getDocStrategy(o.id)
+          const { chunkList, vectors, questionVectors } = await prepareDocChunksAndVectors(
             o.contentLen ? (ownDoc.content ?? '') : '',
             {
+              ...(docStrategy ?? {}),
               withQuestions: chunkerConfig?.questionsPerChunk > 0,
             },
           )
@@ -863,7 +947,7 @@ knowledgeRouter.post(
             ownDoc.content ?? '',
             chunkList,
             vectors,
-            { ownerId: req.principal.userId },
+            { ownerId: req.principal.userId, questionVectors },
           )
           results.push({ id: o.id, ok: true, chunkCount: chunkList.length })
         } catch (e) {
@@ -1106,7 +1190,7 @@ knowledgeRouter.post(
       }
       const safeCategory = typeof category === 'string' ? category.trim() : ''
       // 阶段 1：与上传同一条切片+标注链路
-      const { chunkList, vectors } = await prepareDocChunksAndVectors(content)
+      const { chunkList, vectors, questionVectors } = await prepareDocChunksAndVectors(content)
       const doc = await store.createDocument({
         title: title.trim(),
         category: safeCategory,
@@ -1123,6 +1207,7 @@ knowledgeRouter.post(
         category: safeCategory,
         tags: safeTags,
         ownerId: req.principal.userId,
+        questionVectors,
       })
       res.status(201).json(doc)
     } catch (err) {
