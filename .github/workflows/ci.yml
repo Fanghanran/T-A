@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 jobs:
   check:
@@ -13,18 +14,16 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
+          node-version: '24'
+          cache: 'npm'
           cache-dependency-path: |
             package-lock.json
             server/package-lock.json
 
-      # 前端：依赖 + 质量门禁（build + vitest + eslint + prettier + server 测试/分层）
-      - name: Install frontend deps
-        run: npm ci
+      - name: 安装依赖（root + server）
+        run: |
+          npm ci
+          npm --prefix server ci
 
-      - name: Install server deps
-        run: npm ci --prefix server
-
-      - name: check:all (build + test + lint + format + server)
+      - name: 全量门禁（build + 前端测试 + lint + format + 后端测试 + 分层检查）
         run: npm run check:all
