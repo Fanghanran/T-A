@@ -4,6 +4,7 @@ import { generateChunkAnnotations } from '../llm.js'
 import { childLogger } from '../logger.js'
 import {
   analyzeDocFeatures,
+  attachChunkScoresAsync,
   previewChunks,
   formatChunksPreview,
   chunksToAnnotation,
@@ -17,6 +18,8 @@ import {
   clearCachedPreview,
 } from '../docProcessor.js'
 import { toolRegistry } from '../management/registry.js'
+import { evalChunkStrategies } from '../chunkStrategyEval.js'
+import { tunables } from '../tunables.js'
 // 意图判定已下沉为独立领域模块（lib/intents.js），工具层与工作流层共用同一口径
 import { hasCommitConfirmation } from '../intents.js'
 
@@ -111,9 +114,10 @@ export async function prepareAdjustedChunks(chunks) {
  *     近似完全重复（cos ≥ 0.985）时跳过入库（多份文档合并场景）。
  * 导出供 index.js 的 REST 入库端点复用，聊天/操作栏两条链路口径一致。
  * @param {Array} questionVectors 问题向量（可空；块被过滤时同步过滤，防止索引错位）
+ * @param {{ownerId?: string}} [opts] ownerId 必传——跨文档查重按用户隔离（缺省时跳过跨文档查重并告警）
  * @returns {{ chunkList:Array, vectors:Array, questionVectors:Array|null, skippedWithin:number, skippedCross:number }}
  */
-export async function dedupPreparedChunks(chunkList, vectors, questionVectors = null) {
+export async function dedupPreparedChunks(chunkList, vectors, questionVectors = null, opts = {}) {
   const batch = dedupWithinBatch(chunkList, vectors)
   // 批内去重后原索引失效：按原 chunkList 的 text 反查过滤后的问题向量
   const qvByText = Array.isArray(questionVectors)
@@ -129,7 +133,12 @@ export async function dedupPreparedChunks(chunkList, vectors, questionVectors = 
     if (v.length) {
       try {
         // 只看最相似的 1 条；COSINE 度量，score 即相似度
-        const hits = await store.search(v, { topK: 1, field: 'text' })
+        if (!opts.ownerId) {
+          log.warn('[docTools] 跨文档去重缺少 ownerId，本轮跳过跨文档查重（防误伤其他用户数据）')
+          skippedCross++
+          continue
+        }
+        const hits = await store.search(v, { topK: 1, field: 'text', ownerId: opts.ownerId })
         if (hits?.length && Number(hits[0].score) >= DEDUP_THRESHOLDS.crossDoc) dup = true
       } catch (err) {
         // 检索失败不阻塞入库：宁可重复，不可丢数据
@@ -190,19 +199,67 @@ toolRegistry.register({
       return { observation: '错误：当前没有文档。', userText: '当前还没有文档，请先上传文件或粘贴文本。' }
     }
     const f = analyzeDocFeatures(text)
-    // 初始化/刷新预览缓存（保留已有 chunks）
     const cached = getCachedPreview(ctx.cacheKey)
+    // 多策略试切评测（rewrite.intentAware 同款思路，可热关）：并行试切候选策略 →
+    // 纯文本指标择优 → 推荐即预切片（点「预览切片」即时命中缓存）
+    const evalOn = tunables.strategy?.evalEnabled !== false
+    const evaluation = evalOn ? await evalChunkStrategies(text, { hasQa: f.hasQa }) : null
+    const rec = evaluation?.recommended ?? null
+
+    // 预切片：推荐策略的实际切片（含质量评分）直接写入预览缓存
+    let previewChunks = cached?.chunks ?? null
+    let avgScore = null
+    let strategySource = 'rule'
+    if (rec?.chunks?.length) {
+      try {
+        const scored = await attachChunkScoresAsync(rec.chunks)
+        previewChunks = scored.chunks
+        avgScore = scored.avgScore
+        strategySource = 'eval'
+      } catch (err) {
+        log.warn(`[docTools] 预切片评分失败，按未评分预览：${err.message}`)
+      }
+    }
+    const strategy = rec ? rec.params.strategy : f.suggestedStrategy
+    const opts = {
+      ...(cached?.opts || {}),
+      ...(rec
+        ? {
+            ...(rec.params.delimiter ? { delimiter: rec.params.delimiter } : {}),
+            maxChars: rec.params.maxChars ?? f.maxChars,
+            ...(rec.params.overlapChars != null ? { overlapChars: rec.params.overlapChars } : {}),
+          }
+        : { maxChars: f.maxChars }),
+    }
     setCachedPreview(ctx.cacheKey, {
+      ownerId: ctx.ownerId,
       text,
-      chunks: cached?.chunks ?? null,
-      strategy: f.suggestedStrategy,
-      opts: { ...(cached?.opts || {}), maxChars: f.maxChars },
+      chunks: previewChunks,
+      strategy,
+      opts,
     })
-    const obs = JSON.stringify(f)
+    const obs = JSON.stringify({
+      ...f,
+      strategy,
+      strategySource,
+      avgScore,
+      evaluation: evaluation
+        ? evaluation.evaluated.map((e) => ({
+            label: e.label, count: e.count, avgLen: e.avgLen,
+            boundary: e.boundary, cohesion: e.cohesion, uniformity: e.uniformity, score: e.score,
+          }))
+        : null,
+      recommended: evaluation?.reason ?? null,
+    })
+    const evalLines = evaluation
+      ? evaluation.evaluated.map((e) => `   - ${e.label}：${e.count} 块 / 均长 ${e.avgLen} 字 / 综合分 ${e.score.toFixed(2)}`).join('\n')
+      : ''
     const userText =
       `收到文档：共 ${f.chars.toLocaleString()} 字 / ${f.paragraphs} 个段落 / ${f.headings} 个标题，` +
       `${f.hasCode ? '含代码块' : '无代码'}，${f.hasQa ? '含问答结构' : '无问答'}，${f.hasTable ? '含表格' : '无表格'}。\n` +
-      `推荐策略：${f.suggestedStrategy}（maxChars=${f.maxChars}）。`
+      (evaluation
+        ? `多策略试切评测（已预切片）：\n${evalLines}\n推荐策略：${strategy}（已按此预切片${avgScore != null ? `，均分 ${avgScore}` : ''}）。可说「预览」查看，或手动调整。`
+        : `推荐策略：${f.suggestedStrategy}（maxChars=${f.maxChars}）。`)
     return { observation: obs, userText }
   },
 })
@@ -314,7 +371,7 @@ toolRegistry.register({
       }))
     }
     // 文档去重（§9 扩展）：批内 + 跨文档（Milvus 检索比对）
-    const deduped = await dedupPreparedChunks(chunkList, vectors, questionVectors)
+    const deduped = await dedupPreparedChunks(chunkList, vectors, questionVectors, { ownerId: ctx.ownerId })
     chunkList = deduped.chunkList
     vectors = deduped.vectors
     questionVectors = deduped.questionVectors

@@ -16,14 +16,14 @@ export const mockInterviewAgent = {
   aliases: ['模拟面试'],
 
   async handler(ctx) {
-    const { query, techStack, history, req, res, sessionId, onAssistantDone, pipeStream, dbg, agentId, memoryBlock, signal } = ctx
+    const { query, techStack, history, req, res, sessionId, onAssistantDone, pipeStream, dbg, agentId, memoryBlock, signal, ownerId } = ctx
     const finish = req.body?.interviewFinish === true
 
     let results = []
     if (!finish) {
       const q = query || (Array.isArray(techStack) ? techStack[0] : '')
       try {
-        results = q ? questionBank.search(q, { techStack, limit: 3 }) || [] : []
+        results = q ? questionBank.search(q, { ownerId, techStack, limit: 3 }) || [] : []
       } catch {
         results = []
       }

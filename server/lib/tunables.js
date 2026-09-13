@@ -66,10 +66,11 @@ const GROUPS = [
     label: '查询改写',
     description: '检索前的 query 改写参数（queryRewriter.js）',
     defaults: {
-      rewriteTimeoutMs: 1200,
+      rewriteTimeoutMs: 3000,
       rewriteEnabled: true,
       queriesPerRequest: 3,
       historyTurns: 3,
+      intentAware: true,
     },
   },
   {
@@ -82,6 +83,14 @@ const GROUPS = [
       // 实测（本地 qwen2.5-coder:14b，2026-09-06）：生成 300 字假设答案需 8s+，
       // 5000ms 必然熔断白等；放宽到 12000 保证一次成功（缓存命中后重复查询仅 ~0.2s）
       timeoutMs: 12000,
+    },
+  },
+  {
+    key: 'strategy',
+    label: '切片策略推荐',
+    description: '多策略试切评测器：分析文档时并行试切候选策略，纯文本指标择优并预切片',
+    defaults: {
+      evalEnabled: true,
     },
   },
   {
@@ -106,6 +115,26 @@ const GROUPS = [
       keywordWeight: 0.7,
       esTopK: 50,
       exactBoost: 5,
+    },
+  },
+  {
+    key: 'reflection',
+    label: '回答反思评估',
+    description: 'RAG 回答的快信号质量评估与低置信记录（reflection.js，P1）',
+    defaults: {
+      enabled: true,
+      minTop1: 0.45,
+    },
+  },
+  {
+    key: 'react',
+    label: 'ReAct 自主规划',
+    description: '复合任务的 思考→选工具→观察 循环规划（reactPlanner.js，P2）',
+    defaults: {
+      enabled: true,
+      maxSteps: 8,
+      stepTimeoutMs: 30000,
+      totalBudgetMs: 180000,
     },
   },
   {
@@ -140,13 +169,15 @@ const META = {
   'scoring.maxSentences': { label: '一致性计算上限', type: 'int', min: 50, max: 2000, description: '句子总量超过此值跳过块内一致性计算（防卡顿）' },
   'dedup.withinBatch': { label: '批内去重阈值', type: 'float', min: 0.8, max: 1, description: '同文档内 cos ≥ 此值判重复，只保留首个' },
   'dedup.crossDoc': { label: '跨文档去重阈值', type: 'float', min: 0.8, max: 1, description: '与库中已有块 cos ≥ 此值跳过入库' },
-  'rewrite.rewriteTimeoutMs': { label: '改写超时(ms)', type: 'int', min: 200, max: 30000, description: '改写 LLM 超时即降级为原始 query 检索' },
+  'rewrite.rewriteTimeoutMs': { label: '改写超时(ms)', type: 'int', min: 200, max: 30000, description: '改写 LLM 超时即降级为原始 query 检索（意图感知 prompt 更长，默认 3000）' },
   'rewrite.rewriteEnabled': { label: '启用改写', type: 'bool', description: '总开关，关闭后走纯原始 query 检索' },
   'rewrite.queriesPerRequest': { label: '生成查询数', type: 'int', min: 1, max: 8, description: '每次检索生成几个查询（含主查询）' },
   'rewrite.historyTurns': { label: '历史轮数', type: 'int', min: 1, max: 10, description: '改写参考的对话历史窗口轮数' },
+  'rewrite.intentAware': { label: '意图感知改写', type: 'bool', description: '先判意图类型（对比/多意图/反问等）再按类型策略改写，并输出排除词' },
   'hyde.hydeEnabled': { label: '启用 HyDE', type: 'bool', description: '总开关：首轮检索 top1 低于阈值时用假设答案做二次检索' },
   'hyde.minScore': { label: '触发阈值', type: 'float', min: 0.1, max: 0.9, description: '首轮检索（含 2-gram 加权后）top1 分数低于此值才触发 HyDE，多数查询零额外开销' },
   'hyde.timeoutMs': { label: '生成超时(ms)', type: 'int', min: 1000, max: 30000, description: '假设答案生成超时即放弃本轮 HyDE，保留首轮结果' },
+  'strategy.evalEnabled': { label: '试切评测', type: 'bool', description: '分析文档时多策略试切并择优预切片（关闭则仅规则推荐）' },
   'memory.enabled': { label: '启用记忆', type: 'bool', description: '总开关：关闭后不召回、不摘要、不提炼' },
   'memory.summaryEveryTurns': { label: '摘要触发轮数', type: 'int', min: 1, max: 30, description: '新增用户消息达到此轮数后滚动一次会话摘要' },
   'memory.extractEveryTurns': { label: '提炼触发轮数', type: 'int', min: 1, max: 30, description: '新增用户消息达到此轮数后提炼一次长期事实' },
@@ -154,6 +185,12 @@ const META = {
   'memory.summaryBudgetChars': { label: '摘要字数上限', type: 'int', min: 100, max: 2000, description: '滚动摘要的最大字符数' },
   'memory.factBudgetChars': { label: '事实字数上限', type: 'int', min: 100, max: 2000, description: '单条长期事实注入 prompt 的最大字符数' },
   'memory.maxFactsPerExtract': { label: '单次提炼条数上限', type: 'int', min: 1, max: 20, description: '每次事实提炼最多写入的长期事实条数' },
+  'reflection.enabled': { label: '启用反思评估', type: 'bool', description: 'RAG 回答生成后做快信号质量评估并记录（reflection.js）' },
+  'reflection.minTop1': { label: '引用置信阈值', type: 'float', min: 0.1, max: 0.9, description: '最高引用相似度低于此值视为检索低置信，扣分并记录' },
+  'react.enabled': { label: '启用 ReAct 规划', type: 'bool', description: '复合任务触发自主规划循环（reactPlanner.js，需工作流 react-planner 同步启用）' },
+  'react.maxSteps': { label: '最大步数', type: 'int', min: 1, max: 20, description: '规划循环步数上限（熔断 1：超出显式中止并返回中间结果）' },
+  'react.stepTimeoutMs': { label: '单步超时(ms)', type: 'int', min: 5000, max: 120000, description: '单步 LLM 决策/工具执行的超时（熔断 2）' },
+  'react.totalBudgetMs': { label: '总预算(ms)', type: 'int', min: 20000, max: 600000, description: '单次规划的总耗时预算（熔断 3，超出显式中止）' },
   'es.keywordWeight': { label: 'BM25 融合权重', type: 'float', min: 0.1, max: 1, description: 'ES BM25 命中分数的融合权重（归一化后 × 此权重，与 question 锚点同级降档）' },
   'es.esTopK': { label: 'ES 召回条数', type: 'int', min: 10, max: 200, description: 'ES 检索取回条数（与向量路 overK 同口径的召回池大小）' },
   'es.exactBoost': { label: '整词精确加权', type: 'float', min: 1, max: 20, description: 'text.exact 整词 term 命中的 BM25 加权（兜底连字符标识符整词匹配）' },

@@ -68,8 +68,8 @@ healthRouter.get('/api/health', (_req, res) => {
     // 一致性自检：status=indexed 但 0 切片的孤儿文档（可经 /api/knowledge/orphans 查、reindex 修复）
     orphanDocuments: orphans.length,
     orphans: orphans.map((o) => ({ id: o.id, title: o.title })),
-    questions: questionBank.stats().total,
-    byCategory: questionBank.stats().byCategory,
+    questions: questionBank.stats('*').total, // 系统自检：全库聚合口径
+    byCategory: questionBank.stats('*').byCategory,
     sessions: sessionStore.stats(), // { totalSessions, totalMessages }
   })
 })

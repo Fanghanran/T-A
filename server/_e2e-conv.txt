@@ -1,0 +1,17 @@
+﻿鐩爣: 鏌ヤ竴涓嬬煡璇嗗簱閲屽悜閲忔暟鎹簱鐨勯€夊瀷缁撹锛岀劧鍚庢妸鏈€閲嶈鐨勪袱鏉＄粨璁哄啓鍏ヨ蹇?--- SSE 娴?---
+HTTP 200 | x-session-id: sess_153
+[step 1] kb.search (2109ms) engine=react-agent
+  thought: 棣栧厛闇€瑕佸湪鐭ヨ瘑搴撲腑妫€绱㈠叧浜庡悜閲忔暟鎹簱鐨勯€夊瀷缁撹銆?  args: {"query":"鍚戦噺鏁版嵁搴撻€夊瀷缁撹"}
+  observation: [{"title":"","score":0.9089,"snippet":"闂細浣犺繕鐢ㄨ繃鍏跺畠鐨勫悜閲忔暟鎹簱鍚楋紵\n绛旓細濡傚疄浣滅瓟锛屽Faiss銆丆hroma銆丵drant銆乄eaviate銆丳GVector绛夛紝骞跺姣斿樊寮傘€?},{"title
+[step 2] memory.write (215ms) engine=react-agent
+  thought: 鏍规嵁妫€绱㈢粨鏋滐紝鏈€閲嶈鐨勪袱鏉＄粨璁烘槸锛?. Milvus鏁版嵁搴撳洜鍏堕珮鎬ц兘銆佹敮鎸佸ぇ瑙勬ā鍒嗗竷寮忋€佺储寮曠被鍨嬩赴瀵屻€佺敓鎬佹垚鐔熷拰鍙按骞虫墿灞曡€岄€傚悎鐢熶骇绾у悜閲忔绱紱2. 寮€婧愮殑Ve
+  args: {"text":"Milvus鏁版嵁搴撳洜鍏堕珮鎬ц兘銆佹敮鎸佸ぇ瑙勬ā鍒嗗竷寮忋€佺储寮曠被鍨嬩赴瀵屻€佺敓鎬佹垚鐔熷拰鍙按骞虫墿灞曡€岄€傚悎鐢熶骇绾у悜閲忔绱€?}
+  observation: 宸插啓鍏ラ暱鏈熻蹇嗭紙scope=global锛宨d=mem_c9b7bdcb-aa85-4df1-9b7b-32eeb250688c锛夛細Milvus鏁版嵁搴撳洜鍏堕珮鎬ц兘銆佹敮鎸佸ぇ瑙勬ā鍒嗗竷寮忋€佺储寮曠被鍨嬩赴瀵屻€佺敓鎬佹垚鐔熷拰鍙按骞虫墿灞曡€岄€傚悎鐢熶骇绾у悜閲忔绱€?[step 3] memory.write (164ms) engine=react-agent
+  thought: 宸茬粡鍐欏叆浜嗕竴鏉＄粨璁猴紝鎺ヤ笅鏉ラ渶瑕佸啓鍏ョ浜屾潯鏈€閲嶈鐨勭粨璁恒€?  args: {"text":"寮€婧愮殑VectorDB鍖呮嫭Milvus銆丗aiss銆丆hroma銆丵drant銆乄eaviate銆丳GVector绛夈€?}
+  observation: 宸插啓鍏ラ暱鏈熻蹇嗭紙scope=global锛宨d=mem_64020ef5-8503-4462-8cbd-f732b7a59b38锛夛細寮€婧愮殑VectorDB鍖呮嫭Milvus銆丗aiss銆丆hroma銆丵drant銆乄eaviate銆丳GVec
+[step 4] FINISH (0ms) engine=react-agent
+  thought: 宸茬粡瀹屾垚浜嗗悜閲忔暟鎹簱閫夊瀷缁撹鐨勬绱㈠拰涓ゆ潯閲嶈缁撹鐨勫啓鍏ワ紝鐩爣宸插畬鎴愩€?  args: {}
+  observation: 鏍规嵁鐭ヨ瘑搴撲腑鐨勪俊鎭紝鏈€閲嶈鐨勪袱鏉″叧浜庡悜閲忔暟鎹簱閫夊瀷鐨勭粨璁烘槸锛?. Milvus鏁版嵁搴撳洜鍏堕珮鎬ц兘銆佹敮鎸佸ぇ瑙勬ā鍒嗗竷寮忋€佺储寮曠被鍨嬩赴瀵屻€佺敓鎬佹垚鐔熷拰鍙按骞虫墿灞曡€岄€傚悎鐢熶骇绾у悜閲忔绱紱2. 寮€婧愮殑VectorDB鍖呮嫭Milvus銆丗aiss銆丆hroma
+--- 缁撴灉 ---
+agent_workflow 姝ラ鏁? 4 | FINISH: true | 鏂囨湰鎬婚噺: 283 瀛?--- 瀹¤锛坮eact.*锛?--
+锛堣蹇嗗啓鍏ヤ互娴佸唴 step 鐨?memory.write observation 涓哄噯锛?

@@ -61,11 +61,28 @@ ERR_DLOPEN_FAILED ... NODE_MODULE_VERSION 137 vs 127
 4. ✅ **question 向量索引 —— 2026-08-29 重构时已修**：text_vector + question_vector 双向量，66/67 切片有锚点，已接入检索
 5. ✅ **api.js 死代码 + hook 零日志 —— 2026-08-30 已修**：两个 API 文件接入 `request()`；三个 hook 补 logger；ChunkPreviewPanel 的 onAdjust 已四层接通（ChatPage → MessageList → StreamingMessage → Panel）
 
+## Agent 平台化（P1 已落地 · 2026-09-12）
+- **Agent Spec 配置化**：智能体元数据/人设/runtime 全部落 `server/data/management/agents.db`（agents 表），6 个内置 seed 幂等；设计书 `docs/agent-platform-design.md`
+- **运行时**：`agentStore`（CRUD + emitSpecChange 变更事件）→ `routes/chat.js syncAgentRuntime` 热注册/注销（新建/改/删/启停免重启）；自定义 agent 走 `genericAgent.js`（runtime=chat → streamChat 完整人设；rag → knowledgeBaseFlow 复用检索+引用，persona 追加）
+- **API**：`GET /api/agents`（登录，前端数据源，不泄露 systemPrompt）；`/api/management/agents` CRUD（requirePerm('mgmt.agents')，内置仅展示层字段+启停，删除=软删停用）
+- **前端**：`agentRegistry.loadAgentsFromServer()` 服务端化（静态定义降级兜底）+ `AgentsManagePage` + Sidebar/AppShell 接线
+- **教训**：同一文件多个 Edit 并行调用会互相覆盖（最后写者存活）——同文件编辑必须串行
+- 待办（P2+）：MCP 工具接入、Supervisor 调度、多知识库绑定、agent 级 RBAC 细化
+
 ## 数据现状
-- 知识库：**13 篇文档 / 31 切片**（2026-08-30 清理 5 组同名重复后，原 26 篇 / 67 切片）
+- 知识库：**4 篇文档 / 51 切片 / kb_vectors 51 向量**（2026-09-12 全量 reindex 后；v3 存储只看 kb_vectors，旧 kb_documents/kb_chunks 是 v2 遗留）
+- ⚠️ **kb_vectors 曾被清空**（2026-09-11 Milvus 重启丢未 flush 向量）：症状 = 知识网络图 0 边 + 语义检索失效；修复 = 全量 reindex，已加 flush。**Milvus 重启后务必核对 kb_vectors 行数**
+- 图缓存：`lib/graphCache.js` 共享模块，vectorStoreV3 数据变更自动失效（reindex 后图即时刷新，不再等 5 分钟 TTL）
 - 重复清理的完整备份：`server/data/dedup-backup-*.json`（含正文，可还原）
-- 题库：18 题（SEED_QUESTIONS 自动灌入）
-- 会话：SQLite，21 会话 / 69 消息
+- 题库：admin 18 题（存量迁移）；其他用户按 QUESTION_SEED 配置起步（当前 .env=off → 空题库）
+- 会话：SQLite，按 ownerId 隔离
+
+## 用户数据隔离（2026-09-12 落地）
+- **语义**：所有业务数据按 `ownerId`（=账号 userId）隔离；`ownerId='*'` 是 **admin 聚合视图**（只读跨 owner，写入永远进自己名下）
+- **覆盖**：知识库文档/切片（kb.db 锚点 + data/files/<owner>/ + Milvus kb_vectors）/ ES BM25 / RAG 检索 / 知识网络图 / 题库（data/interview/questions/<owner>.json）/ Wiki（data/knowledge/wiki/<owner>.json）/ 会话（原有）
+- **接线点**：files.js、interview.js 路由读 scope=admin?'*':userId；chat.js ctx.ownerId 同规则；manager graph 用 **req.adminUserId/adminRole**（adminAuth 设置，管理挂载点没有 req.principal！）
+- **存量迁移**：`server/scripts/manual/migrate-owner-local.mjs`（local→admin，幂等已跑：Milvus 304 向量删插 + kb.db + files 目录 + ES 重索引 + 题库/wiki 归位）
+- **E2E**：`server/scripts/manual/_e2e_owner_isolation.mjs`（16 断言）
 
 ## 性能基线（实测，本地 14B 模型）
 - Milvus 检索本身仅约 **50ms**；query 改写才是耗时大头

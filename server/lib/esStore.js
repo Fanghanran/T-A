@@ -195,7 +195,8 @@ export async function search(query, { topK = 50, category, tag, ownerId } = {}) 
   try {
     await initReady()
     const es = getClient()
-    const filter = [{ term: { owner_id: ownerId ?? '' } }]
+    // '*'（admin 聚合视图）：不加 owner 过滤
+    const filter = ownerId === '*' ? [] : [{ term: { owner_id: ownerId ?? '' } }]
     if (category) filter.push({ term: { category } })
     if (tag) filter.push({ term: { tags: tag } })
     const resp = await es.search({

@@ -1,4 +1,4 @@
-import { FileText, Trash2, Pencil } from 'lucide-react'
+import { FileText, Trash2, Pencil, BookOpen } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from './Checkbox'
@@ -73,6 +73,23 @@ export function DocumentRow({
         {/* 操作按钮常显（弱化 60% 透明度，hover 行时全显强调）——
             此前 opacity-0 需悬停才出现，用户看不到以为按钮丢失 */}
         <div className="flex items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100">
+          {/* 切片阅读（v3）：进入 /knowledge/read/:docId，按锚点分段渲染 */}
+          <a
+            href={`/knowledge/read/${encodeURIComponent(doc.id)}`}
+            onClick={(e) => e.stopPropagation()}
+            aria-label="切片阅读"
+            title="切片阅读"
+          >
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6 shrink-0 hover:text-foreground"
+              tabIndex={-1}
+            >
+              <BookOpen className="h-3.5 w-3.5" />
+            </Button>
+          </a>
           {onEdit && (
             <Button
               type="button"

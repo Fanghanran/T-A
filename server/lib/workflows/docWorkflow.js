@@ -98,7 +98,7 @@ ${buildToolListBlock()}
 /** 当前状态块：文档信息 + 预览缓存状态（LLM 决策的关键事实） */
 function buildStateBlock(ctx) {
   const cached = getCachedPreview(ctx.cacheKey)
-  const doc = ctx.docId ? store.getDocument(ctx.docId) : null
+  const doc = ctx.docId ? store.getDocument(ctx.docId, ctx.ownerId) : null
   const text = ctx.resolveText()
   const lines = ['## 当前状态']
   if (doc || text) {
@@ -400,7 +400,7 @@ const OP_GUIDANCE = {
  * @param {{ opReport:{ op:string, docId?:string, instruction?:string, chunkCount?:number, totalChunks?:number, totalChars?:number, ms?:number }, history?:Array }} params
  * @returns {Promise<ReadableStream<Uint8Array>>} AI SDK data-stream 协议流
  */
-export async function streamOpReport({ opReport, history = [], signal }) {
+export async function streamOpReport({ opReport, history = [], signal, ownerId }) {
   const op = String(opReport.op || '')
   const docId = String(opReport.docId || '')
   const cacheKey = docId || '__ephemeral__'
@@ -411,7 +411,7 @@ export async function streamOpReport({ opReport, history = [], signal }) {
   let chunks = getCachedPreview(cacheKey)?.chunks
   if (!chunks && (op === 'preview' || op === 'adjust' || op === 'export')) {
     const cached = getCachedPreview(cacheKey)
-    const text = cached?.text || (docId ? store.getDocument(docId)?.content : '') || ''
+    const text = cached?.text || (docId ? store.getDocument(docId, ownerId)?.content : '') || ''
     if (text.trim()) {
       chunks = await previewChunks(text, { strategy: cached?.strategy })
       setCachedPreview(cacheKey, { ...cached, text, chunks, strategy: cached?.strategy || 'semantic', opts: cached?.opts || {} })
@@ -464,7 +464,7 @@ export async function streamOpReport({ opReport, history = [], signal }) {
     )
   } else if (op === 'export') {
     const md = chunks ? exportChunksAsMarkdown(chunks) : ''
-    const base = ((docId ? store.getDocument(docId)?.title : '') || '文档').replace(/\.[a-z0-9]+$/i, '')
+    const base = ((docId ? store.getDocument(docId, ownerId)?.title : '') || '文档').replace(/\.[a-z0-9]+$/i, '')
     const filename = `${base}_整理.md`
     facts =
       `已生成整理后的 Markdown「${filename}」` +
@@ -486,7 +486,7 @@ export async function streamOpReport({ opReport, history = [], signal }) {
     const failCount = num(opReport.failCount) ?? results.length - okCount
     const detail = results
       .map((x) => {
-        const t = x?.docId ? store.getDocument(x.docId)?.title : ''
+        const t = x?.docId ? store.getDocument(x.docId, ownerId)?.title : ''
         return `${x?.ok ? '✅' : '❌'} ${t || x?.docId}${x?.ok ? `（${x.chunkCount ?? '?'} 块）` : x?.error ? `：${x.error}` : ''}`
       })
       .join('；')

@@ -94,7 +94,8 @@ export const queryRewriterConfig = {
   // Ollama 响应超时（ms）：超过直接降级为原始 query 检索，不阻塞用户。
   // 实测（本地 qwen2.5-coder:14b，2026-08-29）：改写一次需 3s+，原值 3000 几乎必然触发
   // 超时降级 —— 每次查询白等 3 秒，而 Milvus 检索本身仅约 50ms（改写占了 98% 耗时）。
-  // 降到 1200 可显著减少无效等待；若换成响应更快的模型，可调大让改写真正生效。
+  // 1200 时代是无意图感知的短 prompt；意图感知改写（判类型 + 按类型策略）输出更长，
+  // 1200 实测必然超时（2026-09-13，qwen3:14b）→ 放宽到 1800，管理页仍可热调。
   get rewriteTimeoutMs() {
     return tunables.rewrite.rewriteTimeoutMs
   },
@@ -109,6 +110,11 @@ export const queryRewriterConfig = {
   // 对话历史上下文窗口：最多保留几轮（> 3 轮则压缩早期内容）
   get historyTurns() {
     return tunables.rewrite.historyTurns
+  },
+  // 意图感知改写：先判意图类型（对比/多意图/反问/上下文/常规）再按类型策略改写，
+  // 并对反问/否定类输出 excludeTerms（排除词）供排序降权
+  get intentAware() {
+    return tunables.rewrite.intentAware
   },
   // 送给改写 LLM 的上下文预算（近似 token）。
   // 计量口径：CJK 1 字 ≈ 1 token，其余 4 字符 ≈ 1 token。
@@ -139,6 +145,25 @@ export const queryRewriterConfig = {
  * 前 3 个调优项来自 tunables.js（getter 委托 → 在线修改热生效），
  * 其余为静态实现细节（缓存 / 答案长度），不开放在线调整。
  */
+/* ---------- 语音转文字（STT，OpenAI 兼容 /audio/transcriptions 端点） ---------- */
+// STT_BASE_URL 未设置 = 语音输入功能关闭（前端不显示麦克风）。
+// 本地自托管示例：docker run -p 9000:9000 onerahmet/openai-whisper-asr-webservice
+//   则 STT_BASE_URL=http://127.0.0.1:9000/v1/audio/transcriptions
+export const sttConfig = {
+  get enabled() {
+    return Boolean((process.env.STT_BASE_URL ?? '').trim())
+  },
+  get baseUrl() {
+    return (process.env.STT_BASE_URL ?? '').trim()
+  },
+  get apiKey() {
+    return (process.env.STT_API_KEY ?? '').trim()
+  },
+  get model() {
+    return (process.env.STT_MODEL ?? 'whisper-1').trim()
+  },
+}
+
 export const hydeConfig = {
   // 总开关：关闭后低分查询也只走首轮检索
   get hydeEnabled() {

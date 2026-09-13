@@ -1,4 +1,6 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto'
+import { authMode as principalAuthMode } from './principal.js'
+import { verifyAccessToken } from './auth/jwt.js'
 
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{1,128}$/
 
@@ -13,6 +15,11 @@ export function authMode() {
   // user-token 档：数据路由按用户令牌隔离（principal.js），管理路由仍要求 ADMIN_TOKEN
   if (configured === 'token' || configured === 'user-token') {
     return process.env.ADMIN_TOKEN ? 'token' : 'disabled'
+  }
+  // jwt 档（用户模块 v2）：不短路 disabled —— 管理权限由 adminAuth 内部判定
+  // （ADMIN_TOKEN 或 admin 角色的登录 JWT）
+  if (configured === 'jwt') {
+    return 'jwt'
   }
   return process.env.NODE_ENV === 'production' && process.env.ADMIN_TOKEN ? 'token' : 'disabled'
 }
@@ -51,12 +58,72 @@ export function adminAuth(req, res, next) {
   const expected = String(process.env.ADMIN_TOKEN || '')
   const header = req.get('authorization') || ''
   const supplied = header.toLowerCase().startsWith('bearer ') ? header.slice(7).trim() : req.get('x-admin-token')
-  if (!expected || !tokenEqual(String(supplied || ''), expected)) {
-    res.setHeader('WWW-Authenticate', 'Bearer')
-    return res.status(401).json({ message: '需要管理员认证' })
+  // ① 管理员令牌（ADMIN_TOKEN，现有路径零回归）
+  if (expected && supplied && tokenEqual(String(supplied), expected)) {
+    req.adminAuthenticated = true
+    return next()
   }
-  req.adminAuthenticated = true
-  next()
+  // ② jwt 模式：任意有效登录 JWT 放行（member 也过）——细粒度权限由挂载点的
+  //    requirePerm(perm) 按角色权限集判定；admin 角色恒全权。
+  if (principalAuthMode() === 'jwt') {
+    const payload = verifyAccessToken(String(supplied || ''))
+    if (payload?.sub) {
+      req.adminAuthenticated = true
+      req.adminUserId = payload.sub
+      req.adminRole = payload.role ?? 'member'
+      return next()
+    }
+  }
+  res.setHeader('WWW-Authenticate', 'Bearer')
+  return res.status(401).json({ message: '需要管理员认证' })
+}
+
+/* ---------- RBAC 权限判定（用户模块 v2.3） ---------- */
+
+let _permsOfPromise = null
+/** 惰性加载 accounts.permsOf（避免 security ← accounts 的同步加载时序耦合） */
+function permsOfAsync(roleId) {
+  if (!_permsOfPromise) {
+    _permsOfPromise = import('./auth/accounts.js').then((m) => m.permsOf)
+  }
+  return _permsOfPromise.then((fn) => fn(roleId))
+}
+
+/**
+ * 管理端点权限守卫：needed 满足其一即可（admin / '*' 全权）。
+ * disabled 模式（单用户）全放行；member 等角色按 role_perms 实时查库。
+ */
+export function requirePerm(...needed) {
+  return async (req, res, next) => {
+    if (authMode() === 'disabled') return next()
+    const header = req.get('authorization') || ''
+    const supplied = header.toLowerCase().startsWith('bearer ') ? header.slice(7).trim() : req.get('x-user-token')
+    let role = null
+    if (principalAuthMode() === 'jwt') {
+      const payload = verifyAccessToken(String(supplied || ''))
+      if (!payload?.sub) {
+        res.setHeader('WWW-Authenticate', 'Bearer')
+        return res.status(401).json({ message: '需要登录' })
+      }
+      role = payload.role ?? 'member'
+      if (role === 'admin') {
+        req.adminRole = role
+        return next()
+      }
+    } else {
+      return res.status(401).json({ message: '需要登录' })
+    }
+    try {
+      const holds = await permsOfAsync(role)
+      const ok = holds.includes('*') || needed.some((n) => holds.includes(n))
+      if (!ok) {
+        return res.status(403).json({ error: `权限不足（需要 ${needed.join(' 或 ')}）` })
+      }
+      return next()
+    } catch (err) {
+      return res.status(503).json({ error: err.message })
+    }
+  }
 }
 
 export function createRateLimiter({ windowMs, max, envPrefix, keyGenerator } = {}) {
@@ -99,6 +166,8 @@ export const rateLimiters = {
   upload: createRateLimiter({ envPrefix: 'RATE_UPLOAD', max: 20 }),
   search: createRateLimiter({ envPrefix: 'RATE_SEARCH', max: 60 }),
   management: createRateLimiter({ envPrefix: 'RATE_MANAGEMENT', max: 120 }),
+  // 认证端点独立限流：按 IP 计数，防密码暴力破解与用户枚举
+  auth: createRateLimiter({ envPrefix: 'RATE_AUTH', max: 20 }),
 }
 
 function bad(res, message) {

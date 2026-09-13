@@ -93,7 +93,7 @@ function ensureNotCancelled(job) {
  * LLM 不可用直接抛 ServiceUnavailableError（manager 转 503）。
  * @returns {{ jobId: string, alreadyRunning: boolean }}
  */
-export function startWikiJob() {
+export function startWikiJob(ownerId = 'local') {
   for (const j of jobs.values()) {
     if (j.status === 'running') return { jobId: j.id, alreadyRunning: true }
   }
@@ -104,6 +104,7 @@ export function startWikiJob() {
     )
   }
   const job = newJob()
+  job.ownerId = ownerId
   jobs.set(job.id, job)
   scheduleJobGc(job)
   log.info(`[wikiBuilder] 任务 ${job.id} 启动`)
@@ -151,9 +152,9 @@ export function cancelWikiJob(jobId) {
 async function stageExtract(job) {
   const chunks = await listAllChunks()
   // 对账：清掉已消失切片的抽取记录（文档删除后）
-  wikiStore.reconcileChunkExtractions(new Set(chunks.map((c) => c.id)))
+  wikiStore.reconcileChunkExtractions(new Set(chunks.map((c) => c.id)), job.ownerId)
   const pending = chunks.filter((c) => {
-    const rec = wikiStore.getExtraction(c.id)
+    const rec = wikiStore.getExtraction(c.id, job.ownerId)
     return !rec || rec.hash !== wikiStore.hashText(c.text)
   })
   job.stage = 'extracting'
@@ -181,7 +182,7 @@ async function stageExtract(job) {
         wikiStore.putExtraction(c.id, {
           hash: wikiStore.hashText(c.text),
           entities: entitiesByIdx.get(s + i) ?? [],
-        })
+        }, job.ownerId)
       }
     } catch (err) {
       // 单批失败不落哈希 → 下次生成续跑重试；任务回执显式计数
@@ -204,7 +205,7 @@ async function stageNormalize(job) {
   /** @type {Map<string, Array<{chunkId:string, context:string, type:string}>>} */
   const mentions = new Map()
   for (const c of chunks) {
-    const rec = wikiStore.getExtraction(c.id)
+    const rec = wikiStore.getExtraction(c.id, job.ownerId)
     if (!rec?.entities) continue
     for (const e of rec.entities) {
       if (!chunkOrder.has(c.id)) continue // 防御：抽取记录晚于切片删除
@@ -272,14 +273,14 @@ async function stageNormalize(job) {
   // 按提及数降序截断至上限
   entries.sort((a, b) => b.mentionChunkIds.length - a.mentionChunkIds.length)
   const kept = entries.slice(0, wikiConfig.maxEntries)
-  wikiStore.putEntries(kept)
+  wikiStore.putEntries(kept, job.ownerId)
   return { entries: kept.length, dropped: entries.length - kept.length }
 }
 
 /** 阶段 3：词条摘要（无摘要词条逐条生成，逐条落盘续跑） */
 async function stageSummarize(job) {
   const entries = wikiStore
-    .listEntries()
+    .listEntries(job.ownerId)
     .filter((e) => !e.summary)
   job.stage = 'summarizing'
   job.progress = { processed: 0, total: entries.length, failed: 0 }
@@ -297,7 +298,7 @@ async function stageSummarize(job) {
       wikiStore.updateEntry(e.id, {
         summary,
         generatedAt: new Date().toISOString(),
-      })
+      }, job.ownerId)
     } catch (err) {
       failedSummaries++
       log.warn(`[wikiBuilder] 任务 ${job.id} 词条「${e.name}」摘要失败（${err.message}），下次生成续跑重试`)
@@ -317,7 +318,7 @@ async function runWikiJob(job) {
     job.status = 'done'
     job.finishedAt = new Date().toISOString()
     job.result = {
-      ...wikiStore.stats(),
+      ...wikiStore.stats(job.ownerId),
       ...extractStats,
       ...normalizeStats,
       ...summarizeStats,
@@ -330,7 +331,7 @@ async function runWikiJob(job) {
     if (err === CANCELLED) {
       job.status = 'cancelled'
       job.finishedAt = new Date().toISOString()
-      job.result = { ...wikiStore.stats(), stage: job.stage }
+      job.result = { ...wikiStore.stats(job.ownerId), stage: job.stage }
       log.info(`[wikiBuilder] 任务 ${job.id} 已取消（阶段 ${job.stage}，已写入数据保留）`)
       return
     }
@@ -344,14 +345,66 @@ async function runWikiJob(job) {
 /* ===================== 图数据叠加（manager graph 端点用） ===================== */
 
 /**
+ * 图节点 ID 解析（v3 重构期间提及边落到实际存在的切片）。
+ *
+ * v2 的 chunk id 形如 chk_{docId}_{idx}_{rand}，v3 锚点层形如 chk_{docId}_{idx}。
+ * wiki 存量抽取记录保留的是当时生成词条所用的 ID，叠加到图时需匹配当前图节点。
+ * 优先原样命中 → 其次 v2↔v3 形态互转（同文档同序号），
+ * 避免提及边整批丢失（v3 数据迁移期实测 559 条边 ID 全不命中）。
+ * @param {string} cid wiki 记录里的切片 ID
+ * @param {{ idSet:Set<string>, posToId:Map<string,string> }} resolver 解析索引
+ * @returns {string|null} 图上实际存在的节点 id
+ */
+export function resolveGraphChunkId(cid, resolver) {
+  if (!resolver || typeof cid !== 'string' || !cid) return null
+  if (resolver.idSet.has(cid)) return cid
+  const m = /^chk_(.+)_(\d+)(?:_[A-Za-z0-9]+)?$/.exec(cid)
+  if (m) {
+    // v2 ↔ v3 形态互转：chk_{docId}_{idx}_{rand} ↔ chk_{docId}_{idx}
+    const mapped = resolver.posToId.get(`${m[1]}|${m[2]}`)
+    if (mapped) return mapped
+  }
+  return null
+}
+
+/** 为当前图节点构建 ID 解析索引（供 resolveGraphChunkId 使用） */
+export function buildGraphIdResolver(nodes) {
+  const idSet = new Set(nodes.map((n) => n.id))
+  const posToId = new Map()
+  for (const n of nodes) {
+    if (n.type !== 'chunk' || !n.docId) continue
+    posToId.set(`${n.docId}|${n.idx ?? 0}`, n.id)
+  }
+  return { idSet, posToId }
+}
+
+/**
  * 构造 wiki 词条图节点与提及边（叠加在切片相似网络之上）。
  * 提及边 similarity=1（结构边不受阈值滑杆裁剪，2D/3D 按强边渲染），
  * kind='mention' 供 tooltip 显示「词条提及」。
  * @param {Set<string>} existingNodeIds 切片图已有节点 id（提及边只连存在的切片）
+ * @param {string} [ownerId] 数据归属（'*' = 聚合全部 owner）
+ * @param {{resolver?: ReturnType<typeof buildGraphIdResolver>}} [opts]
+ *        v3 迁移期传入 resolver 以兼容历史抽取记录的不同 ID 形态
  */
-export function buildWikiGraphPart(existingNodeIds) {
-  const entries = wikiStore.listEntries()
-  const nodes = entries.map((e) => ({
+export function buildWikiGraphPart(existingNodeIds, ownerId = '*', opts = {}) {
+  const entries = wikiStore.listEntries(ownerId)
+  const resolver = opts.resolver ?? null
+  // 词条 → 实际挂到的图节点 id 集合（去重，一条边不重复连同一节点）
+  const targetsOf = (e) => {
+    const seen = new Set()
+    for (const cid of e.mentionChunkIds ?? []) {
+      const hit = resolver
+        ? resolveGraphChunkId(cid, resolver)
+        : existingNodeIds.has(cid)
+          ? cid
+          : null
+      if (hit) seen.add(hit)
+    }
+    return [...seen]
+  }
+  const resolved = entries.map((e) => ({ e, targets: targetsOf(e) }))
+  const nodes = resolved.map(({ e, targets }) => ({
     id: `wiki:${e.id}`,
     type: 'wiki',
     name: e.name,
@@ -363,20 +416,13 @@ export function buildWikiGraphPart(existingNodeIds) {
     topic: 'Wiki 词条',
     docId: '',
     docTitle: '',
-    degree: (e.mentionChunkIds ?? []).length,
+    degree: targets.length,
     raw: e,
   }))
   const edges = []
-  for (const e of entries) {
-    for (const cid of e.mentionChunkIds ?? []) {
-      if (existingNodeIds.has(cid)) {
-        edges.push({
-          source: `wiki:${e.id}`,
-          target: cid,
-          similarity: 1,
-          kind: 'mention',
-        })
-      }
+  for (const { e, targets } of resolved) {
+    for (const t of targets) {
+      edges.push({ source: `wiki:${e.id}`, target: t, similarity: 1, kind: 'mention' })
     }
   }
   return { nodes, edges }

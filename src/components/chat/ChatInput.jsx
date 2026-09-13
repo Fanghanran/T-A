@@ -6,11 +6,13 @@ import {
   Paperclip,
   X,
   Loader2,
+  Mic,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { TechStackSelector } from '@/components/agents/TechStackSelector'
 import { request } from '@/lib/api'
+import { useSpeechInput } from '@/hooks/useSpeechInput'
 import { cn } from '@/lib/utils'
 
 /**
@@ -53,8 +55,7 @@ export function ChatInput({
   handleSubmit,
   isLoading,
   onStop,
-  error,
-  isDocProcessor,
+  error,  isDocProcessor,
   activeDocId,
   setInput,
   onDocUploaded,
@@ -91,6 +92,15 @@ export function ChatInput({
   // 文件上传状态（仅 doc-processor 用）：支持多文件并发上传，逐个显示状态
   const [pendingFiles, setPendingFiles] = React.useState([]) // [{ key, name, size, docId?, title?, status: 'uploading'|'done'|'error', error? }]
   const [dragOver, setDragOver] = React.useState(false)
+
+  // 语音输入：录音 → 后端转写 → 文本回填输入框（服务未配置时按钮不显示）
+  const speech = useSpeechInput({
+    onResult: (text) => {
+      // AI SDK 的 setInput 不支持 updater 函数式，直接覆盖（语音输入通常在空输入时使用）
+      setInput?.(text)
+    },
+  })
+  const speechBtnVisible = speech.enabled === true && !isLoading
   const uploadingCount = pendingFiles.filter(
     (f) => f.status === 'uploading',
   ).length
@@ -207,6 +217,12 @@ export function ChatInput({
     <div className="shrink-0 border-t bg-background/80 backdrop-blur">
       <div className="mx-auto w-full max-w-3xl px-4 py-3 md:px-6">
         {/* 内联错误提示 */}
+        {speech.error && (
+          <div className="mb-2 flex items-center gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive animate-fade-in">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            <span className="flex-1">{speech.error}</span>
+          </div>
+        )}
         {error && (
           <div className="mb-2 flex items-center gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive animate-fade-in">
             <AlertCircle className="h-4 w-4 shrink-0" />
@@ -314,6 +330,7 @@ export function ChatInput({
             className={cn(
               'w-full resize-none rounded-2xl border border-input bg-background px-4 py-3 pr-12 text-sm',
               canUpload && 'pl-12',
+              speechBtnVisible && 'pr-20',
               'max-h-[200px] scrollbar-thin',
               'placeholder:text-muted-foreground',
               'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
@@ -350,7 +367,38 @@ export function ChatInput({
               </div>
             </>
           )}
-          <div className="absolute bottom-2 right-2">
+          <div className="absolute bottom-2 right-2 flex items-center gap-1">
+            {speechBtnVisible && (
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                onClick={speech.toggle}
+                disabled={speech.status === 'transcribing'}
+                aria-label={speech.status === 'recording' ? '停止录音并转写' : '语音输入'}
+                title={
+                  speech.status === 'recording'
+                    ? '停止录音并转写'
+                    : speech.status === 'transcribing'
+                      ? '转写中…'
+                      : '语音输入（点击开始录音）'
+                }
+                className={cn(
+                  'h-8 w-8 rounded-full',
+                  speech.status === 'recording'
+                    ? 'text-red-500 hover:text-red-500'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {speech.status === 'transcribing' ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : speech.status === 'recording' ? (
+                  <span className="h-3 w-3 animate-pulse rounded-full bg-red-500" />
+                ) : (
+                  <Mic className="h-4 w-4" />
+                )}
+              </Button>
+            )}
             {isLoading ? (
               <Button
                 type="button"

@@ -40,6 +40,31 @@ const HYDE_WEIGHT = Number(process.env.HYDE_WEIGHT ?? 0.8)
  *   用「平均后小幅加成」而非累加，保证：① 双路命中一定不低于任一路单命中；
  *   ② 分数不会顶到 1.0 饱和（累加会让多条结果同分，排序失效）。
  */
+/** 反问/否定降权系数：命中排除词的块按此系数打折（<1；1 = 关闭） */
+export const EXCLUDE_PENALTY = 0.7
+
+/**
+ * 排除词降权（纯函数，供排序管线与单测复用）。
+ * 意图感知改写判定为 negation 时，改写层把「被排除对象」输出为 excludeTerms；
+ * 向量对否定不敏感（"不用 Redux"会大量召回 Redux 内容），且 2-gram 加权会因
+ * query 含该词反向加分——故本步必须在 2-gram 加权之后执行才能纠正排序。
+ * @param {Array<{item:object, score:number}>} arr 合并后的候选（{item, score} 形态）
+ * @param {string[]} excludeTerms 改写层输出的排除词
+ * @returns {Array<{item:object, score:number}>} 新数组；命中项 score×EXCLUDE_PENALTY 并带 excludedBy 标记
+ */
+export function applyExcludePenalty(arr, excludeTerms) {
+  const terms = (excludeTerms ?? []).filter((t) => typeof t === 'string' && t.trim())
+  if (!terms.length || !Array.isArray(arr)) return arr
+  return arr.map(({ item, score }) => {
+    const hay = `${item.title ?? ''}
+${item.text ?? item.snippet ?? ''}`
+    const hitTerm = terms.find((t) => hay.includes(t))
+    return hitTerm
+      ? { item: { ...item, excludedBy: hitTerm }, score: score * EXCLUDE_PENALTY }
+      : { item, score }
+  })
+}
+
 async function _searchOneQueryKB(query, { overK, topK, ownerId }) {
   if (typeof query !== 'string' || !query.trim()) return []
   const [qv] = await embedTexts([query])
@@ -117,6 +142,7 @@ export async function unifiedSearch(opts = {}) {
     ? Promise.resolve().then(async () => {
         const t0 = performance.now()
         const items = questionBank.search(q, {
+          ownerId, // per-owner 隔离；'*' = admin 聚合；空 → 题库通道 fail-closed 返回空
           techStack: Array.isArray(opts.techStack) ? opts.techStack : [],
           category: opts.category || undefined,
           difficulty: opts.difficulty || undefined,
@@ -173,8 +199,13 @@ export async function unifiedSearch(opts = {}) {
         )
         const searchMs = Math.round(performance.now() - seStart)
 
-        // 3) 合并：按 chunk.id 做 Map，score = Σ(item.score * weight[qi])；保留 item 最高分对应的 payload
-        const merged = new Map() // id -> { item, score }
+        // 3) 合并：score = 单路最高加权分为主 + 多路命中小幅加成。
+        //  历史（2026-09-13 回归实锤）：旧实现 score = Σ(weight×score) 纯累加，
+        //  语料扩到 304 片后无关块在多个改写 query 里重复低分命中、累加爬顶，
+        //  hit@3 从 100% 崩到 18%（评测基线：scripts/eval-retrieval.mjs）。
+        //  改为 max 为主 + MERGE_HIT_BONUS×(命中路数-1)：改写 query 扩召回、
+        //  但单路强命中不被多路低分累加淹没（与 4.4 ES 双通道 max+bonus 同语义）。
+        const merged = new Map() // id -> { item, best, hits }
         for (let qi = 0; qi < perQueryItemsArr.length; qi++) {
           const weight = Number(weights[qi % weights.length]) || 0
           const list = perQueryItemsArr[qi] || []
@@ -183,18 +214,22 @@ export async function unifiedSearch(opts = {}) {
             const added = (Number(it.score) || 0) * weight
             const exist = merged.get(it.id)
             if (!exist) {
-              merged.set(it.id, { item: it, score: added })
+              merged.set(it.id, { item: it, best: added, hits: 1 })
               continue
             }
-            exist.score += added
-            // 保留更全面的 item 字段（其实每个 query 检索返回的 item 字段口径一致，无所谓）
+            exist.hits++
+            exist.best = Math.max(exist.best, added)
           }
         }
+        const MERGE_HIT_BONUS = 0.08
+        let arr = [...merged.values()].map(({ item, best, hits }) => ({
+          item,
+          score: best + MERGE_HIT_BONUS * (hits - 1),
+        }))
 
         // 4) 最后统一做 category/tag 过滤（保证合并分数完整）+ 按 score 降序取 topK
         const category = typeof opts.category === 'string' && opts.category.trim() ? opts.category.trim() : ''
         const tag = typeof opts.tag === 'string' && opts.tag.trim() ? opts.tag.trim() : ''
-        let arr = [...merged.values()]
         if (category || tag) {
           arr = arr.filter(({ item }) => {
             if (category && item.category !== category) return false
@@ -280,6 +315,22 @@ export async function unifiedSearch(opts = {}) {
         })
           : arr
         boosted.sort((a, b) => b.score - a.score)
+
+        // 4.52) 反问/否定降权（意图感知改写配套，2026-09-13）：
+        //  改写层判定 negation 时输出 excludeTerms（被排除对象）；命中降权 ×0.7。
+        //  必须在 4.5 的 2-gram 加权之后：query 含被排除词时 2-gram 会反向给干扰块加分，
+        //  先加分后降权才能纠正排序；也须在 4.55 HyDE 的 topScore 判定之前，避免干扰块触发无谓的 HyDE。
+        const excludeTerms = Array.isArray(rewriteRes?.excludeTerms)
+          ? rewriteRes.excludeTerms
+          : []
+        arr = applyExcludePenalty(boosted, excludeTerms)
+        if (excludeTerms.length) {
+          const nExcluded = boosted.length - arr.filter(({ item }) => !item.excludedBy).length
+          if (nExcluded > 0) {
+            arr.sort((a, b) => b.score - a.score)
+            log.info(`[unifiedSearch] 否定降权生效 exclude=[${excludeTerms.join(',')}] 罚分 ${nExcluded} 条`)
+          }
+        }
 
         // 4.55) HyDE 级联触发（2026-09-06）：首轮（含 2-gram 加权）top1 分数低于阈值 →
         //  LLM 生成假设答案 → 答案向量查 text 路（假设答案与库内正文同为陈述句语体，
@@ -387,6 +438,11 @@ export async function unifiedSearch(opts = {}) {
           items: finalItems,
           rewritten: Boolean(rewriteRes.rewritten),
           queries, // 调试信息（传给前端面板可展示 —— 但当前前端没消费，未来可加 chip 展示"实际检索的 queries"）
+          // 意图感知改写的判定与排除词（前端思考链路卡片展示用）
+          queryType: rewriteRes.queryType ?? 'plain',
+          excludeTerms: rewriteRes.excludeTerms ?? [],
+          // 候选池规模（配额/去重前），供思考链路展示检索广度
+          candidates: arr.length,
           // HyDE 级联调试信息：null = 未触发（top1 达标或开关关闭）；触发时含 added/ms/reason
           hyde: hydeInfo,
           // ES 关键词通道调试信息：null = 未启用或无原始 q；degraded = ES 不可用（带标注降级）
@@ -429,6 +485,82 @@ export async function unifiedSearch(opts = {}) {
     questionResults,
     knowledgeResults,
   }
+}
+
+/**
+ * 构造检索思考链路注解（agent_workflow 引擎族，前端工作流卡片直接渲染）。
+ * 从 unifiedSearch 的 knowledgeResults 抽取内部决策过程：意图改写 → 多路检索 →
+ * 关键词融合 → HyDE 级联 → 混合排序。数据缺失的步骤自动跳过。
+ * @param {object|null} kr unifiedSearch().knowledgeResults
+ * @param {{engine?: string}} [opts] engine 标识（knowledge-rag / interview-rag）
+ * @returns {Array<object>} agent_workflow 注解数组（可能为空）
+ */
+export function buildReasoningTrace(kr, { engine = 'knowledge-rag' } = {}) {
+  if (!kr) return []
+  const ms = (v) => (Number.isFinite(v) ? Math.round(v) : 0)
+  const trace = []
+  let seq = 1
+  const step = (tool, label, thought, observation, time) => {
+    trace.push({
+      type: 'agent_workflow',
+      engine,
+      seq: seq++,
+      tool,
+      label,
+      args: {},
+      thought,
+      observation,
+      ms: ms(time),
+    })
+  }
+
+  const r = kr.reasoning ?? {}
+  step(
+    'query_rewrite',
+    'Query 意图感知改写',
+    r.queryType === 'negation'
+      ? '判定为反问/否定型：转肯定式检索并输出排除词'
+      : r.queryType && r.queryType !== 'plain'
+        ? `判定为 ${r.queryType} 型，按类型策略改写`
+        : '常规查询：生成互补检索角度',
+    kr.rewritten
+      ? `产出 ${kr.queries?.length ?? 0} 条互补查询：${(kr.queries ?? []).join(' / ')}${r.excludeTerms?.length ? `；排除词：${r.excludeTerms.join('、')}` : ''}`
+      : '未触发改写（使用原始 query）',
+    r.rewriteMs,
+  )
+  step(
+    'multi_search',
+    '双向量多路检索',
+    '改写出的每条 query 并行检索正文向量与锚点问题向量',
+    `候选池 ${kr.candidates ?? kr.total ?? 0} 条`,
+    kr.searchMs,
+  )
+  if (kr.es) {
+    step(
+      'keyword_fusion',
+      'ES 关键词融合',
+      'BM25 倒排独立召回，补语义检索对精确术语的盲区',
+      `命中 ${kr.es.hits ?? 0} 条${kr.es.added ? `，新增 ${kr.es.added} 条进候选池` : ''}${kr.es.degraded ? '（ES 不可用，已标注降级）' : ''}`,
+      kr.es.ms,
+    )
+  }
+  if (kr.hyde) {
+    step(
+      'hyde_cascade',
+      'HyDE 级联',
+      kr.hyde.triggered ? `首轮 top1 分数偏低（${kr.hyde.reason}），生成假设答案二次检索` : '未触发增强轮',
+      kr.hyde.triggered ? `新增 ${kr.hyde.added} 条候选` : '保留首轮结果',
+      kr.hyde.ms,
+    )
+  }
+  step(
+    'rank_merge',
+    '混合排序',
+    '多 query 最高分融合 → 2-gram 字面加权 → 否定降权 → 近重复折叠 → 单文档配额',
+    `最终 top ${kr.total ?? kr.items?.length ?? 0} 条`,
+    kr.totalMs - (r.rewriteMs ?? 0),
+  )
+  return trace
 }
 
 export default unifiedSearch

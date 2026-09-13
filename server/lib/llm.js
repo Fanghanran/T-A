@@ -137,10 +137,10 @@ function withMemory(system, memoryBlock) {
  * 与 streamInterviewAnswer 对称：先把"检索命中的 chunk 列表 + 耗时"作为 annotation 推到流头部，
  * 前端就能像截图那样画出「👁 显示运行过程」+ Recall slice N 卡片（含文件名 / Heading / Score 徽章 / 片段预览）。
  *
- * @param {{query:string, chunks:Array, searchMs?:number, history?:Array<{role:string,content:string}>, agentId?:string, memoryBlock?:string}} param0
+ * @param {{query:string, chunks:Array, searchMs?:number, history?:Array<{role:string,content:string}>, agentId?:string, memoryBlock?:string, persona?:string}} param0
  * @returns {ReadableStream<Uint8Array>} AI SDK data-stream
  */
-export async function streamRagAnswer({ query, chunks, searchMs = 0, history, agentId, memoryBlock, signal }) {
+export async function streamRagAnswer({ query, chunks, searchMs = 0, history, agentId, memoryBlock, persona, signal }) {
   requireLLM()
   // 给前端 FallbackSlice 卡片准备字段：title(文件名badge) / heading(来源/大纲badge) / score(分数) / snippet(正文预览)
   const resultsForFrontend = chunks.map((c, idx) => ({
@@ -173,6 +173,8 @@ export async function streamRagAnswer({ query, chunks, searchMs = 0, history, ag
     model: getChatModel({ role: 'chat.rag', agentId }),
     abortSignal: signal,
     system: withMemory(
+      // persona：自定义智能体的人设追加（P1 generic rag）；空串时零回归
+      (persona ? `${persona.trim()}\n\n` : '') +
       `你是面试知识助手。严格基于提供的知识库片段回答用户问题；若片段不足以回答，请如实说明，不要编造。\n\n` +
       `显示规则（UI 层已单独处理，请严格遵守以免重复）：\n` +
       `- 如果检索到知识库内容，请在回答开头加上【📚 已检索知识库】标记。\n` +
@@ -188,16 +190,20 @@ export async function streamRagAnswer({ query, chunks, searchMs = 0, history, ag
 
 /**
  * 通用对话流式回答（用于 /api/chat，非知识库智能体）
- * @param {{query:string, techStack?:string[], history?:Array<{role:string,content:string}>, agentId?:string, memoryBlock?:string}} param0
+ * @param {{query:string, techStack?:string[], history?:Array<{role:string,content:string}>, agentId?:string, memoryBlock?:string, systemPrompt?:string}} param0
+ *   systemPrompt：自定义智能体（Agent Spec）的完整人设；缺省时使用内置「资深面试官」默认（零回归）
  */
-export async function streamChat({ query, techStack, history, agentId, memoryBlock, signal }) {
+export async function streamChat({ query, techStack, history, agentId, memoryBlock, systemPrompt, signal }) {
   requireLLM()
   const historyCtx = buildHistoryContext(history, query)
-  const system = withMemory(
-    (techStack?.length
+  const base = systemPrompt?.trim()
+    ? systemPrompt.trim() +
+      (techStack?.length ? `\n用户关注的技术栈：${techStack.join('、')}。` : '')
+    : (techStack?.length
       ? `你是一位资深面试官。结合以下技术栈作答：${techStack.join('、')}。`
       : '你是一位资深面试官，回答清晰专业。')
-    + (historyCtx ? ' 如果提供了「历史对话上下文」段落，请结合前文语境延续对话，不要当作孤立单轮。' : ''),
+  const system = withMemory(
+    base + (historyCtx ? ' 如果提供了「历史对话上下文」段落，请结合前文语境延续对话，不要当作孤立单轮。' : ''),
     memoryBlock,
   )
   const result = await countedStreamText({

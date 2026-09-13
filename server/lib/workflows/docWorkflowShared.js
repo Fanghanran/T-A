@@ -34,11 +34,12 @@ export function toolLabel(name) {
  * 构造 agent_workflow 注解（每执行一步发一条 delta，前端拉平成时间线）。
  * 与 search_results（切片卡片）平级，由前端 AgentWorkflowPanel 渲染，
  * 让用户在会话中看到智能体调用了哪些工具、参数与观察结果。
+ * engine 默认 doc-agent（文档双工作流）；ReAct 规划器传 react-agent。
  */
-export function workflowStepAnnotation({ seq, tool, args, thought, observation, ms }) {
+export function workflowStepAnnotation({ seq, tool, args, thought, observation, ms, engine = 'doc-agent' }) {
   return {
     type: 'agent_workflow',
-    engine: 'doc-agent',
+    engine,
     seq,
     tool,
     label: toolLabel(tool),

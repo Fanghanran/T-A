@@ -90,6 +90,10 @@ export function useChatWithAnnotations(options) {
       }
       if (!resp.body || resp.status >= 400) {
         release()
+        // 401 走全局认证分流（api.request 同款事件）：jwt 模式由 useAuth 跳登录页
+        if (resp.status === 401) {
+          window.dispatchEvent(new CustomEvent('auth:required', { detail: { message: '登录已过期，请重新登录' } }))
+        }
         return resp
       }
 

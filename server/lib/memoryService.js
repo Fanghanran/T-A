@@ -232,3 +232,39 @@ async function extractFacts({ sessionId, agentName, msgs, ownerId, state }) {
     extractUntilSeq: lastSeq,
   })
 }
+
+/**
+ * 显式写入一条长期事实（scope=global）—— 供 ReAct 规划器的 memory.write 工具调用。
+ * 与自动提炼（extractFacts）同一口径：content_hash 去重 → 向量化 → 入库 → flush 才算「已记住」。
+ * embedding 不可用时 Fail-Fast 抛错（工具层会把错误作为 Observation 回传，由 Thought 层感知）。
+ * @param {{ text: string, ownerId: string, agentName?: string, sessionId?: string }} p
+ * @returns {Promise<{ written: boolean, reason?: string, id?: string }>} written=false 表示与已有事实重复
+ */
+export async function writeGlobalFact({ text, ownerId, agentName, sessionId }) {
+  const t = String(text ?? '').trim()
+  if (!t) return { written: false, reason: 'empty' }
+  if (!ownerId) throw new Error('writeGlobalFact 缺少 ownerId')
+  if (embedMode() !== 'external') throw new Error('embedding 不可用，无法写入长期记忆')
+
+  const contentHash = factHash('global', t)
+  const existing = await milvusStore.listMemories({ filter: `content_hash == "${contentHash}"`, limit: 1 })
+  if (existing?.length) return { written: false, reason: 'duplicate' }
+
+  const [vec] = await embedTexts([t])
+  const row = {
+    id: `mem_${randomUUID()}`,
+    scope: 'global',
+    sessionId: '',
+    agentName: agentName ?? '',
+    ownerId,
+    kind: 'fact',
+    text: t,
+    contentHash,
+    ts: Date.now(),
+    vector: vec,
+  }
+  await milvusStore.insertMemories([row])
+  await milvusStore.flush([milvusStore.getCollections().memory])
+  log.info(`[memory] 显式写入长期事实（owner=${ownerId}）：${t.slice(0, 60)}${t.length > 60 ? '…' : ''}`)
+  return { written: true, id: row.id }
+}

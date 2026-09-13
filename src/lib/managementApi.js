@@ -312,3 +312,112 @@ export function fetchWikiStatus() {
 export function clearWiki() {
   return del('/api/management/wiki')
 }
+
+/* ---------- v3 集合浏览（按集合出明细，字段 = 集合 schema） ---------- */
+
+export function fetchVectorCollections() {
+  return request('/api/management/vector/collections')
+}
+
+export function fetchCollectionRows(name, { limit = 200, offset = 0 } = {}) {
+  const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+  return request(
+    '/api/management/vector/collections/' + encodeURIComponent(name) + '/rows?' + qs.toString(),
+  )
+}
+
+/* ---------- 数据库目录（记忆库 / 会话库只读浏览，与向量库同模式） ---------- */
+
+/** 表清单：store = 'memory' | 'session'；items 含 name/kind/desc/rowCount/columns */
+export function fetchDbTables(store) {
+  return request('/api/management/db/' + encodeURIComponent(store) + '/tables')
+}
+
+/** 表行分页明细：响应含 columns（列名数组）、total、rows；向量字段为 {dim,norm,preview} 预览对象 */
+export function fetchDbRows(store, name, { limit = 200, offset = 0 } = {}) {
+  const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+  return request(
+    '/api/management/db/' + encodeURIComponent(store) + '/tables/' + encodeURIComponent(name) + '/rows?' + qs.toString(),
+  )
+}
+
+/* ---------- 权限管理（用户账号：角色 / 禁用 / 解锁 / 重置密码，Admin 专属） ---------- */
+
+/** 用户账号清单（含角色/状态/最近登录；不含密码列）；admins = 当前 active 管理员数 */
+export function fetchAuthUsers() {
+  return request('/api/management/auth/users')
+}
+
+/** 设置角色：role = 'admin' | 'member'（不能改自己 / 不能降最后一个 admin） */
+export function setAuthUserRole(userId, role) {
+  return patchJson('/api/management/auth/users/' + encodeURIComponent(userId) + '/role', { role })
+}
+
+/** 禁用/启用：status = 'active' | 'disabled'（不能禁自己 / 不能禁最后一个 admin） */
+export function setAuthUserStatus(userId, status) {
+  return patchJson('/api/management/auth/users/' + encodeURIComponent(userId) + '/status', { status })
+}
+
+/** 解锁（清失败计数与锁定） */
+export function unlockAuthUser(userId) {
+  return postJson('/api/management/auth/users/' + encodeURIComponent(userId) + '/unlock')
+}
+
+/** 管理员重置密码（不验旧密码；目标用户需重新登录） */
+export function resetAuthUserPassword(userId, password) {
+  return postJson('/api/management/auth/users/' + encodeURIComponent(userId) + '/reset-password', { password })
+}
+
+/** 创建成员（管理员代建，指定角色） */
+export function createAuthUser({ userId, password, label, role }) {
+  return postJson('/api/management/auth/users', { userId, password, label, role })
+}
+
+/** 删除成员（不能删自己 / 最后一个管理员） */
+export function deleteAuthUser(userId) {
+  return request('/api/management/auth/users/' + encodeURIComponent(userId), { method: 'DELETE' })
+}
+
+/* ---------- 角色管理（RBAC 权限矩阵） ---------- */
+
+/** 角色清单（含权限集与成员引用数）+ 可勾选权限点目录 */
+export function fetchAuthRoles() {
+  return request('/api/management/auth/roles')
+}
+
+/** 新建自定义角色 */
+export function createAuthRole({ roleId, name, description, perms }) {
+  return postJson('/api/management/auth/roles', { roleId, name, description, perms })
+}
+
+/** 更新角色（member 可调权限集；自定义角色可改名/描述） */
+export function updateAuthRole(roleId, { name, description, perms } = {}) {
+  return patchJson('/api/management/auth/roles/' + encodeURIComponent(roleId), { name, description, perms })
+}
+
+/** 删除角色（内置不可删；被启用账号引用不可删） */
+export function deleteAuthRole(roleId) {
+  return request('/api/management/auth/roles/' + encodeURIComponent(roleId), { method: 'DELETE' })
+}
+
+/* ---------- 智能体管理（P1：Agent Spec CRUD，mgmt.agents 权限） ---------- */
+
+/** Spec 全字段清单 */
+export function fetchAgentSpecs() {
+  return request('/api/management/agents')
+}
+
+/** 新建自定义智能体 */
+export function createAgentSpec(payload) {
+  return postJson('/api/management/agents', payload)
+}
+
+/** 更新（内置仅展示层字段） */
+export function updateAgentSpec(id, patch) {
+  return patchJson('/api/management/agents/' + encodeURIComponent(id), patch)
+}
+
+/** 删除（内置 403；软删=停用） */
+export function deleteAgentSpec(id) {
+  return request('/api/management/agents/' + encodeURIComponent(id), { method: 'DELETE' })
+}

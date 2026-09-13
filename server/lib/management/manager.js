@@ -6,64 +6,79 @@ import {
   listAudit,
   isAuditEnabled,
   setAuditEnabled,
+  currentActor,
 } from './audit.js'
+import * as auditBrowse from './audit.js'
 import { listTunables, setTunable, resetTunables } from '../tunables.js'
 import { usageOf } from '../quota.js'
 import * as principal from '../principal.js'
 import { childLogger } from '../logger.js'
+import * as agentStore from '../agents/agentStore.js'
+import { requirePerm } from '../security.js'
 import * as esStore from '../esStore.js'
 import { listAllChunks } from '../milvusStore.js'
-import * as wikiStore from '../wikiStore.js'
+import * as anchors from '../anchorStore.js'
+import * as files from '../fileStore.js'
+import * as vindex from '../vectorIndexV3.js'
+import * as sessionStore from '../sessionStore.js'
+import * as accountsStore from '../auth/accounts.js'
 import {
-  startWikiJob,
-  getWikiJob,
-  cancelWikiJob,
-  getRunningWikiJob,
-  buildWikiGraphPart,
-} from '../wikiBuilder.js'
+  listAccounts,
+  setAccountStatus,
+  setAccountRole,
+  resetAccountPassword,
+  unlockAccount,
+  countAdmins,
+  createAccountByAdmin,
+  deleteAccount,
+  listRoles,
+  createRole,
+  updateRole,
+  deleteRole,
+  findRole,
+  findAccount,
+} from '../auth/accounts.js'
+import { PERM_CATALOG } from '../auth/perms.js'
 
 /**
  * manager —— 管理模块的 REST 服务（/api/management/*）
  *
- * 职责：工具与工作流的查询 / 启停管理、运行统计展示、调优参数在线修改、
- * 操作审计查询、恢复默认。数据来源：
- *  - registry.js 两个注册表（元数据 + 启停状态 + 进程内运行统计）
- *  - tunables.js（调优参数活对象，修改即热生效）
- *  - audit.js（append-only 审计日志）
- *
+ * 模块分层（L8）：依赖 L5 注册表（registry/audit）与 L1 存储层。
  * 端点：
  *  - GET   /api/management/overview        总览（工具+工作流+统计+依赖提示）
- *  - GET   /api/management/tools           工具列表（含启用状态/运行统计/dependents）
- *  - PATCH /api/management/tools/:name     { enabled: boolean } 启停工具
- *  - GET   /api/management/workflows       工作流列表（同上）
- *  - PATCH /api/management/workflows/:name { enabled: boolean } 启停工作流
- *  - POST  /api/management/reset           { scope: 'tools'|'workflows'|'all' } 恢复全部启用
- *  - GET   /api/management/audit           ?limit=50 最近管理操作（时间倒序）
- *  - PATCH /api/management/audit           { enabled: boolean } 审计功能总开关
- *  - GET   /api/management/tunables        调优参数全量（分组 + 当前值 + 默认值）
- *  - PATCH /api/management/tunables/:key   { value } 修改参数（校验范围，热生效）
- *  - POST  /api/management/tunables/reset  调优参数全部恢复默认
- *  - GET   /api/management/vector/overview            向量库总览（连接信息 + 集合结构/行数/索引）
- *  - GET   /api/management/vector/documents           向量库文档浏览列表（?q= 过滤，含每篇切片数）
- *  - GET   /api/management/vector/documents/:id/chunks 切片明细（含 text/question 双向量预览）
- *  - GET   /api/management/vector/graph               知识网络图（切片相似网络，?threshold=&topK=&includeWiki=）
- *  - POST  /api/management/wiki/generate              触发 Wiki 词条生成后台任务（202/409）
- *  - GET   /api/management/wiki/jobs/:id              生成任务进度（stage + progress + result）
- *  - POST  /api/management/wiki/jobs/:id/cancel       取消生成任务（进行中标记，已结束幂等）
- *  - GET   /api/management/wiki/status                Wiki 状态（当前任务 + 词条统计）
- *  - DELETE /api/management/wiki                      清空全部 Wiki 数据（进行中 409 拒绝）
- *  - GET   /api/management/es/status    ES 关键词索引状态（启用/条数/与 Milvus 偏差）
- *  - POST  /api/management/es/sync      全量回填（Milvus → ES，幂等，先清后建）
- *
- * 启停语义（谁消费）：
- *  - 工具禁用 → 工作流层 System Prompt 不再列出该工具（LLM 不可见），
- *    LLM 仍执意调用时被 resolveRunner 拦截并写回 observation 自纠
- *  - 工作流禁用 → index.js 的 doc-processor 分支回退 action 关键词路由（stub 同款）
+ *  - GET   /api/management/usage           各用户用量与配额（v3）
+ *  - GET   /api/management/vector/graph    知识网络图（切片相似网络）
+ *  - GET/PATCH /api/management/audit       操作审计与开关
+ *  - GET/POST/DELETE /api/management/users 用户令牌管理（M5a）
  */
 
-const log = childLogger('management')
-
 const router = Router()
+
+/* ---------- RBAC 权限段挂载（用户模块 v2.3）----------
+ * /api/management 全局已有 authRequired（index.js：disabled 全放行 / jwt 有效登录 / ADMIN_TOKEN），
+ * 此处按子路径再挂细粒度权限；admin 角色恒全权，其余角色按 role_perms 实时判定。
+ * overview / usage 等只读统计仅要求登录，不挂权限。 */
+router.use('/auth/users', requirePerm('mgmt.users'))
+router.use('/auth/roles', requirePerm('mgmt.roles'))
+router.use('/db', requirePerm('db'))
+// 向量结构探查（collections/documents/rows）属管理 DB 检查 → db 权限；
+// /vector/graph 是知识网络图，用户面功能（独立页 + 仪表盘卡片消费），登录即可 → 显式豁免
+router.use('/vector', (req, res, next) => {
+  if (req.path === '/graph') return next()
+  return requirePerm('db')(req, res, next)
+})
+router.use('/tunables', requirePerm('mgmt.params'))
+router.use('/es', requirePerm('mgmt.params'))
+router.use('/wiki', requirePerm('graph'))
+router.use('/memory', requirePerm('mgmt.params'))
+router.use('/storage', requirePerm('mgmt.params'))
+router.use('/audit', requirePerm('mgmt.audit'))
+router.use('/models', requirePerm('mgmt.models'))
+router.use('/tools', requirePerm('mgmt.tools'))
+router.use('/workflows', requirePerm('mgmt.workflows'))
+router.use('/agents', requirePerm('mgmt.agents'))
+router.use('/users', requirePerm('mgmt.params')) // 旧 M5a 用户令牌管理（参数管理页 UI）
+router.use('/reset', requirePerm('mgmt.workflows', 'mgmt.tools'))
 
 /** 序列化注册项：剥掉 run 函数（不可 JSON 化），保留元数据、启用状态与统计 */
 function serialize(item) {
@@ -173,6 +188,26 @@ router.get('/audit', (req, res) => {
   const n = Number(req.query?.limit)
   const limit = Number.isFinite(n) ? Math.max(1, Math.min(500, n)) : 50
   res.json({ enabled: isAuditEnabled(), items: listAudit(limit), total: limit })
+})
+
+/* ---------- 数据库目录：审计库（audit.db 只读浏览，与 session/base 同形状） ---------- */
+router.get('/db/audit/tables', (_req, res) => {
+  try {
+    res.json(auditBrowse.browseTables())
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+router.get('/db/audit/tables/:name/rows', (req, res) => {
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200))
+  const offset = Math.max(0, Number(req.query.offset) || 0)
+  try {
+    res.json(auditBrowse.browseRows(req.params.name, limit, offset))
+  } catch (err) {
+    const status = err.message.startsWith('未知表') ? 404 : 503
+    res.status(status).json({ error: err.message })
+  }
 })
 
 /* ---------- 用量视图（M5b：各 user 的文档/切片用量与配额上限） ---------- */
@@ -365,11 +400,158 @@ import {
   ownerRebuild,
   flush,
   describeStoreInfo,
+  listBrowseCollections,
+  describeCollectionInfo,
   listDocRowsLite,
   countChunksByDoc,
   listChunkRowsOfDocWithVectors,
-  buildChunkGraph,
 } from '../milvusStore.js'
+// 知识网络图走 v3 数据源（锚点层节点 + kb_vectors 精确余弦），不再读旧集合 kb_chunks
+import { buildChunkGraph } from '../vectorStoreV3.js'
+
+/* ---------- 数据库目录（/db/:store：SQLite 库的表结构与行明细，只读） ---------- */
+// store 键：session（会话库）/ memory（记忆库：Milvus kb_memory + SQLite session_memory）/ base（账号库）/ audit（审计库）
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+const AUDIT_DB_FILE = join(
+  dirname(fileURLToPath(import.meta.url)), '..', '..', 'data', 'management', 'audit.db',
+)
+const auditBrowser = makeSqliteBrowser({
+  db: new Database(AUDIT_DB_FILE, { readonly: true, fileMustExist: true }),
+  file: AUDIT_DB_FILE,
+  tableMeta: { audit_log: { desc: '操作审计日志', order: 0 } },
+  label: 'audit-db',
+})
+
+const DB_BROWSERS = {
+  session: {
+    tables: () => sessionStore.browseTables(),
+    rows: (name, limit, offset) => sessionStore.browseRows(name, limit, offset),
+  },
+  base: {
+    tables: () => browseBaseTables(),
+    rows: (name, limit, offset) => browseBaseRows(name, limit, offset),
+  },
+  audit: {
+    tables: () => auditBrowser.browseTables(),
+    rows: (name, limit, offset) => auditBrowser.browseRows(name, limit, offset),
+  },
+  memory: {
+    // 记忆库 = Milvus kb_memory（长期事实）+ SQLite session_memory（滚动摘要）的合并目录
+    async tables() {
+      const kbCount = milvusReady() ? await countMemoriesAll() : 0
+      const sm = sessionStore.browseTables().items.find((t) => t.name === 'session_memory')
+      return {
+        file: 'Milvus kb_memory + SQLite session_memory',
+        writable: false,
+        items: [
+          {
+            name: 'kb_memory',
+            kind: 'milvus',
+            desc: '长期记忆事实（Milvus 集合，只读浏览）',
+            rowCount: kbCount,
+            columns: [
+              { name: 'mem_id', kind: 'PK' }, { name: 'owner_id' }, { name: 'scope' },
+              { name: 'session_id' }, { name: 'agent_name' }, { name: 'kind' },
+              { name: 'text' }, { name: 'ts' },
+            ],
+            indexes: [],
+          },
+          ...(sm ? [{ ...sm, desc: '会话滚动摘要（SQLite）' }] : []),
+        ],
+      }
+    },
+    async rows(name, limit, offset) {
+      if (name === 'kb_memory') {
+        if (!milvusReady()) return { name, kind: 'milvus', columns: [], total: 0, rows: [] }
+        const items = await listMemories({ limit, offset })
+        return {
+          name,
+          kind: 'milvus',
+          columns: ['owner_id', 'scope', 'session_id', 'agent_name', 'kind', 'text'],
+          total: await countMemoriesAll(),
+          rows: items.map((m) => ({
+            owner_id: m.ownerId ?? 'admin',
+            scope: m.scope,
+            session_id: m.sessionId || '-',
+            agent_name: m.agentName || '-',
+            kind: m.kind ?? 'fact',
+            text: m.text ?? '',
+            ts: m.ts,
+          })),
+        }
+      }
+      return sessionStore.browseRows(name, limit, offset)
+    },
+  },
+}
+
+router.get('/db/:store/tables', async (req, res) => {
+  const b = DB_BROWSERS[req.params.store]
+  if (!b) return res.status(404).json({ error: `未知数据库：${req.params.store}` })
+  try {
+    res.json(await b.tables())
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+router.get('/db/:store/tables/:name/rows', async (req, res) => {
+  const b = DB_BROWSERS[req.params.store]
+  if (!b) return res.status(404).json({ error: `未知数据库：${req.params.store}` })
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200))
+  const offset = Math.max(0, Number(req.query.offset) || 0)
+  try {
+    res.json(await b.rows(req.params.name, limit, offset))
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/* ---------- LLM Wiki（知识网络页词条生成与查询，owner 隔离） ---------- */
+// viewer 用具体身份（admin 也落自己的命名空间）；图端点的 '*' 聚合检索不受影响
+const wikiViewer = (req) => (req.adminRole === 'admin' ? 'admin' : String(req.adminUserId ?? ''))
+
+router.get('/wiki/status', (req, res) => {
+  const viewer = wikiViewer(req)
+  res.json({ stats: wikiStore.stats(viewer), running: getRunningWikiJob() })
+})
+
+router.post('/wiki/generate', (req, res) => {
+  try {
+    const viewer = wikiViewer(req)
+    const job = startWikiJob(viewer)
+    appendAudit('wiki.generate', { ownerId: viewer })
+    res.json({ jobId: job.id })
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
+})
+
+router.get('/wiki/jobs/:id', (req, res) => {
+  const job = getWikiJob(req.params.id)
+  if (!job) return res.status(404).json({ error: '任务不存在或已完成清理' })
+  res.json(job)
+})
+
+router.post('/wiki/jobs/:id/cancel', (req, res) => {
+  const job = cancelWikiJob(req.params.id)
+  if (!job) return res.status(404).json({ error: '任务不存在或已结束' })
+  appendAudit('wiki.cancel', { jobId: req.params.id })
+  res.json({ ok: true, status: job.status })
+})
+
+router.delete('/wiki', (req, res) => {
+  try {
+    const viewer = wikiViewer(req)
+    wikiStore.clearWiki(viewer)
+    invalidateGraphCache()
+    appendAudit('wiki.clear', { ownerId: viewer })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
 
 /** owner schema 状态与重建（M5a）：GET status / POST rebuild {dryRun?} */
 router.get('/storage/owner-schema', async (_req, res) => {
@@ -460,6 +642,421 @@ router.post('/memory/clear', async (req, res) => {
   }
 })
 
+/* ---------- 数据库目录：会话库 / 记忆库（只读浏览，与向量库同模式） ---------- */
+
+/**
+ * 会话库（SQLite）表清单：GET /api/management/db/session/tables
+ * 返回文件路径、可写状态与每张表的结构（PRAGMA table_info）+ 行数。
+ */
+router.get('/db/session/tables', (_req, res) => {
+  try {
+    res.json(sessionStore.browseTables())
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/** 会话库表行明细：GET /api/management/db/session/tables/:name/rows?limit=&offset=（表名走白名单防注入） */
+router.get('/db/session/tables/:name/rows', (req, res) => {
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200))
+  const offset = Math.max(0, Number(req.query.offset) || 0)
+  try {
+    res.json(sessionStore.browseRows(req.params.name, limit, offset))
+  } catch (err) {
+    const status = err.message.startsWith('未知表') ? 404 : 503
+    res.status(status).json({ error: err.message })
+  }
+})
+
+/** 记忆库自动归类约定：集合/表名匹配 /memory/i 即纳入（新增记忆表无需登记） */
+const MEMORY_NAME_RE = /memory/i
+
+/* ---------- 数据库目录：基础库（与 RAG 无关的 SQLite 表：用户账号等） ---------- */
+
+/** 基础库数据源（accounts.db 的浏览实现；敏感列在行明细中已掩码） */
+const accountsBrowse = accountsStore
+
+/* ---------- 权限管理（用户账号：角色 / 禁用 / 解锁 / 重置密码，Admin 专属） ---------- */
+
+/** 端点内部错误 → 400/404，其余 503 */
+const authErrStatus = (err) =>
+  err.message.includes('不存在')
+    ? 404
+    : err.message.startsWith('非法') ||
+        err.message.includes('过短') ||
+        err.message.includes('无效') ||
+        err.message.includes('已存在') ||
+        err.message.includes('已被') ||
+        err.message.includes('仍被') ||
+        err.message.includes('不可')
+      ? 400
+      : 503
+
+/**
+ * 用户账号清单：GET /api/management/auth/users
+ * 含角色 / 状态 / 登录时间与 IP（密码列不出现在任何响应中）。
+ */
+router.get('/auth/users', (_req, res) => {
+  try {
+    res.json({ items: listAccounts(), admins: countAdmins() })
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/**
+ * 设置角色：PATCH /api/management/auth/users/:userId/role  body: { role: 'admin'|'member' }
+ * 保护：不能修改自己的角色；不能降级最后一个 active admin。
+ */
+router.patch('/auth/users/:userId/role', (req, res) => {
+  const target = String(req.params.userId ?? '')
+  const me = currentActor()?.userId
+  try {
+    if (target === me) return res.status(400).json({ error: '不能修改自己的角色（防止最后一个管理员失去权限）' })
+    const role = String(req.body?.role ?? '')
+    if (role === 'member') {
+      const u = accountsStore.findAccount(target)
+      if (!u) return res.status(404).json({ error: `用户 ${target} 不存在` })
+      if (u.role === 'admin' && u.status === 'active' && countAdmins() <= 1) {
+        return res.status(400).json({ error: '不能降级唯一的管理员' })
+      }
+    }
+    const changed = setAccountRole(target, role)
+    if (changed) appendAudit('auth.role.set', { target, role, ownerId: me ?? target })
+    res.json({ ok: true, changed })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/**
+ * 创建成员（管理员代建）：POST /api/management/auth/users  body: { userId, password, label?, role? }
+ * 指定角色（可为核心/自定义角色），不走「空表首注册 admin」引导。
+ */
+router.post('/auth/users', (req, res) => {
+  const me = currentActor()?.userId
+  try {
+    const r = createAccountByAdmin({
+      userId: String(req.body?.userId ?? '').trim(),
+      password: String(req.body?.password ?? ''),
+      label: req.body?.label,
+      role: String(req.body?.role ?? 'member'),
+    })
+    appendAudit('auth.user.create', { target: r.userId, role: r.role, ownerId: me ?? r.userId })
+    res.json({ ok: true, ...r })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/**
+ * 删除成员：DELETE /api/management/auth/users/:userId
+ * 保护：不能删除自己；不能删除最后一个 active admin。仅删账号（业务数据保留待清理）。
+ */
+router.delete('/auth/users/:userId', (req, res) => {
+  const target = String(req.params.userId ?? '')
+  const me = currentActor()?.userId
+  try {
+    if (target === me) return res.status(400).json({ error: '不能删除自己' })
+    deleteAccount(target)
+    appendAudit('auth.user.delete', { target, ownerId: me ?? target })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/* ---------- 角色管理（RBAC：角色清单 / 增删改 / 权限矩阵） ---------- */
+
+/** 角色清单（含权限集与成员引用数）+ 可勾选权限点目录：GET /api/management/auth/roles */
+router.get('/auth/roles', (_req, res) => {
+  try {
+    res.json({ items: listRoles(), catalog: PERM_CATALOG })
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/** 新建角色：POST /api/management/auth/roles  body: { roleId, name, description?, perms[] } */
+router.post('/auth/roles', (req, res) => {
+  const me = currentActor()?.userId
+  try {
+    const r = createRole({
+      roleId: String(req.body?.roleId ?? '').trim(),
+      name: String(req.body?.name ?? ''),
+      description: req.body?.description,
+      perms: req.body?.perms,
+    })
+    appendAudit('auth.role.create', { target: r.roleId, ownerId: me ?? r.roleId })
+    res.json({ ok: true, ...r })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/** 更新角色（member 可调权限集；自定义角色可改名/描述）：PATCH /api/management/auth/roles/:roleId */
+router.patch('/auth/roles/:roleId', (req, res) => {
+  const roleId = String(req.params.roleId ?? '')
+  const me = currentActor()?.userId
+  try {
+    const r = updateRole(roleId, { name: req.body?.name, description: req.body?.description, perms: req.body?.perms })
+    appendAudit('auth.role.perms', { target: roleId, perms: r.perms, ownerId: me ?? roleId })
+    res.json({ ok: true, ...r })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/** 删除角色：DELETE /api/management/auth/roles/:roleId（内置不可删；被引用不可删） */
+router.delete('/auth/roles/:roleId', (req, res) => {
+  const roleId = String(req.params.roleId ?? '')
+  const me = currentActor()?.userId
+  try {
+    deleteRole(roleId)
+    appendAudit('auth.role.delete', { target: roleId, ownerId: me ?? roleId })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/** 角色引用校验辅助（成员管理页角色下拉禁用判定用） */
+router.get('/auth/roles/:roleId/exists', (req, res) => {
+  const r = findRole(String(req.params.roleId ?? ''))
+  res.json({ exists: Boolean(r), builtIn: Boolean(r?.built_in) })
+})
+
+/* ---------- 智能体管理（P1：Agent Spec CRUD） ---------- */
+
+/** Spec 清单（全字段）：GET /api/management/agents */
+router.get('/agents', (_req, res) => {
+  try {
+    res.json({ items: agentStore.listSpecs(), version: agentStore.version() })
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/** 新建自定义智能体：POST /api/management/agents  body: Agent Spec（id/name/runtime 必填） */
+router.post('/agents', (req, res) => {
+  const me = currentActor()?.userId
+  try {
+    const spec = agentStore.createSpec({
+      id: String(req.body?.id ?? '').trim(),
+      name: req.body?.name,
+      description: req.body?.description,
+      icon: req.body?.icon,
+      aliases: req.body?.aliases,
+      runtime: req.body?.runtime,
+      systemPrompt: req.body?.systemPrompt,
+      modelRole: req.body?.modelRole,
+      knowledge: req.body?.knowledge,
+      structuredInput: req.body?.structuredInput,
+      greeting: req.body?.greeting,
+      suggestions: req.body?.suggestions,
+      sortOrder: req.body?.sortOrder,
+    })
+    appendAudit('agent.create', { target: spec.id, ownerId: me ?? spec.id })
+    res.json({ ok: true, spec })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/** 更新：PATCH /api/management/agents/:id（内置仅允许展示层字段，store 内强校验） */
+router.patch('/agents/:id', (req, res) => {
+  const me = currentActor()?.userId
+  try {
+    const spec = agentStore.updateSpec(String(req.params.id ?? ''), req.body ?? {})
+    appendAudit('agent.update', { target: spec.id, fields: Object.keys(req.body ?? {}), ownerId: me ?? spec.id })
+    res.json({ ok: true, spec })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/** 删除：DELETE /api/management/agents/:id（内置 403；实际为停用软删，保留历史会话） */
+router.delete('/agents/:id', (req, res) => {
+  const me = currentActor()?.userId
+  try {
+    const r = agentStore.deleteSpec(String(req.params.id ?? ''))
+    appendAudit('agent.delete', { target: req.params.id, mode: r.mode, ownerId: me ?? req.params.id })
+    res.json({ ok: true, ...r })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/**
+ * 禁用/启用：PATCH /api/management/auth/users/:userId/status  body: { status: 'active'|'disabled' }
+ * 保护：不能禁用自己；不能禁用最后一个 active admin。禁用同时清锁定状态。
+ */
+router.patch('/auth/users/:userId/status', (req, res) => {
+  const target = String(req.params.userId ?? '')
+  const me = currentActor()?.userId
+  try {
+    const status = String(req.body?.status ?? '')
+    if (!['active', 'disabled'].includes(status)) return res.status(400).json({ error: `非法状态：${status}` })
+    if (target === me && status === 'disabled') return res.status(400).json({ error: '不能禁用自己' })
+    if (status === 'disabled') {
+      const u = accountsStore.findAccount(target)
+      if (!u) return res.status(404).json({ error: `用户 ${target} 不存在` })
+      if (u.role === 'admin' && countAdmins() <= 1) {
+        return res.status(400).json({ error: '不能禁用唯一的管理员' })
+      }
+    }
+    const changed = setAccountStatus(target, status)
+    if (changed) appendAudit('auth.status.set', { target, status, ownerId: me ?? target })
+    res.json({ ok: true, changed })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/** 解锁（清失败计数与锁定）：POST /api/management/auth/users/:userId/unlock */
+router.post('/auth/users/:userId/unlock', (req, res) => {
+  const target = String(req.params.userId ?? '')
+  const me = currentActor()?.userId
+  try {
+    const changed = unlockAccount(target)
+    if (changed) appendAudit('auth.unlock', { target, ownerId: me ?? target })
+    res.json({ ok: true, changed })
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/**
+ * 重置密码：POST /api/management/auth/users/:userId/reset-password  body: { password }
+ * 不验旧密码（凭 admin 权限）；同时清失败锁定。目标用户需重新登录获取新令牌。
+ */
+router.post('/auth/users/:userId/reset-password', (req, res) => {
+  const target = String(req.params.userId ?? '')
+  const me = currentActor()?.userId
+  try {
+    resetAccountPassword(target, String(req.body?.password ?? ''))
+    appendAudit('auth.password.reset', { target, ownerId: me ?? target })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/**
+ * 基础库表清单：GET /api/management/db/base/tables
+ * 数据源：accounts.db（用户账号）等基础 SQLite 库；新表自动发现无需登记。
+ */
+router.get('/db/base/tables', (_req, res) => {
+  try {
+    res.json(accountsBrowse.browseTables())
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/** 基础库表行明细：GET /api/management/db/base/tables/:name/rows（敏感列自动掩码） */
+router.get('/db/base/tables/:name/rows', (req, res) => {
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200))
+  const offset = Math.max(0, Number(req.query.offset) || 0)
+  try {
+    res.json(accountsBrowse.browseRows(req.params.name, limit, offset))
+  } catch (err) {
+    const status = err.message.startsWith('未知表') ? 404 : 503
+    res.status(status).json({ error: err.message })
+  }
+})
+
+/** 记忆库表清单：GET /api/management/db/memory/tables —— Milvus memory 集合（自动枚举）+ SQLite memory 表（自动发现） */
+router.get('/db/memory/tables', async (_req, res) => {
+  const items = []
+  // ① Milvus：listCollections 动态枚举，按命名约定归类（kb_memory 及未来的 memory_* 自动纳入）
+  if (milvusReady()) {
+    try {
+      const names = (await listBrowseCollections()).filter((n) => MEMORY_NAME_RE.test(n))
+      for (const name of names) {
+        const col = await describeCollectionInfo(name)
+        items.push({
+          name: col.name,
+          kind: 'milvus',
+          desc: '长期记忆事实（跨会话提炼 / 显式写入，向量召回）',
+          rowCount: col.rowCount,
+          columns: col.fields.map((f) => ({
+            name: f.name,
+            type: f.type + (f.dim ? `(${f.dim})` : ''),
+            pk: !!f.isPrimaryKey,
+            notnull: false,
+            vector: !!f.isVector,
+          })),
+          indexes: col.indexes,
+          createdTime: col.createdTime,
+        })
+      }
+    } catch (err) {
+      // Milvus 未就绪/部分不可用时只给 SQLite 部分（显式降级，不静默）
+      log.warn(`[manager] 记忆库浏览：Milvus 部分不可用（${err.message}）`)
+    }
+  }
+  // ② SQLite：全部表自动发现，按命名约定归入记忆库（session_memory 及未来的 *_memory）
+  try {
+    const sessionTables = sessionStore.browseTables()
+    for (const t of sessionTables.items) {
+      if (MEMORY_NAME_RE.test(t.name)) items.push(t)
+    }
+  } catch (err) {
+    log.warn(`[manager] 记忆库浏览：SQLite 部分不可用（${err.message}）`)
+  }
+  res.json({ items })
+})
+
+/** 记忆库表行明细：GET /api/management/db/memory/tables/:name/rows（向量字段以预览对象下发） */
+router.get('/db/memory/tables/:name/rows', async (req, res) => {
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200))
+  const offset = Math.max(0, Number(req.query.offset) || 0)
+  const pv = (v) => {
+    if (!Array.isArray(v) || v.length === 0) return { dim: 0, norm: 0, preview: [] }
+    return {
+      dim: v.length,
+      norm: Math.sqrt(v.reduce((s, x) => s + x * x, 0)),
+      preview: v.slice(0, 8),
+    }
+  }
+  try {
+    const isMilvusMemory =
+      milvusReady() && (await listBrowseCollections()).some((n) => n === req.params.name && MEMORY_NAME_RE.test(n))
+    if (isMilvusMemory) {
+      // 动态集合：从 schema 取主键与全部字段，向量字段一律转 pv 预览
+      const info = await describeCollectionInfo(req.params.name)
+      const pk = info.fields.find((f) => f.isPrimaryKey)?.name ?? 'id'
+      const outputFields = info.fields.map((f) => f.name)
+      const vectorFields = new Set(info.fields.filter((f) => f.isVector).map((f) => f.name))
+      const { readCollectionRows } = await import('../vectorIndexV3.js')
+      const [raw, allRows] = await Promise.all([
+        readCollectionRows(req.params.name, pk, outputFields, limit, offset),
+        readCollectionRows(req.params.name, pk, [pk], 16000, 0),
+      ])
+      const rows = raw.map((row) => {
+        const out = { ...row }
+        for (const vf of vectorFields) out[vf] = pv(out[vf])
+        return out
+      })
+      return res.json({
+        name: req.params.name,
+        kind: 'milvus',
+        columns: outputFields,
+        total: allRows.length,
+        rows,
+      })
+    }
+    if (MEMORY_NAME_RE.test(req.params.name)) {
+      const r = sessionStore.browseRows(req.params.name, limit, offset)
+      if (r) return res.json(r)
+    }
+    return res.status(404).json({ error: `未知表：${req.params.name}` })
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
 /* ---------- 向量库浏览（只读：集合结构 + 文档/切片/向量明细，Admin 跨 owner 视角） ---------- */
 
 /** 向量库总览：GET /api/management/vector/overview（连接信息 + 三个集合的结构与行数） */
@@ -474,21 +1071,88 @@ router.get('/vector/overview', async (_req, res) => {
   }
 })
 
-/** 文档浏览列表：GET /api/management/vector/documents（?q= 按标题/分类/ID 过滤，含每篇切片数） */
-router.get('/vector/documents', async (req, res) => {
-  if (!milvusReady()) {
-    return res.status(503).json({ error: 'Milvus 未就绪' })
-  }
+/* ---------- v3 集合浏览：有几张表就几个明细，字段 = 集合 schema（集合动态枚举，新集合自动纳入） ---------- */
+
+/** 集合列表：GET /api/management/vector/collections（listCollections 自动发现，含 schema 主键与行数） */
+router.get('/vector/collections', async (_req, res) => {
+  if (!milvusReady()) return res.status(503).json({ error: 'Milvus 未就绪' })
   try {
-    const [docs, chunkCounts] = await Promise.all([
-      listDocRowsLite(),
-      countChunksByDoc(),
+    const items = []
+    for (const name of await listBrowseCollections()) {
+      const info = await describeCollectionInfo(name)
+      const pk = info.fields.find((f) => f.isPrimaryKey)?.name ?? 'id'
+      items.push({ name, pk, rowCount: info.rowCount })
+    }
+    res.json({ items })
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/** 集合行明细：GET /api/management/vector/collections/:name/rows?limit=&offset=
+ *  字段 = 集合 schema 原生字段（动态 describe，新集合无需登记）；向量字段以预览对象返回（dim/范数/前 8 维）。 */
+router.get('/vector/collections/:name/rows', async (req, res) => {
+  if (!milvusReady()) return res.status(503).json({ error: 'Milvus 未就绪' })
+  try {
+    const names = await listBrowseCollections()
+    if (!names.includes(req.params.name)) {
+      return res.status(404).json({ error: '未知集合' })
+    }
+    // 动态 schema：主键、字段清单、向量字段全部从 describe 取（零登记）
+    const info = await describeCollectionInfo(req.params.name)
+    const pk = info.fields.find((f) => f.isPrimaryKey)?.name ?? 'id'
+    const outputFields = info.fields.map((f) => f.name)
+    const vectorFields = new Set(info.fields.filter((f) => f.isVector).map((f) => f.name))
+    const { readCollectionRows } = await import('../vectorIndexV3.js')
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200))
+    const offset = Math.max(0, Number(req.query.offset) || 0)
+    const [raw, allRows] = await Promise.all([
+      readCollectionRows(req.params.name, pk, outputFields, limit, offset),
+      readCollectionRows(req.params.name, pk, [pk], 16000, 0),
     ])
+    const pv = (v) => {
+      if (!Array.isArray(v) || v.length === 0) return { dim: 0, norm: 0, preview: [] }
+      return {
+        dim: v.length,
+        norm: Math.sqrt(v.reduce((s, x) => s + x * x, 0)),
+        preview: v.slice(0, 8),
+      }
+    }
+    const rows = raw.map((row) => {
+      const out = { ...row }
+      for (const vf of vectorFields) out[vf] = pv(out[vf])
+      return out
+    })
+    res.json({ name: req.params.name, offset, count: rows.length, total: allRows.length, columns: outputFields, rows })
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/** 文档浏览列表：GET /api/management/vector/documents（v3：读锚点层，含每篇切片数；admin 聚合全部 owner） */
+router.get('/vector/documents', async (req, res) => {
+  try {
     const q = String(req.query.q ?? '')
       .trim()
       .toLowerCase()
+    // 主体口径与知识网络图端点一致：admin='*' 聚合，其他角色仅自己；
+    // 旧实现写死 'local'，jwt 模式下 admin 的数据全部不可见（对不上数的根因）
+    const viewerId = req.adminRole === 'admin' ? '*' : String(req.adminUserId ?? '')
+    if (!viewerId) return res.status(401).json({ error: '需要登录' })
+    const owners = viewerId === '*' ? anchors.listOwnerIds() : [viewerId]
+    const docs = owners.flatMap((o) => anchors.listDocuments(o, { pageSize: 1000 }).items)
     const items = docs
-      .map((d) => ({ ...d, chunkCount: chunkCounts.get(d.id) ?? 0 }))
+      .map((d) => ({
+        id: d.id,
+        title: d.title,
+        category: d.category,
+        tags: d.tags,
+        size: d.size,
+        status: d.status,
+        uploadedAt: d.createdAt,
+        ownerId: d.ownerId,
+        chunkCount: anchors.countChunksOfDoc(d.id),
+      }))
       .filter(
         (d) =>
           !q ||
@@ -503,21 +1167,72 @@ router.get('/vector/documents', async (req, res) => {
   }
 })
 
-/** 文档切片明细：GET /api/management/vector/documents/:docId/chunks（含双向量预览） */
+/** 文档切片明细：GET /api/management/vector/documents/:docId/chunks（v3 数据 + V2 兼容字段，向量预览读索引层） */
 router.get('/vector/documents/:docId/chunks', async (req, res) => {
-  if (!milvusReady()) {
-    return res.status(503).json({ error: 'Milvus 未就绪' })
-  }
+  // management 挂载无 req.principal；主体取 adminUserId/adminRole（同图端点）。
+  // admin 可看任意 owner 的文档（按文档实际归属读取），其他角色仅限本人
+  const viewerId = req.adminRole === 'admin' ? '*' : String(req.adminUserId ?? '')
+  if (!viewerId) return res.status(401).json({ error: '需要登录' })
+  const doc =
+    viewerId === '*'
+      ? anchors.getDocumentAnyOwner(req.params.docId)
+      : anchors.getDocument(req.params.docId, viewerId)
+  if (!doc) return res.status(404).json({ error: '文档不存在' })
+  const ownerId = doc.ownerId || viewerId
   try {
-    const r = await listChunkRowsOfDocWithVectors(req.params.docId)
-    res.json({ docId: req.params.docId, ...r })
+    const rows = anchors.listChunks(doc.id, ownerId)
+    let full = ''
+    try {
+      full = files.readContent(ownerId, doc.id)
+    } catch {
+      full = ''
+    }
+    // 向量预览（dim / 范数 / 前 8 维）：本体在索引层 kb_vectors，锚点层只有引用
+    let vecMap = new Map()
+    try {
+      vecMap = await vindex.readVectorsByDoc(doc.id, ownerId)
+    } catch (err) {
+      log.warn(`向量预览读取失败：${err.message}`)
+    }
+    const preview = (v) => {
+      if (!Array.isArray(v) || v.length === 0) return { dim: 0, norm: 0, preview: [] }
+      return {
+        dim: v.length,
+        norm: Math.sqrt(v.reduce((s, x) => s + x * x, 0)),
+        preview: v.slice(0, 8),
+      }
+    }
+    const items = rows.map((c) => ({
+      // 字段名与 V2 对齐（前端 VectorDataPage 的 FIELDS 按这些名字渲染）
+      id: c.chunkId,
+      idx: c.idx,
+      heading: c.heading ?? '',
+      topic: c.topic ?? null,
+      questions: c.questions ?? [],
+      text: full.slice(c.spanStart, c.spanEnd),
+      displayTitle: `${doc.title} § ${c.idx + 1}`,
+      category: doc.category,
+      tags: doc.tags,
+      status: doc.status,
+      indexedAt: c.updatedAt,
+      ownerId,
+      textVector: preview(vecMap.get(c.vecText)?.text),
+      questionVector: preview(vecMap.get(c.vecQuest)?.question),
+    }))
+    res.json({ docId: doc.id, items, total: items.length })
   } catch (err) {
     res.status(503).json({ error: err.message })
   }
 })
 
-/** 知识网络图缓存：key 为 `threshold|topK`，TTL 5 分钟（仪表盘反复加载不打 Milvus） */
-const graphCache = new Map()
+/** 知识网络图缓存（共享模块：vectorStoreV3 数据变更时主动失效），TTL 5 分钟 */
+import graphCache from '../graphCache.js'
+import { startWikiJob, getWikiJob, cancelWikiJob, getRunningWikiJob } from '../wikiBuilder.js'
+import * as wikiStore from '../wikiStore.js'
+import { browseTables as browseBaseTables, browseRows as browseBaseRows } from '../auth/accounts.js'
+import { makeSqliteBrowser } from '../sqliteBrowse.js'
+import Database from 'better-sqlite3'
+import { buildWikiGraphPart, buildGraphIdResolver } from '../wikiBuilder.js'
 const GRAPH_TTL_MS = 5 * 60 * 1000
 
 /**
@@ -537,25 +1252,35 @@ router.get('/vector/graph', async (req, res) => {
   }
   const threshold = Number(req.query.threshold ?? 0.55)
   const topK = Number(req.query.topK ?? 6)
+  // includeWiki：是否叠加 LLM Wiki 词条节点（默认含；仪表盘卡片显式传 0）。
+  // 缓存只存不含词条的基础切片图，词条在缓存外每次实时叠加（生成完成即生效）
+  const includeWiki = !/^(0|false|no|off)$/i.test(String(req.query.includeWiki ?? '1'))
   if (!Number.isFinite(threshold) || threshold < 0.3 || threshold > 0.95) {
     return res.status(400).json({ error: 'threshold 需在 0.3 ~ 0.95 之间' })
   }
   if (!Number.isFinite(topK) || topK < 1 || topK > 20) {
     return res.status(400).json({ error: 'topK 需在 1 ~ 20 之间' })
   }
-  const includeWiki = req.query.includeWiki === '1' || req.query.includeWiki === 'true'
-  /** 应答前叠加 wiki 词条节点与提及边（实时读取，不进切片图缓存） */
+  // 知识网络按用户隔离；admin = '*' 聚合全部 owner
+  // （管理挂载点经 adminAuth，主体字段是 req.adminUserId / req.adminRole，见 security.js）
+  const graphOwnerId = req.adminRole === 'admin' ? '*' : String(req.adminUserId ?? '')
+  if (!graphOwnerId) return res.status(401).json({ error: '需要登录' })
   const respond = (data, extra = {}) => {
-    if (!includeWiki) return res.json({ ...data, ...extra })
-    const part = buildWikiGraphPart(new Set((data.nodes ?? []).map((n) => n.id)))
-    res.json({
-      ...data,
-      ...extra,
-      nodes: [...(data.nodes ?? []), ...part.nodes],
-      edges: [...(data.edges ?? []), ...part.edges],
-    })
+    if (includeWiki) {
+      const part = buildWikiGraphPart(
+        new Set((data.nodes ?? []).map((n) => n.id)),
+        graphOwnerId,
+        { resolver: buildGraphIdResolver(data.nodes ?? []) },
+      )
+      data = {
+        ...data,
+        nodes: [...(data.nodes ?? []), ...part.nodes],
+        edges: [...(data.edges ?? []), ...part.edges],
+      }
+    }
+    res.json({ ...data, ...extra })
   }
-  const key = `${threshold.toFixed(2)}|${topK}`
+  const key = `${graphOwnerId}|${threshold.toFixed(2)}|${topK}`
   const hit = graphCache.get(key)
   const fresh = hit && Date.now() - hit.ts < GRAPH_TTL_MS
   if (hit) {
@@ -563,7 +1288,7 @@ router.get('/vector/graph', async (req, res) => {
     // 过期：先返回旧值，无进行中重建时后台刷新
     if (!hit.rebuilding) {
       hit.rebuilding = true
-      buildChunkGraph({ threshold, topK })
+      buildChunkGraph({ threshold, topK, ownerId: graphOwnerId })
         .then((data) => {
           graphCache.set(key, { data, ts: Date.now() })
         })
@@ -577,7 +1302,7 @@ router.get('/vector/graph', async (req, res) => {
     return respond(hit.data, { cached: true })
   }
   try {
-    const data = await buildChunkGraph({ threshold, topK })
+    const data = await buildChunkGraph({ threshold, topK, ownerId: graphOwnerId })
     graphCache.set(key, { data, ts: Date.now() })
     // 顺手清理过期项，避免缓存随参数组合无限增长
     for (const [k, v] of graphCache) {
@@ -587,58 +1312,6 @@ router.get('/vector/graph', async (req, res) => {
   } catch (err) {
     res.status(503).json({ error: err.message })
   }
-})
-
-/* ---------- LLM Wiki（知识网络图词条：生成任务与状态） ---------- */
-
-/**
- * 触发生成：POST /api/management/wiki/generate
- * 后台三阶段任务（实体抽取 → 归一合并 → 词条摘要），202 返回 jobId；
- * 已有进行中任务时 409 返回该任务（幂等触发）；LLM 未配置 503。
- */
-router.post('/wiki/generate', (_req, res) => {
-  try {
-    const { jobId, alreadyRunning } = startWikiJob()
-    appendAudit({
-      action: 'wiki-generate',
-      detail: `Wiki 词条生成任务 ${jobId}${alreadyRunning ? '（已有进行中任务，复用）' : ' 启动'}`,
-    })
-    res.status(alreadyRunning ? 409 : 202).json({ jobId, alreadyRunning })
-  } catch (err) {
-    if (err?.status) return res.status(err.status).json({ error: err.message, code: err.code })
-    res.status(500).json({ error: err.message })
-  }
-})
-
-/** 任务进度：GET /api/management/wiki/jobs/:id（stage: extracting/normalizing/summarizing） */
-router.get('/wiki/jobs/:id', (req, res) => {
-  const job = getWikiJob(req.params.id)
-  if (!job) return res.status(404).json({ error: '任务不存在或已过期（保留 10 分钟）' })
-  res.json(job)
-})
-
-/** 取消任务：POST /api/management/wiki/jobs/:id/cancel（进行中标记取消，已结束幂等返回） */
-router.post('/wiki/jobs/:id/cancel', (req, res) => {
-  const job = cancelWikiJob(req.params.id)
-  if (!job) return res.status(404).json({ error: '任务不存在或已过期' })
-  appendAudit({ action: 'wiki-cancel', detail: `Wiki 生成任务 ${job.id} 取消` })
-  res.json(job)
-})
-
-/** Wiki 状态：GET /api/management/wiki/status（当前任务 + 词条统计，挂载恢复轮询用） */
-router.get('/wiki/status', (_req, res) => {
-  res.json({ current: getRunningWikiJob(), stats: wikiStore.stats() })
-})
-
-/** 清空全部 Wiki 数据：DELETE /api/management/wiki（有进行中任务时 409 拒绝） */
-router.delete('/wiki', (_req, res) => {
-  const running = getRunningWikiJob()
-  if (running) {
-    return res.status(409).json({ error: `任务 ${running.id} 进行中，请先取消或等待完成` })
-  }
-  wikiStore.clearWiki()
-  appendAudit({ action: 'wiki-clear', detail: '清空全部 LLM Wiki 词条数据' })
-  res.json({ ok: true })
 })
 
 /* ---------- 用户管理（M5a / ADR-008：user-token 档的签发与吊销） ---------- */

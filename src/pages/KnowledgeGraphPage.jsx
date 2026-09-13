@@ -7,12 +7,10 @@ import {
   Loader2,
   Search,
   AlertCircle,
-  Sparkles,
-  Ban,
-  Trash2,
   ChevronsRight,
   X,
   BookMarked,
+  FilePlus2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -20,9 +18,7 @@ import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
 import {
   fetchVectorGraph,
-  startWikiGeneration,
   fetchWikiJob,
-  cancelWikiJob,
   fetchWikiStatus,
   clearWiki,
 } from '@/lib/managementApi'
@@ -42,11 +38,6 @@ const KnowledgeGraph3D = React.lazy(() =>
 )
 
 /** 生成阶段中文标签 */
-const STAGE_LABELS = {
-  extracting: '实体抽取',
-  normalizing: '归一合并',
-  summarizing: '词条摘要',
-}
 
 /**
  * KnowledgeGraphPage —— 知识网络独立页（知识库子菜单 /knowledge/graph）
@@ -103,14 +94,11 @@ export function KnowledgeGraphPage({ onLoadingChange }) {
   /** 文档筛选：null = 全部文档；否则只显示集合内文档的切片节点 */
   const [selectedDocIds, setSelectedDocIds] = React.useState(null)
   /** 是否包含 LLM Wiki 词条节点（默认含） */
-  const [includeWikiNodes, setIncludeWikiNodes] = React.useState(true)
   /** 词条详情浮层（点击 wiki 节点打开；携带图节点全量字段） */
   const [selectedWiki, setSelectedWiki] = React.useState(null)
 
   /* ---------- LLM Wiki 生成任务状态 ---------- */
-  const [job, setJob] = React.useState(null)
-  const [jobError, setJobError] = React.useState('')
-  const [wikiStats, setWikiStats] = React.useState(null)
+  const [, setJob] = React.useState(null)
   const [clearOpen, setClearOpen] = React.useState(false)
   const [clearing, setClearing] = React.useState(false)
   /** 轮询定时器（ref 持有便于卸载清理与防重入） */
@@ -190,33 +178,7 @@ export function KnowledgeGraphPage({ onLoadingChange }) {
     [stopPolling, settleJob, refreshWikiStats],
   )
 
-  /** 触发生成（进行中任务 409 复用同 jobId） */
-  const handleGenerate = React.useCallback(async () => {
-    setJobError('')
-    try {
-      const r = await startWikiGeneration()
-      setJob({
-        id: r.jobId,
-        status: 'running',
-        stage: null,
-        progress: { processed: 0, total: 0, failed: 0 },
-      })
-      startPolling(r.jobId)
-    } catch (err) {
-      setJobError(err.message || '触发生成失败')
-    }
-  }, [startPolling])
 
-  /** 取消生成（进行中标记取消，下一个检查点停止） */
-  const handleCancelJob = React.useCallback(async () => {
-    if (!job?.id) return
-    try {
-      const j = await cancelWikiJob(job.id)
-      setJob(j)
-    } catch (err) {
-      setJobError(err.message || '取消失败')
-    }
-  }, [job])
 
   /** 清空词条（二次确认；成功后重拉图与统计） */
   const handleClear = React.useCallback(async () => {
@@ -264,9 +226,8 @@ export function KnowledgeGraphPage({ onLoadingChange }) {
         threshold,
         keyword,
         selectedDocIds,
-        includeWikiNodes,
       }),
-    [data, threshold, keyword, selectedDocIds, includeWikiNodes],
+    [data, threshold, keyword, selectedDocIds],
   )
 
   /** 各文档切片计数（左栏列表徽标） */
@@ -293,7 +254,13 @@ export function KnowledgeGraphPage({ onLoadingChange }) {
     })
   }
 
-  /** 点击节点：wiki 词条开浮层；切片跳转数据明细（URL 参数定位文档 + 切片） */
+  /**
+   * 点击节点：wiki 词条开浮层；切片节点跳**切片阅读器**（D9 语义）。
+   *
+   * 此前跳 /vector-data（管理端数据明细，看到的是一行数据库记录）；
+   * v3 起改为跳阅读器并按 chunk 定位 —— 节点直接落到文件里的那段实际正文，
+   * 贯彻「文件为事实源」。传入 chunkId（阅读器同时兼容 idx 与 chunkId）。
+   */
   const handleNodeClick = React.useCallback(
     (n) => {
       if (n.type === 'wiki') {
@@ -301,7 +268,7 @@ export function KnowledgeGraphPage({ onLoadingChange }) {
         return
       }
       navigate(
-        `/vector-data?docId=${encodeURIComponent(n.docId)}&chunkId=${encodeURIComponent(n.id)}`,
+        `/knowledge/read/${encodeURIComponent(n.docId)}?chunk=${encodeURIComponent(n.id)}`,
       )
     },
     [navigate],
@@ -330,9 +297,6 @@ export function KnowledgeGraphPage({ onLoadingChange }) {
     setMode(m)
     window.localStorage.setItem('ui:knowledge-graph-mode', m)
   }
-
-  const running = job?.status === 'running'
-  const wikiEntryNodes = (view?.nodes ?? []).filter((n) => n.type === 'wiki')
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -388,23 +352,6 @@ export function KnowledgeGraphPage({ onLoadingChange }) {
                 {threshold.toFixed(2)}
               </span>
             </label>
-            <label
-              className="flex cursor-pointer items-center gap-2 text-xs text-foreground/85"
-              title="LLM Wiki 词条节点（琥珀色）与提及边"
-            >
-              <input
-                type="checkbox"
-                checked={includeWikiNodes}
-                onChange={(e) => setIncludeWikiNodes(e.target.checked)}
-                className="h-3.5 w-3.5 accent-primary"
-              />
-              含 Wiki 词条节点
-              {wikiEntryNodes.length > 0 && (
-                <Badge className="h-4 min-w-4 rounded-full px-1 text-[10px] leading-4">
-                  {wikiEntryNodes.length}
-                </Badge>
-              )}
-            </label>
           </div>
 
           {/* 中部：文档复选列表（文件管理列） */}
@@ -451,125 +398,6 @@ export function KnowledgeGraphPage({ onLoadingChange }) {
             </div>
           </div>
 
-          {/* 底部：LLM Wiki 词条生成 */}
-          <div className="shrink-0 space-y-2.5 border-t border-border/60 p-3">
-            <p className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider">
-              LLM Wiki
-            </p>
-            {wikiStats && (
-              <p className="text-[11px] leading-relaxed text-muted-foreground">
-                词条 {wikiStats.entries} · 已摘要 {wikiStats.summarized} ·
-                抽取切片 {wikiStats.extractedChunks}
-              </p>
-            )}
-            {/* 任务进度（进行中 / 终态回执） */}
-            {job && (
-              <div
-                className={cn(
-                  'space-y-1.5 rounded-md border px-2.5 py-2 text-[11px]',
-                  job.status === 'error'
-                    ? 'border-destructive/40 bg-destructive/5'
-                    : job.status === 'done'
-                      ? 'border-emerald-500/30 bg-emerald-500/5'
-                      : 'border-border bg-background',
-                )}
-              >
-                {running ? (
-                  <>
-                    <div className="flex items-center gap-1.5">
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                      <span className="font-medium">
-                        {job.stage ? STAGE_LABELS[job.stage] ?? job.stage : '启动中'}…
-                      </span>
-                      {job.progress?.total > 0 && (
-                        <span className="ml-auto tabular-nums text-muted-foreground">
-                          {job.progress.processed}/{job.progress.total}
-                        </span>
-                      )}
-                    </div>
-                    {job.progress?.total > 0 && (
-                      <div className="h-1 overflow-hidden rounded-full bg-muted">
-                        <div
-                          className="h-full rounded-full bg-primary transition-all duration-300"
-                          style={{
-                            width: `${Math.round((job.progress.processed / job.progress.total) * 100)}%`,
-                          }}
-                        />
-                      </div>
-                    )}
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 w-full gap-1 px-2 text-[11px]"
-                      onClick={handleCancelJob}
-                    >
-                      <Ban className="h-3 w-3" />
-                      取消生成
-                    </Button>
-                  </>
-                ) : (
-                  <div className="space-y-1">
-                    <p
-                      className={cn(
-                        'font-medium',
-                        job.status === 'done'
-                          ? 'text-emerald-600'
-                          : job.status === 'error'
-                            ? 'text-destructive'
-                            : 'text-muted-foreground',
-                      )}
-                    >
-                      {job.status === 'done'
-                        ? `生成完成：词条 ${job.result?.entries ?? 0} 条 · ${(job.result?.durationMs ?? 0) / 1000}s`
-                        : job.status === 'cancelled'
-                          ? `已取消（${job.stage ? STAGE_LABELS[job.stage] ?? job.stage : '进行中'}，已写入数据保留）`
-                          : job.error || '任务失败'}
-                    </p>
-                    {job.status === 'done' && (job.result?.failedBatches > 0 || job.result?.failedSummaries > 0) && (
-                      <p className="text-muted-foreground">
-                        失败批次 {job.result.failedBatches} · 失败摘要 {job.result.failedSummaries}（下次生成自动续跑重试）
-                      </p>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-            {jobError && (
-              <p className="flex items-start gap-1.5 text-[11px] text-destructive">
-                <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
-                {jobError}
-              </p>
-            )}
-            <div className="flex gap-1.5">
-              <Button
-                type="button"
-                size="sm"
-                className="h-7 flex-1 gap-1 text-xs"
-                onClick={handleGenerate}
-                disabled={running}
-                title="后台任务：实体抽取 → 归一合并 → 词条摘要（增量：内容未变的切片跳过）"
-              >
-                {running ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Sparkles className="h-3.5 w-3.5" />
-                )}
-                {wikiStats?.entries > 0 ? '增量生成词条' : '生成 Wiki 词条'}
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                className="h-7 w-7 shrink-0 p-0 text-muted-foreground hover:text-destructive"
-                onClick={() => setClearOpen(true)}
-                disabled={running || !wikiStats?.entries}
-                title="清空全部 Wiki 数据"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </Button>
-            </div>
-          </div>
         </aside>
       )}
 
@@ -745,10 +573,46 @@ export function KnowledgeGraphPage({ onLoadingChange }) {
           </div>
         )}
         {!loading && !error && data && view?.nodes.length === 0 && (
-          <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
-            {selectedDocIds
-              ? '所选文档在当前阈值下无节点'
-              : '向量库暂无切片'}
+          <div className="absolute inset-0 flex items-center justify-center p-4">
+            <div className="flex max-w-sm flex-col items-center gap-3 rounded-xl border border-border/60 bg-background/80 px-8 py-7 text-center shadow-sm backdrop-blur-sm">
+              <div className="flex h-11 w-11 items-center justify-center rounded-full bg-primary/10">
+                {selectedDocIds || (data.docs?.length ?? 0) > 0 ? (
+                  <Network className="h-5 w-5 text-primary/70" />
+                ) : (
+                  <FilePlus2 className="h-5 w-5 text-primary/70" />
+                )}
+              </div>
+              {selectedDocIds ? (
+                <>
+                  <p className="text-sm font-medium">所选文档在当前阈值下无节点</p>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    试试调低左侧相似度阈值，或清除文档筛选查看全库网络。
+                  </p>
+                  <Button size="sm" variant="outline" onClick={() => setSelectedDocIds(null)}>
+                    清除文档筛选
+                  </Button>
+                </>
+              ) : (data.docs?.length ?? 0) === 0 ? (
+                <>
+                  <p className="text-sm font-medium">知识库还是空的</p>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    上传文档并完成解析入库后，这里会以语义相似度网络展示你的知识切片。
+                    当前账号名下还没有任何文档。
+                  </p>
+                  <Button size="sm" onClick={() => navigate('/knowledge')}>
+                    <FilePlus2 className="mr-1.5 h-3.5 w-3.5" />
+                    去上传文档
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <p className="text-sm font-medium">暂无可视化节点</p>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    已有文档但切片向量缺失或相似度未达阈值。可尝试调低左侧阈值，或回到文档管理重新解析。
+                  </p>
+                </>
+              )}
+            </div>
           </div>
         )}
       </div>

@@ -35,3 +35,9 @@ data/knowledge/
 # 临时文件
 .tmp-*
 nohup.out
+
+# ---- 本地临时产物（构建残留 / 调试输出 / 截图）----
+dist-*/
+.playwright-cli/
+/*.png
+/_*.txt

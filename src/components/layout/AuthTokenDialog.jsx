@@ -9,26 +9,30 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { setUserToken } from '@/lib/api'
+import { useAuth } from '@/hooks/useAuth'
 
 /**
- * AuthTokenDialog —— 用户令牌输入（M5a）
+ * AuthTokenDialog —— 用户令牌输入（M5a，legacy token 模式兜底）
  *
- * 监听 api 层广播的 auth:required（后端 AUTH_MODE=user-token 且请求缺令牌/令牌失效时触发），
+ * 监听 api 层广播的 auth:required（后端 AUTH_MODE=user-token/token 且请求缺令牌/令牌失效时触发），
  * 让用户粘贴管理页签发的令牌；保存后刷新页面重新拉取数据。
+ * jwt 模式不弹此框：401 由 useAuth 清令牌并跳 /auth 登录页。
  */
 export function AuthTokenDialog() {
+  const { mode } = useAuth()
   const [open, setOpen] = React.useState(false)
   const [token, setToken] = React.useState('')
   const [message, setMessage] = React.useState('')
 
   React.useEffect(() => {
     const onRequired = (e) => {
+      if (mode === 'jwt') return // 会话过期走 AuthGate 跳登录，不弹粘贴框
       setMessage(e?.detail?.message || '')
       setOpen(true)
     }
     window.addEventListener('auth:required', onRequired)
     return () => window.removeEventListener('auth:required', onRequired)
-  }, [])
+  }, [mode])
 
   const handleSave = () => {
     if (!token.trim()) return
@@ -53,7 +57,17 @@ export function AuthTokenDialog() {
             if (e.key === 'Enter') handleSave()
           }}
         />
-        <DialogFooter>
+        <DialogFooter className="gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              setOpen(false)
+              window.location.assign('/auth')
+            }}
+          >
+            前往登录页
+          </Button>
           <Button type="button" onClick={handleSave} disabled={!token.trim()}>
             保存并重载
           </Button>

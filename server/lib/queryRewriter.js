@@ -14,7 +14,7 @@
  *   queries[1..n] 是改写补充 query（不存在时数组长度为 1）。
  */
 
-import { streamText } from 'ai'
+import { generateText } from 'ai'
 import { llmConfig, llmAvailable, queryRewriterConfig } from './config.js'
 import { getChatModel } from './llmProvider.js'
 import { stripToJson } from './textUtils.js'
@@ -186,56 +186,89 @@ export async function rewrite(query, history, overrideCfg = {}, caller) {
   // 4) 真实改写（超时 ms 内不完成 → AbortController 中断 → 降级）
   const timeoutMs = Number.isFinite(cfg.rewriteTimeoutMs) ? cfg.rewriteTimeoutMs : 3000
   const queriesPer = Math.max(2, Math.min(5, Number.isFinite(cfg.queriesPerRequest) ? cfg.queriesPerRequest : 3))
-  const prompt =
-    `你是检索 Query 改写专家。给定【用户当前问题】 + 【最近几轮对话历史】，请改写输出 ${queriesPer} 个独立、互补、用于向量检索的查询。\n` +
-    `要求：\n` +
-    `1) 第 0 条（最优先）必须是"当前问题的同义改写 / 补充缺失指代"的版本，长度与原问题相近；\n` +
-    `2) 第 1..${queriesPer - 1} 条分别从不同角度改写：例如"换一个更专业的术语说法" / "把指代补全为具体概念" / "拆成具体知识点问句" / "换成面试场景下的问法" 等；\n` +
-    `3) 每个 query 必须是完整问句/陈述句，不出现编号，不要解释，彼此不重复；\n` +
-    `4) 输出 STRICT JSON 数组 ["q0","q1","q2"]，不要 markdown 代码块/前后文字。\n\n` +
-    `【最近几轮对话历史（已压缩）】：\n${historyStr || '（无历史对话）'}\n\n` +
-    `【用户当前问题】：${q}\n`
+  // 意图感知模式（rewrite.intentAware，管理页可热关）：先判意图类型再按类型策略改写；
+  // 关闭时走旧的纯互补角度 prompt（行为与历史版本一致）
+  const intentAware = cfg.intentAware !== false
+  const prompt = intentAware
+    ? `你是检索 Query 改写专家。给定【用户当前问题】 + 【最近几轮对话历史】，先判断问题的意图类型，再按类型策略改写出用于向量检索的多个查询。\n` +
+      `意图类型（type 取其一）：\n` +
+      `- contextual：依赖对话历史的上下文/指代问题 → queries[0] 补全指代，其余从不同角度补写；\n` +
+      `- comparison：对比型（A 与 B 比较）→ 为每个对比对象各出 1 条独立查询（分别聚焦 A、聚焦 B），再加 1 条综合对比的查询；\n` +
+      `- multi_intent：一个问题里包含两个及以上子问题/关注点 → 为每个子问题各出 1 条独立查询（如"有哪些环节，缺了会怎样"拆成"环节"与"影响"两条）；\n` +
+      `- negation：反问/否定/排除型（用户明确不想要某对象）→ 查询转成肯定式陈述（问用户想要什么），并把被排除的对象名词写入 excludeTerms（1~3 个，其余类型为 []）；\n` +
+      `- plain：常规单一意图 → 从不同角度互补改写。\n` +
+      `输出 STRICT JSON 对象（无 markdown 代码块、无前后缀文字）：\n` +
+      `{"type":"plain|contextual|comparison|multi_intent|negation","queries":["q0","q1"],"excludeTerms":[]}。\n` +
+      `规则：queries[0] 必须是"当前问题本身的同义改写/补全指代"，长度与原问题相近；每条 query 是完整问句/陈述句，不含编号与解释，彼此不重复，最多 ${queriesPer} 条。\n\n` +
+      `【最近几轮对话历史（已压缩）】：\n${historyStr || '（无历史对话）'}\n\n` +
+      `【用户当前问题】：${q}\n`
+    : `你是检索 Query 改写专家。给定【用户当前问题】 + 【最近几轮对话历史】，请改写输出 ${queriesPer} 个独立、互补、用于向量检索的查询。\n` +
+      `要求：\n` +
+      `1) 第 0 条（最优先）必须是"当前问题的同义改写 / 补充缺失指代"的版本，长度与原问题相近；\n` +
+      `2) 第 1..${queriesPer - 1} 条分别从不同角度改写：例如"换一个更专业的术语说法" / "把指代补全为具体概念" / "拆成具体知识点问句" / "换成面试场景下的问法" 等；\n` +
+      `3) 每个 query 必须是完整问句/陈述句，不出现编号，不要解释，彼此不重复；\n` +
+      `4) 输出 STRICT JSON 数组 ["q0","q1","q2"]，不要 markdown 代码块/前后文字。\n\n` +
+      `【最近几轮对话历史（已压缩）】：\n${historyStr || '（无历史对话）'}\n\n` +
+      `【用户当前问题】：${q}\n`
 
   let rewritten = false
   let reason = ''
   let extraQueries = []
+  let queryType = 'plain'
+  let excludeTerms = []
   try {
-    extraQueries = await gate.run(async () => {
+    const parsedOut = await gate.run(async () => {
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), timeoutMs)
       try {
-        const result = await streamText({
+        // 用 generateText 而非 streamText：本项目 ai@3.4.33 的 streamText().text
+        // 在不消费 textStream 时永远 pending（Node 24 实测，正常路径也挂起），
+        // 而改写需要的就是全文——与 generateStructuredJSON 同款已验证模式。
+        const result = await generateText({
           model: getChatModel({ role: 'chat.rewrite' }),
           temperature: 0,
           prompt,
           abortSignal: controller.signal,
         })
-        // 硬超时兜底：AI SDK 的 result.text 在 abort / 流中断时可能永远 pending，
-        // 只靠 AbortController 无法保证 Promise 落地（实测会永久挂起整个检索链路）。
-        // 用 race 强制在 timeoutMs 后降级为空串，绝不阻塞主链路。
+        // 硬超时兜底：race 强制在 timeoutMs 后降级，绝不阻塞主链路
         const raw = await Promise.race([
           Promise.resolve(result.text).catch(() => ''),
           new Promise((resolve) => setTimeout(() => resolve(''), timeoutMs)),
         ])
-        if (!raw) return []
+        if (!raw) return { extra: [], type: '', excludeTerms: [] }
         const parsed = JSON.parse(stripToJson(raw))
-        if (!Array.isArray(parsed)) return []
-        const filtered = parsed
+        // 新契约 = 对象 {type, queries, excludeTerms}；模型退化为旧数组格式时按 plain 兼容
+        const isObj = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        const rawQueries = isObj ? (parsed.queries ?? []) : parsed
+        if (!Array.isArray(rawQueries)) return { extra: [], type: '', excludeTerms: [] }
+        const filtered = rawQueries
           .map((x) => (typeof x === 'string' ? x.trim() : ''))
           .filter((t) => _isValidQuery(t, { minChars: cfg.minQueryChars, maxChars: cfg.maxQueryChars }))
           .slice(0, queriesPer)
         // 去重（大小写不敏感）
         const seen = new Set()
-        return filtered.filter((t) => {
+        const extra = filtered.filter((t) => {
           const k2 = t.toLowerCase(); if (seen.has(k2)) return false; seen.add(k2); return true
         })
+        const type = isObj && typeof parsed.type === 'string' ? parsed.type.toLowerCase() : 'plain'
+        // 排除词：反问/否定型的被排除对象，供排序层降权；仅收字符串、限长限数
+        const excludeTerms = isObj && Array.isArray(parsed.excludeTerms)
+          ? parsed.excludeTerms
+              .filter((t) => typeof t === 'string' && t.trim().length >= 2 && t.length <= 20)
+              .map((t) => t.trim())
+              .slice(0, 3)
+          : []
+        return { extra, type, excludeTerms }
       } catch (err) {
         reason = err.name === 'AbortError' ? 'timeout' : err.message
-        return []
+        return { extra: [], type: '', excludeTerms: [] }
       } finally {
         clearTimeout(timer)
       }
     })
+    extraQueries = parsedOut.extra
+    queryType = parsedOut.type || 'plain'
+    excludeTerms = parsedOut.excludeTerms
   } catch (err) {
     reason = reason || err.message
   }
@@ -250,7 +283,13 @@ export async function rewrite(query, history, overrideCfg = {}, caller) {
     if (final.length >= queriesPer) break
   }
   rewritten = final.length > 1
-  const out = { queries: final, rewritten, reason: reason || (rewritten ? 'ok' : 'rewrite_empty') }
+  const out = {
+    queries: final,
+    rewritten,
+    reason: reason || (rewritten ? 'ok' : 'rewrite_empty'),
+    queryType,
+    excludeTerms,
+  }
   _cache.set(k, out)
   return out
 }

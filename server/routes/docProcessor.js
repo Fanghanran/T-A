@@ -206,7 +206,7 @@ async function commitDocToStore(docId, ownerId) {
     }))
   }
   // 文档去重（与聊天侧 CommitToStore 工具同口径）：批内余弦 + 跨文档 Milvus 检索
-  const deduped = await dedupPreparedChunks(chunkList, vectors, questionVectors)
+  const deduped = await dedupPreparedChunks(chunkList, vectors, questionVectors, { ownerId })
   chunkList = deduped.chunkList
   vectors = deduped.vectors
   questionVectors = deduped.questionVectors

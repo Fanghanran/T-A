@@ -1,0 +1,41 @@
+﻿--- react 宸ュ叿娉ㄥ唽 ---
+kb.search | 鐭ヨ瘑搴撴绱?| enabled = true
+kb.documentInfo | 鏂囨。鏄庣粏鏌ヨ | enabled = true
+memory.write | 鍐欏叆闀挎湡璁板繂 | enabled = true
+--- 宸ヤ綔娴佹敞鍐?---
+react-planner | ReAct 鑷富瑙勫垝鍣?| enabled = true | dependsOn = kb.search,kb.documentInfo,memory.write
+--- isCompositeGoal ---
+OK  | expect true | 鏌ヤ竴涓嬬煡璇嗗簱閲屽悜閲忓簱鐨勯€夊瀷缁撹锛岀劧鍚庢妸瑕佺偣鍐欏叆璁板繂
+OK  | expect true | 鍏堟绱?HyDE 鐨勫師鐞嗭紝鎺ョ潃鎬荤粨鎴愪笁鍙ヨ瘽
+OK  | expect true | 涓€姝ユ鎵ц锛氬垪鍑虹煡璇嗗簱鏂囨。锛屽啀鍒嗘瀽瑕佺偣
+OK  | expect false | 浠€涔堟槸鍚戦噺鏁版嵁搴擄紵
+OK  | expect false | 甯垜妫€绱竴涓?Milvus 鐨勯厤缃柟娉?OK  | expect false | 浣犲ソ
+OK  | expect true | 鎶婅繖娈佃瘽缈昏瘧鎴愯嫳鏂囧啀鎬荤粨
+node.exe : D:\workplace\trae\server\node_modules\sonic-boom\index.js:551
+所在位置 行:445 字符: 40
++ ... rae\server; & "C:\Program Files\nodejs\node.exe" --env-file-if-exists ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (D:\workplace\tr...om\index.js:551 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    throw new Error('sonic boom is not ready yet')
+          ^
+
+Error: sonic boom is not ready yet
+    at SonicBoom.flushSync (D:\workplace\trae\server\node_modules\sonic-boom\in
+dex.js:551:11)
+    at autoEnd (D:\workplace\trae\server\node_modules\pino\lib\tools.js:319:12)
+    at callRefs (D:\workplace\trae\server\node_modules\on-exit-leak-free\index.
+js:55:7)
+    at process.onExit (D:\workplace\trae\server\node_modules\on-exit-leak-free\
+index.js:39:3)
+    at process.emit (node:events:521:24)
+    at process.exit (node:internal/process/per_thread:236:15)
+    at file:///D:/workplace/trae/server/_check-react.mjs:28:9
+    at ModuleJob.run (node:internal/modules/esm/module_job:439:25)
+    at async node:internal/modules/esm/loader:633:26
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:10
+1:5)
+
+Node.js v24.17.0

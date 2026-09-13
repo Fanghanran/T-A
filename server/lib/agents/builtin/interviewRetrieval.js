@@ -6,8 +6,9 @@
  *   → streamInterviewAnswer 流式回答
  */
 
-import { unifiedSearch } from '../../unifiedSearch.js'
+import { unifiedSearch, buildReasoningTrace } from '../../unifiedSearch.js'
 import { streamInterviewAnswer } from '../../llm.js'
+import { prependAnnotation } from '../../streamUtils.js'
 
 export const interviewRetrievalAgent = {
   id: 'interview-retrieval',
@@ -46,21 +47,20 @@ export const interviewRetrievalAgent = {
       dbg(`      ${i + 1}. ${c.title}${c.heading ? ' / ' + c.heading : ''} (相似度: ${(c.score * 100).toFixed(1)}%)`)
     })
 
-    return pipeStream(
-      res,
-      await streamInterviewAnswer({
-        query,
-        results,
-        techStack,
-        searchMs: questionSearchMs,
-        ragChunks,
-        ragSearchMs,
-        history,
-        agentId,
-        memoryBlock,
-        signal,
-      }),
-      { sessionId, onAssistantText: onAssistantDone },
-    )
+    // 检索思考链路卡片：与知识库智能体同口径（engine=interview-rag）
+    const reasoningTrace = buildReasoningTrace(u.knowledgeResults, { engine: 'interview-rag' })
+    const stream = await streamInterviewAnswer({
+      query,
+      results,
+      techStack,
+      searchMs: questionSearchMs,
+      ragChunks,
+      ragSearchMs,
+      history,
+      agentId,
+      memoryBlock,
+      signal,
+    })
+    return pipeStream(res, prependAnnotation(stream, reasoningTrace), { sessionId, onAssistantText: onAssistantDone })
   },
 }

@@ -635,7 +635,7 @@ function listAvgScoreOfDoc(docId, ownerId) {
 }
 
 // ---------- 文档列表（支持过滤 + 排序 + 分页）----------
-knowledgeRouter.get('/api/knowledge/documents', (req, res) => {
+knowledgeRouter.get('/api/knowledge/documents', async (req, res) => {
   const { category, tag, q, sort, page = 1, pageSize = 20 } = req.query
   const all = store.listDocuments({
     category,
@@ -648,10 +648,13 @@ knowledgeRouter.get('/api/knowledge/documents', (req, res) => {
   const ps = Math.max(1, Math.min(100, Number(pageSize) || 20))
   const items = all.slice((p - 1) * ps, p * ps)
   // 每文档附带启发式评分均分（走内容签名缓存，避免每次列表对全部切片重复纯 CPU 计算），供列表质量徽标
-  const scoredItems = items.map((d) => ({
-    ...d,
-    avgScore: listAvgScoreOfDoc(d.id, d.ownerId),
-  }))
+  const scoredItems = await Promise.all(
+    items.map(async (d) => ({
+      ...d,
+      avgScore: listAvgScoreOfDoc(d.id, d.ownerId),
+      chunkCount: await store.countChunksOfDoc(d.id, d.ownerId),
+    })),
+  )
   res.json({ items: scoredItems, total: all.length, page: p, pageSize: ps })
 })
 
@@ -732,9 +735,14 @@ knowledgeRouter.get(
 
 // ---------- 删除文档 ----------
 knowledgeRouter.delete('/api/knowledge/documents/:id', async (req, res) => {
-  const existed = await store.deleteDocument(req.params.id, req.principal.userId)
-  if (!existed) return res.status(404).json({ message: '文档不存在' })
-  res.status(204).end()
+  try {
+    const existed = await store.deleteDocument(req.params.id, req.principal.userId)
+    if (!existed) return res.status(404).json({ message: '文档不存在' })
+    res.status(204).end()
+  } catch (err) {
+    // 事务化删除失败：三层数据已回滚到等价状态，把原因明确告知前端（Fail-Fast，禁静默）
+    res.status(503).json({ message: err.message })
+  }
 })
 
 // ---------- 编辑文档（元数据 / 正文，统一 PATCH）----------

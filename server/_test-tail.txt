@@ -1,0 +1,8 @@
+﻿鈩?tests 63
+鈩?suites 0
+鈩?pass 63
+鈩?fail 0
+鈩?cancelled 0
+鈩?skipped 0
+鈩?todo 0
+鈩?duration_ms 510.2255

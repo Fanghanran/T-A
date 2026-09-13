@@ -1,0 +1,225 @@
+{
+  "note": "检索质量回归黄金集：期望命中按【文档片段关键词】判定（topK 命中的切片正文须包含全部关键词）。type 字段标注意图类别，评测脚本不区分、仅随结果输出供对比。",
+  "cases": [
+    {
+      "id": "plain-embed-zh",
+      "type": "plain",
+      "q": "做中文场景的 Embedding 应该选什么模型",
+      "expectDoc": "Embedding与本地模型",
+      "expectKeywords": [
+        "BGE"
+      ]
+    },
+    {
+      "id": "plain-lora",
+      "type": "plain",
+      "q": "LoRA 调优需要设置哪些参数",
+      "expectDoc": "AI大模型面试题库",
+      "expectKeywords": [
+        "lora_alpha",
+        "target_modules"
+      ]
+    },
+    {
+      "id": "plain-vectordb",
+      "type": "plain",
+      "q": "常见的开源向量数据库有哪些",
+      "expectDoc": "AI大模型面试题库",
+      "expectKeywords": [
+        "Milvus",
+        "Faiss"
+      ]
+    },
+    {
+      "id": "plain-arch",
+      "type": "plain",
+      "q": "Interview Agent 的分层架构是怎么做静态检查的",
+      "expectDoc": "Interview_Agent_项目总结",
+      "expectKeywords": [
+        "check-layers"
+      ]
+    },
+    {
+      "id": "plain-spa",
+      "type": "plain",
+      "q": "为什么这个项目前端选 SPA 而不是 SSR",
+      "expectDoc": "Interview_Agent_技术栈面试题",
+      "expectKeywords": [
+        "SEO"
+      ]
+    },
+    {
+      "id": "ctx-quality-followup",
+      "type": "contextual",
+      "q": "除了这些还有哪些经验性的做法",
+      "history": [
+        {
+          "role": "user",
+          "content": "如何保证代码的质量"
+        },
+        {
+          "role": "assistant",
+          "content": "保证代码质量最核心的手段是测试，建议提前准备测试集验证正确性"
+        }
+      ],
+      "expectDoc": "Embedding与本地模型",
+      "expectKeywords": [
+        "重复"
+      ]
+    },
+    {
+      "id": "ctx-vectordb-ref",
+      "type": "contextual",
+      "q": "你自研的这个相比于开源的有什么加速",
+      "history": [
+        {
+          "role": "user",
+          "content": "开源的 VectorDB 有哪些"
+        },
+        {
+          "role": "assistant",
+          "content": "常见开源向量数据库有 Milvus、Faiss、Chroma、Qdrant、Weaviate、PGVector 等"
+        }
+      ],
+      "expectDoc": "AI大模型面试题库",
+      "expectKeywords": [
+        "加速"
+      ]
+    },
+    {
+      "id": "cmp-list-tuple",
+      "type": "comparison",
+      "q": "Python 里 list 和 tuple 该怎么选，有什么区别",
+      "expectDoc": "AI大模型面试题库",
+      "expectKeywords": [
+        "不可变序列"
+      ]
+    },
+    {
+      "id": "cmp-append-extend",
+      "type": "comparison",
+      "q": "append 和 extend 在行为上有什么不同",
+      "expectDoc": "AI大模型面试题库",
+      "expectKeywords": [
+        "可迭代对象"
+      ]
+    },
+    {
+      "id": "cmp-vite-cra",
+      "type": "comparison",
+      "q": "Vite 相比 CRA 带来了哪些收益",
+      "expectDoc": "Interview_Agent_技术栈面试题",
+      "expectKeywords": [
+        "esbuild"
+      ]
+    },
+    {
+      "id": "multi-rag-pipeline",
+      "type": "multi_intent",
+      "q": "RAG 的完整闭环有哪几个环节，缺一个会怎么样",
+      "expectDoc": "Interview_Agent_项目总结",
+      "expectKeywords": [
+        "切片"
+      ]
+    },
+    {
+      "id": "multi-local-deploy",
+      "type": "multi_intent",
+      "q": "本地部署大模型该怎么选型，显存不够怎么压缩",
+      "expectDoc": "Embedding与本地模型",
+      "expectKeywords": [
+        "量化"
+      ]
+    },
+    {
+      "id": "multi-highlights",
+      "type": "multi_intent",
+      "q": "这个项目最拿得出手的工程亮点和整体技术栈分别是什么",
+      "expectDoc": "Interview_Agent_项目总结",
+      "expectKeywords": [
+        "分层"
+      ]
+    },
+    {
+      "id": "neg-ssr",
+      "type": "negation",
+      "q": "不使用 SSR 的话，这个系统前端为什么选 SPA",
+      "expectDoc": "Interview_Agent_技术栈面试题",
+      "expectKeywords": [
+        "SEO"
+      ]
+    },
+    {
+      "id": "neg-4090",
+      "type": "negation",
+      "q": "不买 4090 的话，RTX 4060 上能跑本地模型吗",
+      "expectDoc": "Embedding与本地模型",
+      "expectKeywords": [
+        "千问"
+      ]
+    },
+    {
+      "id": "neg-lora",
+      "type": "negation",
+      "q": "不做 LoRA 微调，还有别的方式让模型适配自己的任务吗",
+      "expectDoc": "AI大模型面试题库",
+      "expectKeywords": [
+        "微调"
+      ]
+    },
+    {
+      "id": "hard-gpu-colloquial",
+      "type": "plain",
+      "q": "显卡不太行的话怎么玩本地大模型",
+      "expectDoc": "Embedding与本地模型",
+      "expectKeywords": [
+        "量化"
+      ]
+    },
+    {
+      "id": "hard-dup-avoid",
+      "type": "plain",
+      "q": "怎么避免项目里重复的代码越堆越多",
+      "expectDoc": "Embedding与本地模型",
+      "expectKeywords": [
+        "重复"
+      ]
+    },
+    {
+      "id": "hard-lora-colloquial",
+      "type": "plain",
+      "q": "面试被问到 LoRA 的秩和 alpha 该怎么答",
+      "expectDoc": "AI大模型面试题库",
+      "expectKeywords": [
+        "秩"
+      ]
+    },
+    {
+      "id": "hard-cross-react-quality",
+      "type": "plain",
+      "q": "在 React 项目里怎么靠测试集保证代码正确性",
+      "expectDoc": "Embedding与本地模型",
+      "expectKeywords": [
+        "测试"
+      ]
+    },
+    {
+      "id": "hard-neg-nextjs",
+      "type": "negation",
+      "q": "系统为什么没用 Next.js 做服务端渲染",
+      "expectDoc": "Interview_Agent_技术栈面试题",
+      "expectKeywords": [
+        "首屏"
+      ]
+    },
+    {
+      "id": "hard-cmp-tuple-key",
+      "type": "comparison",
+      "q": "tuple 和 list 谁的性能更好、哪个能当字典的 key",
+      "expectDoc": "AI大模型面试题库",
+      "expectKeywords": [
+        "哈希"
+      ]
+    }
+  ]
+}

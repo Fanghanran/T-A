@@ -154,6 +154,18 @@ if (db) {
       extract_until_seq INTEGER,
       updated_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS reflection_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT,
+      question TEXT,
+      score INTEGER,
+      action TEXT,
+      issues TEXT,
+      top1_score REAL,
+      citations INTEGER,
+      answer_chars INTEGER,
+      created_at TEXT
+    );
     CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
     CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at);
   `)
@@ -175,6 +187,63 @@ if (db) {
         .run(new Date().toISOString())
     })
     tx()
+  }
+  if (currentVersion < 2) {
+    // v2（隔离加固）：① owner 过滤 + 排序走复合索引；② session_memory / reflection_log
+    // 重建并挂外键级联——旧表无外键，删除会话后靠应用层记得清理（漏删即孤儿）；
+    // ③ 清理指向已删除会话的孤儿行。数据操作前已备份会话库。
+    const snapshot = {
+      sessions: db.prepare('SELECT COUNT(*) AS c FROM sessions').get().c,
+      messages: db.prepare('SELECT COUNT(*) AS c FROM messages').get().c,
+      memory: db.prepare('SELECT COUNT(*) AS c FROM session_memory').get().c,
+      reflection: db.prepare('SELECT COUNT(*) AS c FROM reflection_log').get().c,
+    }
+    const tx = db.transaction(() => {
+      db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_owner_updated ON sessions(owner_id, updated_at)')
+      // 孤儿清理：外键重建前先移除指向已删除会话的行（FK 开启状态下无法通过插入检查）
+      db.exec('DELETE FROM session_memory WHERE session_id NOT IN (SELECT id FROM sessions)')
+      db.exec('DELETE FROM reflection_log WHERE session_id NOT IN (SELECT id FROM sessions)')
+      db.exec(`CREATE TABLE session_memory_v2 (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        summary TEXT,
+        summary_until_seq INTEGER,
+        extract_until_seq INTEGER,
+        updated_at TEXT
+      )`)
+      db.exec('INSERT INTO session_memory_v2 SELECT session_id, summary, summary_until_seq, extract_until_seq, updated_at FROM session_memory')
+      db.exec('DROP TABLE session_memory')
+      db.exec('ALTER TABLE session_memory_v2 RENAME TO session_memory')
+      db.exec(`CREATE TABLE reflection_log_v2 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+        question TEXT,
+        score INTEGER,
+        action TEXT,
+        issues TEXT,
+        top1_score REAL,
+        citations INTEGER,
+        answer_chars INTEGER,
+        created_at TEXT
+      )`)
+      db.exec('INSERT INTO reflection_log_v2 SELECT id, session_id, question, score, action, issues, top1_score, citations, answer_chars, created_at FROM reflection_log')
+      db.exec('DROP TABLE reflection_log')
+      db.exec('ALTER TABLE reflection_log_v2 RENAME TO reflection_log')
+      // 反思表索引必须在重建之后建——建在旧表上会随 DROP 一起消失（实测踩坑）
+      db.exec('CREATE INDEX IF NOT EXISTS idx_reflection_session ON reflection_log(session_id)')
+      db.prepare('INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES(2, ?)')
+        .run(new Date().toISOString())
+    })
+    tx()
+    const after = {
+      sessions: db.prepare('SELECT COUNT(*) AS c FROM sessions').get().c,
+      messages: db.prepare('SELECT COUNT(*) AS c FROM messages').get().c,
+      memory: db.prepare('SELECT COUNT(*) AS c FROM session_memory').get().c,
+      reflection: db.prepare('SELECT COUNT(*) AS c FROM reflection_log').get().c,
+    }
+    log.info(
+      { before: snapshot, after },
+      '[sessionStore] schema v2：owner 复合索引 + 摘要/反思表外键级联（孤儿行已清理）',
+    )
   }
 }
 
@@ -604,6 +673,177 @@ try {
 }
 
 // 进程退出前关闭 DB（better-sqlite3 close 会自动 flush WAL）
+/* ==================== P1 反思日志（reflection_log） ==================== */
+
+const stmtAddReflection = prepare(`
+  INSERT INTO reflection_log (session_id, question, score, action, issues, top1_score, citations, answer_chars, created_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`)
+
+/**
+ * 追加一条反思记录（P1 反思回路）。
+ * @param {{sessionId?: string, question: string, score: number, action: string, issues?: string[],
+ *          top1Score?: number|null, citations?: number, answerChars?: number}} r
+ */
+export function addReflection(r) {
+  const info = stmtAddReflection.run(
+    r.sessionId ?? '',
+    String(r.question ?? '').slice(0, 500),
+    Math.round(Number(r.score) || 0),
+    String(r.action ?? ''),
+    JSON.stringify(r.issues ?? []),
+    r.top1Score == null ? null : Number(r.top1Score),
+    Number.isFinite(r.citations) ? r.citations : null,
+    Number.isFinite(r.answerChars) ? r.answerChars : null,
+    new Date().toISOString(),
+  )
+  return info.lastInsertRowid
+}
+
+const stmtListReflections = prepare(`
+  SELECT id, session_id AS sessionId, question, score, action, issues,
+         top1_score AS top1Score, citations, answer_chars AS answerChars, created_at AS createdAt
+  FROM reflection_log ORDER BY id DESC LIMIT ?
+`)
+
+/** 最近 N 条反思记录（管理页用），issues 已解析回数组 */
+export function listReflections(limit = 50) {
+  return stmtListReflections.all(Math.max(1, Math.min(200, Number(limit) || 50))).map((r) => {
+    let issues = []
+    try { issues = JSON.parse(r.issues ?? '[]') } catch { /* 历史脏数据按空处理 */ }
+    return { ...r, issues }
+  })
+}
+
+const stmtReflectionStats = prepare(`
+  SELECT COUNT(*) AS total,
+         SUM(CASE WHEN score < 60 THEN 1 ELSE 0 END) AS lowCount,
+         AVG(score) AS avgScore
+  FROM reflection_log
+`)
+
+/** 反思统计总览（管理页用） */
+export function reflectionStats() {
+  const s = stmtReflectionStats.get()
+  return {
+    total: s.total ?? 0,
+    lowCount: s.lowCount ?? 0,
+    avgScore: s.avgScore == null ? null : Math.round(s.avgScore * 10) / 10,
+  }
+}
+
+/* ============ 数据库目录浏览（管理端只读，"数据库"菜单的会话库数据源） ============ */
+
+/**
+ * 已知表的展示辅助（说明文案 + 排序优先级）—— 不是白名单。
+ * 新建表（migration 里 CREATE TABLE）无需在此登记：browseTables 经 sqlite_master
+ * 自动发现并追加在已知表之后，说明文案留空、行照常可浏览。
+ */
+const TABLE_META = {
+  sessions: { desc: '会话列表（按智能体隔离）', order: 0 },
+  messages: { desc: '聊天消息（SSE 全文落库）', order: 1 },
+  annotations: { desc: '消息注解（引用卡片 / 工作流轨迹 JSON）', order: 2 },
+  session_memory: { desc: '会话滚动摘要与记忆提炼游标', order: 3 },
+  reflection_log: { desc: '反思评估记录（P1）', order: 4 },
+  meta: { desc: '键值元数据', order: 9 },
+  schema_version: { desc: 'schema 迁移版本', order: 10 },
+}
+
+/** 动态枚举全部用户表（sqlite_master，排除 sqlite_ 内部表）；失败返回空数组 */
+function listUserTables() {
+  try {
+    return db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+      )
+      .all()
+      .map((r) => r.name)
+  } catch (err) {
+    log.warn(`[sessionStore] 枚举用户表失败（${err.message}）`)
+    return []
+  }
+}
+
+/** 表结构（PRAGMA table_info）+ 索引（index_list/index_info）；表不存在返回 null */
+function describeTable(name) {
+  const columns = db
+    .pragma(`table_info(${JSON.stringify(name)})`)
+    .map((c) => ({ name: c.name, type: c.type || '', pk: !!c.pk, notnull: !!c.notnull }))
+  if (!columns.length) return null
+  let indexes = []
+  try {
+    indexes = db
+      .pragma(`index_list(${JSON.stringify(name)})`)
+      .filter((ix) => !ix.origin || ix.origin === 'c') // 只列显式创建的索引（sqlite_autoindex 为约束副产品）
+      .map((ix) => ({
+        name: ix.name,
+        unique: !!ix.unique,
+        columns: db.pragma(`index_info(${JSON.stringify(ix.name)})`).map((c) => c.name),
+      }))
+  } catch {
+    /* 索引信息缺失不阻塞结构展示 */
+  }
+  return { columns, indexes }
+}
+
+/**
+ * 列出全部表（结构 + 行数），供「数据库 → 会话库 · 数据结构」使用。
+ * 自动发现：sqlite_master 动态枚举，新表自动出现，无需代码登记。
+ * @returns {{ file: string, writable: boolean, items: Array<{name:string,kind:string,desc:string,rowCount:number,columns:Array<{name:string,type:string,pk:boolean,notnull:boolean}>,indexes:Array<{name:string,unique:boolean,columns:string[]}>}>}}
+ */
+export function browseTables() {
+  if (!db) return { file: DB_FILE, writable: false, items: [] }
+  // 排序：已知表按 TABLE_META 优先级在前，未知新表按字母序追加
+  const names = listUserTables().sort((a, b) => {
+    const oa = TABLE_META[a]?.order ?? 50
+    const ob = TABLE_META[b]?.order ?? 50
+    return oa - ob || a.localeCompare(b)
+  })
+  const items = []
+  for (const name of names) {
+    try {
+      const d = describeTable(name)
+      if (!d) continue // 表不存在（如被并发删除）则跳过
+      const rowCount = db.prepare(`SELECT COUNT(*) AS n FROM ${JSON.stringify(name)}`).get()?.n ?? 0
+      items.push({
+        name,
+        kind: 'sqlite',
+        desc: TABLE_META[name]?.desc ?? '',
+        rowCount,
+        columns: d.columns,
+        indexes: d.indexes,
+      })
+    } catch (err) {
+      log.warn(`[sessionStore] 浏览表 ${name} 失败（${err.message}），已跳过`)
+    }
+  }
+  return { file: DB_FILE, writable: isWritable(), items }
+}
+
+/**
+ * 分页读取某表的行（按 rowid 排序），供「数据库 → 会话库 · 数据明细」使用。
+ * 表名经 sqlite_master 存在性校验后以双引号转义拼接，杜绝注入。
+ * @param {string} name 表名
+ * @param {number} limit
+ * @param {number} offset
+ * @returns {{ name:string, kind:string, columns:string[], total:number, rows:Array<object> }}
+ */
+export function browseRows(name, limit = 200, offset = 0) {
+  if (!db) throw new Error('会话数据库不可用')
+  const t = String(name ?? '')
+  const exists = db
+    .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(t)
+  if (!exists) throw new Error(`未知表：${t}`)
+  const safe = JSON.stringify(t) // JSON.stringify 即带双引号的 SQL 标识符转义（表名无引号字符）
+  const columns = db.pragma(`table_info(${safe})`).map((c) => c.name)
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM ${safe}`).get()?.n ?? 0
+  const rows = db
+    .prepare(`SELECT * FROM ${safe} ORDER BY rowid LIMIT ? OFFSET ?`)
+    .all(Math.min(500, Math.max(1, limit | 0)), Math.max(0, offset | 0))
+  return { name: t, kind: 'sqlite', desc: TABLE_META[t]?.desc ?? '', columns, total, rows }
+}
+
 try {
   // 优雅退出：先做检查点再关库，避免 WAL 残留膨胀
   const gracefulClose = () => {

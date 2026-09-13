@@ -8,6 +8,7 @@ const ADDRESS = process.env.MILVUS_ADDRESS || 'localhost:19530'
 const DOC_COL = process.env.MILVUS_DOC_COLLECTION || 'kb_documents'
 const CHUNK_COL = process.env.MILVUS_CHUNK_COLLECTION || 'kb_chunks'
 const MEM_COL = process.env.MILVUS_MEMORY_COLLECTION || 'kb_memory'
+const VEC_COL = process.env.MILVUS_VECTOR_COLLECTION || 'kb_vectors'
 const METRIC = 'COSINE'
 
 // VarChar 长度上限（Milvus 硬限制 65535）
@@ -352,54 +353,17 @@ async function countRowsStrong(name, pk) {
 }
 
 /**
- * 向量库存储总览：连接信息 + 三个集合的结构描述。
+ * 向量库存储总览：连接信息 + 存活集合的结构描述（动态枚举，新集合自动纳入）。
  * 每个集合含：Strong 口径行数、字段列表（含向量维度）、索引描述、创建时间。
  * 供管理端「向量库浏览」展示集合卡片（只读，不触碰数据）。
  */
 export async function describeStoreInfo() {
-  const c = getClient()
   const collections = []
-  for (const name of [DOC_COL, CHUNK_COL, MEM_COL]) {
-    const desc = await c.describeCollection({ collection_name: name })
-    const d = desc?.data ?? desc ?? {}
-    // 字段结构：data_type 为字符串名（如 VarChar），type_params 携带 max_length/dim
-    const fields = (d.schema?.fields ?? []).map((f) => {
-      const params = {}
-      for (const p of f.type_params ?? []) params[p.key] = p.value
-      return {
-        name: f.name,
-        type: f.data_type ?? '',
-        isVector: f.data_type === 'FloatVector',
-        isPrimaryKey: !!f.is_primary_key,
-        dim: params.dim ? Number(params.dim) : null,
-        maxLength: params.max_length ? Number(params.max_length) : null,
-      }
-    })
-    // 索引描述：params 为 [{key,value}] 数组，取 index_type / metric_type
-    let indexes = []
-    try {
-      const idxR = await c.describeIndex({ collection_name: name })
-      indexes = (idxR?.index_descriptions ?? []).map((x) => {
-        const kv = {}
-        for (const p of x.params ?? []) kv[p.key] = p.value
-        return {
-          field: x.field_name ?? '',
-          indexType: kv.index_type ?? '',
-          metricType: kv.metric_type ?? '',
-          indexedRows: Number(x.indexed_rows ?? 0),
-          state: x.state ?? '',
-        }
-      })
-    } catch {
-      // 集合无索引时 describeIndex 报错，浏览场景按空索引处理
-    }
-    collections.push({
-      name,
-      rowCount: await countRowsStrong(name, name === DOC_COL ? 'doc_id' : name === CHUNK_COL ? 'chunk_id' : 'mem_id'),
-      fields,
-      indexes,
-      createdTime: tsToIso(d.created_utc_timestamp),
-    })
+  // 自动发现：listCollections 全量列举，仅排除 v2 遗留集合（回退保障期约定不展示）。
+  // 新建集合无需在此登记，数据库目录即可看到。
+  const names = await listBrowseCollections()
+  for (const name of names) {
+    collections.push(await describeCollectionInfo(name))
   }
   return {
     address: ADDRESS,
@@ -407,6 +371,69 @@ export async function describeStoreInfo() {
     dim,
     metric: METRIC,
     collections,
+  }
+}
+
+/** v2 遗留集合（被 v3 集合取代，回退保障期内在浏览端隐藏；未来彻底下线后可移除） */
+const LEGACY_BROWSE_EXCLUDED = new Set([DOC_COL, CHUNK_COL])
+
+/**
+ * 动态枚举可浏览的业务集合（自动发现，无需登记）。
+ * 排除 v2 遗留集合与内部命名（下划线开头）。
+ * @returns {Promise<string[]>}
+ */
+export async function listBrowseCollections() {
+  const { collection_names = [] } = await getClient().listCollections()
+  return collection_names.filter((n) => !LEGACY_BROWSE_EXCLUDED.has(n) && !n.startsWith('_'))
+}
+
+/**
+ * 描述单个集合的结构（字段/索引/行数/创建时间），数据库目录浏览用。
+ * @param {string} name 集合名
+ * @returns {Promise<{name:string,rowCount:number,fields:Array,indexes:Array,createdTime:string|null}>}
+ */
+export async function describeCollectionInfo(name) {
+  const c = getClient()
+  const desc = await c.describeCollection({ collection_name: name })
+  const d = desc?.data ?? desc ?? {}
+  // 字段结构：data_type 为字符串名（如 VarChar），type_params 携带 max_length/dim
+  const fields = (d.schema?.fields ?? []).map((f) => {
+    const params = {}
+    for (const p of f.type_params ?? []) params[p.key] = p.value
+    return {
+      name: f.name,
+      type: f.data_type ?? '',
+      isVector: f.data_type === 'FloatVector',
+      isPrimaryKey: !!f.is_primary_key,
+      dim: params.dim ? Number(params.dim) : null,
+      maxLength: params.max_length ? Number(params.max_length) : null,
+    }
+  })
+  // 索引描述：params 为 [{key,value}] 数组，取 index_type / metric_type
+  let indexes = []
+  try {
+    const idxR = await c.describeIndex({ collection_name: name })
+    indexes = (idxR?.index_descriptions ?? []).map((x) => {
+      const kv = {}
+      for (const p of x.params ?? []) kv[p.key] = p.value
+      return {
+        field: x.field_name ?? '',
+        indexType: kv.index_type ?? '',
+        metricType: kv.metric_type ?? '',
+        indexedRows: Number(x.indexed_rows ?? 0),
+        state: x.state ?? '',
+      }
+    })
+  } catch {
+    // 集合无索引时 describeIndex 报错，浏览场景按空索引处理
+  }
+  const pkField = fields.find((f) => f.isPrimaryKey)
+  return {
+    name,
+    rowCount: await countRowsStrong(name, pkField?.name ?? 'id'),
+    fields,
+    indexes,
+    createdTime: tsToIso(d.created_utc_timestamp),
   }
 }
 

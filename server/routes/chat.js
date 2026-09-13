@@ -19,14 +19,19 @@ import {
 import { stubStream, prependAnnotation } from '../lib/streamUtils.js'
 import { llmAvailable } from '../lib/config.js'
 import { unifiedSearch } from '../lib/unifiedSearch.js'
+import { evaluateAnswer } from '../lib/reflection.js'
+import { tunables } from '../lib/tunables.js'
+import { runReactPlanner, REACT_WORKFLOW_NAME } from '../lib/workflows/reactPlanner.js'
 import { workflowRegistry } from '../lib/management/registry.js'
 import { runDocAgent, streamOpReport, DOC_WORKFLOW_NAME } from '../lib/workflows/docWorkflow.js'
 import { runDocPlanAgent, DOC_PLAN_WORKFLOW_NAME } from '../lib/workflows/docPlanWorkflow.js'
 import { buildDocContext } from '../lib/workflows/docWorkflowShared.js'
-import { extractTaskIntents } from '../lib/intents.js'
+import { extractTaskIntents, isCompositeGoal } from '../lib/intents.js'
 import { pipeStream, dbg } from './shared.js'
 import { childLogger } from '../lib/logger.js'
 import { agentRegistry } from '../lib/agents/agentRegistry.js'
+import { genericAgentDef } from '../lib/agents/genericAgent.js'
+import * as agentStore from '../lib/agents/agentStore.js'
 import { knowledgeBaseAgent } from '../lib/agents/builtin/knowledgeBase.js'
 import { interviewRetrievalAgent } from '../lib/agents/builtin/interviewRetrieval.js'
 import { defaultChatAgent } from '../lib/agents/builtin/defaultChat.js'
@@ -52,17 +57,18 @@ import { recallBlock, onTurnEnd } from '../lib/memoryService.js'
 
 const log = childLogger('chat')
 
-/* ===================== 内置智能体注册 ===================== */
+/* ===================== 智能体注册（P1：Agent Spec 驱动） ===================== */
 
-// 知识库 RAG 智能体
-agentRegistry.registerAgent(knowledgeBaseAgent)
-
-// 面试题检索智能体
-agentRegistry.registerAgent(interviewRetrievalAgent)
-
-// 文档处理智能体（动态注入 L5+ 依赖到 ctx）
-agentRegistry.registerAgent({
-  id: 'doc-processor',
+// 内置 handler 映射：seed 的 builtin_ref → 既有实现（人设仍在 llm.js，本层只挂执行体）
+const builtinHandlers = {
+  'knowledge-base': knowledgeBaseAgent,
+  'interview-retrieval': interviewRetrievalAgent,
+  'default-chat': defaultChatAgent,
+  'resume-analysis': resumeAnalysisAgent,
+  'mock-interview': mockInterviewAgent,
+  // 文档处理智能体（动态注入 L5+ 依赖到 ctx）
+  'doc-processor': {
+    id: 'doc-processor',
   name: 'doc-processor',
   description: '文档处理智能体：opReport / 双工作流分发 / action 关键词路由',
   aliases: ['文档处理'],
@@ -82,7 +88,7 @@ agentRegistry.registerAgent({
     const opReport = req.body?.opReport
     if (opReport && typeof opReport === 'object' && typeof opReport.op === 'string') {
       dbg(`[doc-processor] opReport op=${opReport.op} | docId=${opReport.docId || '(无)'}`)
-      return pipeStream(res, await streamOpReport({ opReport, history, signal: ctx.signal }), opts)
+      return pipeStream(res, await streamOpReport({ opReport, history, signal: ctx.signal, ownerId: ctx.ownerId }), opts)
     }
 
     // 双工作流分发
@@ -92,7 +98,7 @@ agentRegistry.registerAgent({
       const planOn = workflowRegistry.isEnabled(DOC_PLAN_WORKFLOW_NAME)
       const reactOn = workflowRegistry.isEnabled(DOC_WORKFLOW_NAME)
       let agentStream = null
-      if (planOn && buildDocContext(agentDocId, agentText).resolveText().trim() && extractTaskIntents(query).length >= 2) {
+      if (planOn && buildDocContext(agentDocId, agentText, ctx.ownerId).resolveText().trim() && extractTaskIntents(query).length >= 2) {
         dbg(`[doc-processor] 复合任务 → 计划工作流（${DOC_PLAN_WORKFLOW_NAME}）`)
         agentStream = await runDocPlanAgent({ query, docId: agentDocId, text: agentText, history, signal: ctx.signal, ownerId: ctx.ownerId })
       } else if (reactOn) {
@@ -106,16 +112,62 @@ agentRegistry.registerAgent({
     // ---------- action 关键词路由（stub 兜底）----------
     return handleActionRouter({ query, history, req, res, sessionId, onAssistantDone, pipeStream, dbg, ctx })
   },
-})
+  },
+}
 
-// 通用对话兜底
-agentRegistry.registerAgent(defaultChatAgent)
+/**
+ * 合并注册：agents.db 的 spec 驱动（内置 → builtin handler；自定义 → genericAgentDef）。
+ * 停用（enabled=0）的 spec 不注册 → 路由兜底 default-chat。
+ * store 异常时降级为直接注册全部内置（库损坏不阻断服务）。
+ */
+export async function initAgentRegistry() {
+  try {
+    agentStore.seedBuiltinAgents()
+    const specs = agentStore.listSpecs()
+    const registered = new Set()
+    for (const s of specs) {
+      if (!s.enabled) continue
+      if (s.runtime === 'builtin') {
+        const def = builtinHandlers[s.builtinRef || s.id]
+        if (def) {
+          agentRegistry.registerAgent(def)
+          registered.add(s.id)
+        }
+      } else {
+        agentRegistry.registerAgent(genericAgentDef(s))
+        registered.add(s.id)
+      }
+    }
+    // 兜底：seed 缺行（旧库升级/手动删行）时内置 handler 仍可用
+    for (const [id, def] of Object.entries(builtinHandlers)) {
+      if (!registered.has(id)) agentRegistry.registerAgent(def)
+    }
+    log.info(`[Chat] 智能体注册完成：spec 驱动 ${specs.filter((s) => s.enabled).length} 个`)
+  } catch (err) {
+    log.error(`[Chat] agentStore 不可用，降级为内置直注册：${err.message}`)
+    for (const def of Object.values(builtinHandlers)) agentRegistry.registerAgent(def)
+  }
+}
 
-// 简历分析（上传/粘贴简历 → 结构化报告卡片）
-agentRegistry.registerAgent(resumeAnalysisAgent)
+/**
+ * 热同步单个智能体到运行时注册表（agentStore CRUD 变更回调）。
+ * 未启用/已删除 → 注销（dispatch 兜底 default-chat）；builtin → 复用内置 handler；自定义 → genericAgentDef。
+ * 回调异常已在 agentStore.emitSpecChange 内吞掉，这里无需再包一层。
+ */
+export function syncAgentRuntime(agentId) {
+  agentRegistry.unregisterAgent(agentId)
+  const s = agentStore.findSpec(agentId)
+  if (!s || !s.enabled) return
+  if (s.runtime === 'builtin') {
+    const def = builtinHandlers[s.builtinRef || s.id]
+    if (def) agentRegistry.registerAgent(def)
+  } else {
+    agentRegistry.registerAgent(genericAgentDef(s))
+  }
+}
 
-// 模拟面试（技术栈定向多轮问答 + 结束评分卡）
-agentRegistry.registerAgent(mockInterviewAgent)
+// 订阅 store 变更：管理 API 新建/更新/删除/启停后立即热生效，无需重启
+agentStore.onSpecChange(syncAgentRuntime)
 
 export const chatRouter = Router()
 
@@ -189,6 +241,43 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
       } catch (err) {
         log.error({ msg: err.message, stack: err.stack }, `[Chat] 会话 ${sid} 追加 assistant 消息失败`)
       }
+
+      // P1 反思回路：生成后快信号评估 + 落 reflection_log（纯启发式零 IO，不影响响应）
+      try {
+        if (tunables.reflection?.enabled) {
+          // 从引用注解提取最高切片相似度与引用条数（search_results 类型）
+          let top1Score = null
+          let citations = 0
+          for (const a of annotations ?? []) {
+            if (a?.type === 'search_results' && Array.isArray(a.results)) {
+              citations += a.results.length
+              for (const r of a.results) {
+                const s = Number(r.score)
+                if (Number.isFinite(s) && (top1Score === null || s > top1Score)) top1Score = s
+              }
+            }
+          }
+          const verdict = evaluateAnswer({
+            question: query,
+            answer: fullText,
+            top1Score,
+            citations,
+            ragExpected: citations > 0 || annotations?.some?.((a) => a?.type === 'search_results'),
+          })
+          sessionStore.addReflection({
+            sessionId: sid,
+            question: query,
+            score: verdict.score,
+            action: verdict.action,
+            issues: verdict.issues,
+            top1Score,
+            citations,
+            answerChars: fullText.length,
+          })
+        }
+      } catch (err) {
+        log.warn(`[Chat] 反思评估失败（不影响响应）：${err.message}`)
+      }
     }
 
     // M2 会话记忆：dispatch 前召回（滚动摘要 + 长期事实）→ 注入 ctx.memoryBlock。
@@ -197,6 +286,30 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
 
     // ---------- 通过 agentRegistry 分发 ----------
     const agentDef = agentRegistry.resolveAgent(safeAgentName)
+
+    // ---------- P2 ReAct 自主规划（复合目标路由，先于智能体分发） ----------
+    // 只对通用/RAG 类智能体生效，不劫持 doc-processor（有自己的双工作流）、
+    // 模拟面试、简历分析等专项交互流程。三开关全开才触发：
+    // tunables.react.enabled + workflow react-planner 启用 + isCompositeGoal 命中。
+    const reactEligible =
+      !agentDef || agentDef.id === 'knowledge-base' || agentDef.id === 'default-chat'
+    if (
+      reactEligible &&
+      tunables.react?.enabled &&
+      workflowRegistry.isEnabled(REACT_WORKFLOW_NAME) &&
+      isCompositeGoal(query)
+    ) {
+      dbg(`[Chat] 复合目标 → ReAct 自主规划器`)
+      return pipeStream(
+        res,
+        await runReactPlanner({
+          query, history, signal: upstreamAbort.signal,
+          ownerId: userId, sessionId: sid,
+        }),
+        { sessionId: sid, onAssistantText: onAssistantDone },
+      )
+    }
+
     if (!agentDef) {
       log.warn(`[Chat] 未找到智能体 "${safeAgentName}"，使用默认对话`)
       return pipeStream(
@@ -207,10 +320,11 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
     }
 
     // 构造共享 ctx，供 agent handler 消费
+    // ownerId：知识/题库检索的隔离键；admin = '*' 聚合全部用户数据（可见性策略）
     const ctx = {
       query, history, techStack: techStackArr, sessionId: sid, onAssistantDone,
       agentId: agentDef.id, memoryBlock, signal: upstreamAbort.signal,
-      ownerId: req.principal.userId,
+      ownerId: req.principal.role === 'admin' ? '*' : req.principal.userId,
       req, res, pipeStream, dbg,
       // L5+ 依赖（仅 doc-processor 需要，按需传入不影响其他 agent）
       workflowRegistry: undefined, runDocAgent: undefined, runDocPlanAgent: undefined,

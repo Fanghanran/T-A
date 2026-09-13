@@ -67,3 +67,31 @@ export function extractTaskIntents(query) {
   }
   return hits
 }
+
+/* ---------- ReAct 自主规划触发判定（通用 Agent 能力设计 P2） ---------- */
+
+/** 显式要求规划（最高置信，单条件即触发） */
+const EXPLICIT_PLANNING_RE = /自主规划|规划执行|一步步(执行|完成|处理)|分步(执行|处理)|用工具完成/i
+
+/** 目标动词（出现 ≥2 个不同的动词 + 连接词 → 复合目标） */
+const COMPOSITE_VERB_RE = /检索|查一下|查查|搜索|查找|整理|总结|提炼|归纳|记住|写入记忆|生成|列出|对比|分析|翻译/
+
+/** 步骤连接词 */
+const COMPOSITE_CONNECTOR_RE = /然后|接着|之后|再|最后|并且|同时/
+
+/**
+ * 判断用户消息是否为「复合任务」目标（ReAct 规划器触发条件）。
+ * 设计约束：启发式必须保守 —— 规划器会接管整轮对话，误触发比漏触发代价高。
+ *  ① 显式规划措辞（"一步步执行"、"自主规划"）→ 直接触发
+ *  ② ≥2 个目标动词 + 步骤连接词（"检索…然后写入记忆"）→ 触发
+ * 纯检索、闲聊、单动词指令一律不触发（走既有智能体链路）。
+ * @param {string} query 用户消息
+ * @returns {boolean}
+ */
+export function isCompositeGoal(query) {
+  const q = String(query ?? '').trim()
+  if (q.length < 6) return false
+  if (EXPLICIT_PLANNING_RE.test(q)) return true
+  const verbs = new Set(q.match(new RegExp(COMPOSITE_VERB_RE.source, 'g')) ?? [])
+  return verbs.size >= 2 && COMPOSITE_CONNECTOR_RE.test(q)
+}

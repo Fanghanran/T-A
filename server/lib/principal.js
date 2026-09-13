@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { childLogger } from './logger.js'
+import { verifyAccessToken } from './auth/jwt.js'
 
 /**
  * principal —— 用户主体抽象（M5a / ADR-008 B 部分，L0 基础设施）
@@ -26,9 +27,15 @@ export const LOCAL_USER_ID = 'local'
 
 const USER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/
 
-/** 用户体系是否启用（false = 全部请求视为 local 单一用户） */
+/** 认证模式（disabled | user-token | jwt） */
+export function authMode() {
+  return String(process.env.AUTH_MODE || '').trim().toLowerCase() || 'disabled'
+}
+
+/** 用户体系是否启用（jwt / user-token 两档都启用数据隔离守卫；false = 全部请求视为 local 单一用户） */
 export function usersEnabled() {
-  return String(process.env.AUTH_MODE || '').trim().toLowerCase() === 'user-token'
+  const m = authMode()
+  return m === 'user-token' || m === 'jwt'
 }
 
 function sha256(s) {
@@ -70,15 +77,24 @@ function tokenEqual(a, b) {
 
 /**
  * 从请求解析用户主体。
- * @returns {{userId: string}|null} disabled 模式恒为 local；user-token 模式下令牌无效返回 null
+ * - disabled：恒为 local
+ * - user-token：静态令牌（users.json，sha256）
+ * - jwt：JWT 优先（accounts.json，密码/OAuth 账号），无效时回退静态令牌（平滑迁移旧令牌）
+ * @returns {{userId:string, role?:string}|null} 模式关闭时恒为 local；启用模式下令牌无效返回 null
  */
 export function principalOf(req) {
-  if (!usersEnabled()) return { userId: LOCAL_USER_ID }
+  const mode = authMode()
+  if (mode === 'disabled') return { userId: LOCAL_USER_ID }
   const header = req.get('authorization') || ''
   const supplied = header.toLowerCase().startsWith('bearer ')
     ? header.slice(7).trim()
     : req.get('x-user-token')
   if (!supplied) return null
+  // jwt 模式：先验 JWT（携带 role），失败回退静态令牌（旧 users.json 令牌平滑过渡）
+  if (mode === 'jwt') {
+    const payload = verifyAccessToken(supplied)
+    if (payload) return { userId: payload.sub, role: payload.role ?? 'member' }
+  }
   const hash = sha256(supplied)
   const user = loadUsers().find((u) => u.tokenHash && !u.revokedAt && tokenEqual(u.tokenHash, hash))
   return user ? { userId: user.userId } : null

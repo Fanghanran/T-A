@@ -304,70 +304,116 @@ const SEED_QUESTIONS = [
   },
 ]
 
-// ========== 内存状态 ==========
-let questions = []
-let seq = 0
-let _loaded = false
-let _saveTimer = null
+// ========== 内存状态（per-owner 题库；'*' = admin 聚合视图） ==========
+// 存储：data/interview/questions/<ownerId>.json（ownerId 仅允许字母数字_-，防路径穿越）
+// 旧版全局 questions.json 首次加载时自动迁移为 questions/admin.json
+const BANKS_DIR = path.join(DATA_DIR, 'questions')
+const LEGACY_FILE = QUESTIONS_FILE
+const OWNER_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 
-// ========== 持久化 ==========
-function scheduleSave() {
-  if (_saveTimer) clearTimeout(_saveTimer)
-  _saveTimer = setTimeout(() => {
-    _saveTimer = null
-    try {
-      writeJsonAtomic(QUESTIONS_FILE, { seq, questions })
-    } catch (err) {
-      log.error({ details: err.message }, '[questionBank] 保存失败')
+const banks = new Map() // ownerId → { questions, seq, saveTimer }
+
+function assertOwner(ownerId) {
+  if (!OWNER_ID_RE.test(String(ownerId))) {
+    throw new Error(`questionBank: 非法 ownerId：${ownerId}`)
+  }
+  return ownerId
+}
+
+function bankFile(ownerId) {
+  return path.join(BANKS_DIR, `${assertOwner(ownerId)}.json`)
+}
+
+function migrateLegacyFile() {
+  try {
+    if (!fs.existsSync(LEGACY_FILE)) return
+    fs.mkdirSync(BANKS_DIR, { recursive: true })
+    const adminFile = path.join(BANKS_DIR, 'admin.json')
+    if (!fs.existsSync(adminFile)) {
+      fs.renameSync(LEGACY_FILE, adminFile)
+      log.info('[questionBank] 旧版全局题库已迁移 → questions/admin.json')
+    } else {
+      fs.renameSync(LEGACY_FILE, `${LEGACY_FILE}.migrated`)
+      log.info('[questionBank] 旧版全局题库已存在迁移产物，改名保留为 questions.json.migrated')
     }
+  } catch (err) {
+    log.warn(`[questionBank] 旧题库迁移失败（${err.message}），忽略`)
+  }
+}
+
+function readBankFile(ownerId) {
+  const raw = readJsonSafe(bankFile(ownerId), null)
+  if (raw && Array.isArray(raw.questions)) {
+    return { questions: raw.questions, seq: Number(raw.seq) || raw.questions.length }
+  }
+  return null
+}
+
+function writeBank(ownerId, bank) {
+  try {
+    fs.mkdirSync(BANKS_DIR, { recursive: true })
+    writeJsonAtomic(bankFile(ownerId), { seq: bank.seq, questions: bank.questions })
+  } catch (err) {
+    log.error(`[questionBank] 保存 ${ownerId} 题库失败：${err.message}`)
+  }
+}
+
+const seedDisabled = (process.env.QUESTION_SEED ?? '').trim().toLowerCase() === 'off'
+
+function bankOf(ownerId) {
+  assertOwner(ownerId)
+  let bank = banks.get(ownerId)
+  if (bank) return bank
+  const loaded = readBankFile(ownerId)
+  if (loaded) {
+    bank = loaded
+  } else {
+    // 新 owner：空题库 + 自动灌入种子题（QUESTION_SEED=off 时不灌）
+    bank = { questions: [], seq: 0 }
+    if (!seedDisabled && SEED_QUESTIONS.length > 0) {
+      bank.questions = SEED_QUESTIONS.map((q) => ({ ...q }))
+      bank.seq = bank.questions.length
+    }
+    writeBank(ownerId, bank)
+    log.info(`[questionBank] 初始化 ${ownerId} 题库：${bank.questions.length} 题`)
+  }
+  banks.set(ownerId, bank)
+  return bank
+}
+
+/** '*'（admin 聚合视图）：合并全部已落盘题库（只读；跨 owner id 可能重复，仅展示用） */
+function mergedQuestions() {
+  const out = []
+  for (const f of fs.existsSync(BANKS_DIR) ? fs.readdirSync(BANKS_DIR) : []) {
+    if (!f.endsWith('.json')) continue
+    const raw = readJsonSafe(path.join(BANKS_DIR, f), null)
+    if (raw && Array.isArray(raw.questions)) out.push(...raw.questions)
+  }
+  for (const bank of banks.values()) out.push(...bank.questions)
+  return out
+}
+
+function scheduleSave(ownerId) {
+  const bank = banks.get(ownerId)
+  if (!bank) return
+  if (bank.saveTimer) clearTimeout(bank.saveTimer)
+  bank.saveTimer = setTimeout(() => {
+    bank.saveTimer = null
+    writeBank(ownerId, bank)
   }, 300)
 }
 
-export function flushSync() {
-  if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null }
-  try { writeJsonAtomic(QUESTIONS_FILE, { seq, questions }) } catch {}
+function flushAllSync() {
+  for (const [ownerId, bank] of banks) {
+    if (bank.saveTimer) { clearTimeout(bank.saveTimer); bank.saveTimer = null }
+    writeBank(ownerId, bank)
+  }
 }
 
+/** 兼容旧调用（启动自检/健康检查聚合口径） */
 export function load() {
-  if (_loaded) return stats()
-  ensureDir()
-  const raw = readJsonSafe(QUESTIONS_FILE, null)
-  if (raw && Array.isArray(raw.questions)) {
-    questions = raw.questions
-    seq = Number(raw.seq) || questions.length
-    log.info(`[questionBank] 已从磁盘加载题库：${questions.length} 题（存储于 ${DATA_DIR}）`)
-  } else {
-    // 首次启动：空题库，等待用户通过上传/接口添加
-    questions = []
-    seq = 0
-    try {
-      writeJsonAtomic(QUESTIONS_FILE, { seq, questions })
-      log.info(`[questionBank] 首次启动：已写入空题库 → ${QUESTIONS_FILE}（后续通过上传/接口添加题目）`)
-    } catch (err) {
-      log.warn({ details: err.message }, '[questionBank] 空题库落盘失败')
-    }
-  }
-
-  // 空题库自动灌入内置种子题。
-  // 历史问题：SEED_QUESTIONS 定义后从未被引用，questions.json 恒为 {"seq":0,"questions":[]}，
-  // 导致面试题检索的「结构化题库」一路召回恒为 0 条 —— 双路召回实际只有知识库一路在供料。
-  // 开关：环境变量 QUESTION_SEED=off 时禁用自动灌入（清空题库后重启不会回来）。
-  const seedDisabled = (process.env.QUESTION_SEED ?? '').trim().toLowerCase() === 'off'
-  if (seedDisabled) {
-    log.info('[questionBank] QUESTION_SEED=off，跳过内置种子题灌入')
-  } else if (questions.length === 0 && Array.isArray(SEED_QUESTIONS) && SEED_QUESTIONS.length > 0) {
-    questions = SEED_QUESTIONS.map((q) => ({ ...q }))
-    seq = questions.length
-    try {
-      writeJsonAtomic(QUESTIONS_FILE, { seq, questions })
-      log.info(`[questionBank] 空题库已灌入 ${questions.length} 道内置种子题`)
-    } catch (err) {
-      log.warn({ details: err.message }, '[questionBank] 种子题库落盘失败（仅内存生效）')
-    }
-  }
-
-  _loaded = true
-  return stats()
+  migrateLegacyFile()
+  return stats('*')
 }
 
 // ========== 检索 ==========
@@ -380,9 +426,10 @@ function tokenize(text) {
 }
 
 /**
- * 结构化面试题检索
+ * 结构化面试题检索（per-owner）
  * @param {string} q            用户关键词
  * @param {Object} opts
+ * @param {string}  opts.ownerId 必填：用户 id；'*' = admin 聚合；非法/缺失 → 空结果（fail-closed）
  * @param {string[]} [opts.techStack] 与 TECH_STACK_OPTIONS 对齐，命中 category/tag 加分
  * @param {string}   [opts.difficulty] 简单/中等/困难
  * @param {string}   [opts.company]
@@ -392,10 +439,12 @@ function tokenize(text) {
  */
 export function search(q, opts = {}) {
   const { techStack = [], difficulty, company, tag, limit = 5 } = opts
+  const ownerId = opts.ownerId
+  if (ownerId !== '*' && !OWNER_ID_RE.test(String(ownerId))) return [] // fail-closed
   const qTokens = tokenize(q)
 
   // 先按精确过滤缩范围
-  let pool = questions
+  let pool = ownerId === '*' ? mergedQuestions() : bankOf(ownerId).questions
   if (difficulty) pool = pool.filter((x) => x.difficulty === difficulty)
   if (company)    pool = pool.filter((x) => x.company?.includes(company))
   if (tag)        pool = pool.filter((x) => x.tags?.includes(tag))
@@ -437,7 +486,7 @@ export function search(q, opts = {}) {
   }
 
   const sorted = [...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
-  const byId = new Map(questions.map((q) => [q.id, q]))
+  const byId = new Map(pool.map((q) => [q.id, q]))
 
   // 归一化到 0~1（最大为 1）
   const maxRaw = sorted.length ? sorted[0][1] : 1
@@ -460,22 +509,34 @@ export function search(q, opts = {}) {
   })
 }
 
-// ========== 增删改查（后台/未来管理端 API 用） ==========
-export function listQuestions({ category, difficulty } = {}) {
-  let items = [...questions]
+// ========== 增删改查（interview 路由 / 管理端用，均 per-owner） ==========
+
+/**
+ * 列出题目。
+ * @param {{category?:string, difficulty?:string, ownerId:string}} opts ownerId 必填；'*' = admin 聚合
+ */
+export function listQuestions({ category, difficulty, ownerId } = {}) {
+  let items = ownerId === '*' ? mergedQuestions() : OWNER_ID_RE.test(String(ownerId)) ? [...bankOf(ownerId).questions] : []
   if (category) items = items.filter((q) => q.category === category)
   if (difficulty) items = items.filter((q) => q.difficulty === difficulty)
   return items
 }
 
-export function getQuestion(id) {
-  return questions.find((q) => q.id === id) || null
+export function getQuestion(id, ownerId) {
+  if (ownerId === '*') return mergedQuestions().find((q) => q.id === id) || null
+  if (!OWNER_ID_RE.test(String(ownerId))) return null
+  return bankOf(ownerId).questions.find((q) => q.id === id) || null
 }
 
-export function addQuestion(data) {
-  seq += 1
+/** 新增题目（写入 ownerId 自己的题库；'*' 不允许写入） */
+export function addQuestion(data, ownerId) {
+  if (ownerId === '*' || !OWNER_ID_RE.test(String(ownerId))) {
+    throw new Error('questionBank.addQuestion 需要具体 ownerId（不允许聚合视图写入）')
+  }
+  const bank = bankOf(ownerId)
+  bank.seq += 1
   const q = {
-    id: `q_${seq}`,
+    id: `q_${bank.seq}`,
     title: data.title,
     category: data.category || '',
     tags: data.tags || [],
@@ -485,32 +546,36 @@ export function addQuestion(data) {
     answer: data.answer || '',
     analysis: data.analysis || '',
   }
-  questions.push(q)
-  scheduleSave()
+  bank.questions.push(q)
+  scheduleSave(ownerId)
   return q
 }
 
-export function deleteQuestion(id) {
-  const idx = questions.findIndex((q) => q.id === id)
-  if (idx >= 0) { questions.splice(idx, 1); scheduleSave(); return true }
+export function deleteQuestion(id, ownerId) {
+  if (ownerId === '*' || !OWNER_ID_RE.test(String(ownerId))) return false
+  const bank = bankOf(ownerId)
+  const idx = bank.questions.findIndex((q) => q.id === id)
+  if (idx >= 0) { bank.questions.splice(idx, 1); scheduleSave(ownerId); return true }
   return false
 }
 
-export function stats() {
+/** 统计（'*' = 全库聚合；健康检查自检用 '*'） */
+export function stats(ownerId = '*') {
+  const all = ownerId === '*' ? mergedQuestions() : OWNER_ID_RE.test(String(ownerId)) ? bankOf(ownerId).questions : []
   const byCategory = new Map()
-  for (const q of questions) {
+  for (const q of all) {
     byCategory.set(q.category, (byCategory.get(q.category) || 0) + 1)
   }
   return {
-    total: questions.length,
+    total: all.length,
     byCategory: [...byCategory.entries()].map(([name, count]) => ({ name, count })),
   }
 }
 
-// 自动加载 + 退出兜底
-load()
+// 启动迁移 + 退出兜底
+migrateLegacyFile()
 try {
-  process.on('exit', flushSync)
-  process.on('SIGINT',  () => { try { flushSync() } catch {}; process.exit(130) })
-  process.on('SIGTERM', () => { try { flushSync() } catch {}; process.exit(143) })
+  process.on('exit', flushAllSync)
+  process.on('SIGINT',  () => { try { flushAllSync() } catch {}; process.exit(130) })
+  process.on('SIGTERM', () => { try { flushAllSync() } catch {}; process.exit(143) })
 } catch { /* 非 Node 环境忽略 */ }

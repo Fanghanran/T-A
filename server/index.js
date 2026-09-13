@@ -35,13 +35,18 @@ import { metricsRouter } from './routes/metrics.js'
 import { sessionsRouter } from './routes/sessions.js'
 import { interviewRouter } from './routes/interview.js'
 import { knowledgeRouter } from './routes/knowledge.js'
+import filesRouter from './routes/files.js'
 import { docProcessorRouter } from './routes/docProcessor.js'
 import { resumeRouter } from './routes/resume.js'
-import { chatRouter } from './routes/chat.js'
+import { chatRouter, initAgentRegistry } from './routes/chat.js'
+import { agentsRouter } from './routes/agents.js'
+import { authRouter } from './routes/auth.js'
+import sttRouter from './routes/stt.js'
 import managementRouter from './lib/management/manager.js'
 
 // ── 工作流注册副作用导入：确保路由处理请求前，工具/工作流均已注册到管理注册表 ──
 import './lib/tools/docTools.js'
+import './lib/tools/knowledgeTools.js' // 知识工具注册（与 docTools 同惯例：入口统一触发）
 import './lib/workflows/docWorkflow.js'
 import './lib/workflows/docPlanWorkflow.js'
 
@@ -82,6 +87,8 @@ app.use(express.json({ limit: '8mb' }))
 // ── 路由挂载（顺序无关：各 Router 内部使用绝对路径）──
 app.use(healthRouter) // / 、/api/health（健康探针不要求用户主体）
 app.use(metricsRouter) // /api/metrics（运行指标快照：纯计数/延迟统计，与 health 同级公开）
+app.use(authRouter) // /api/auth/*（公开认证端点；爆破限流在 routes/auth.js 内按端点下沉——me 不占爆破桶）
+app.use(sttRouter) // /api/stt（语音转文字：转发 OpenAI 兼容转写端点）
 // M5a 用户主体守卫（ADR-008）：AUTH_MODE=disabled 时所有请求视为 local 单一用户（零回归）；
 // M5b：把当前 principal 放进 AsyncLocalStorage，使请求链路中任意深度的
 // appendAudit 都能自动带上 ownerId（16 处调用点无需改动）。
@@ -92,10 +99,11 @@ app.use((req, res, next) => {
   runWithActor(p, () => next())
 })
 
-// user-token 模式下除 health/management 外的 /api 路由必须携带有效用户令牌，跨用户数据互相不可见。
-// management 路由走 adminAuth（管理员令牌），不在此守卫范围内。
+// user-token / jwt 模式下除 health/management/auth 外的 /api 路由必须携带有效凭据，
+// 跨用户数据互相不可见。management 路由走 adminAuth，auth 路由本身就是认证入口。
 app.use('/api', (req, res, next) => {
   if (req.path.startsWith('/management')) return next()
+  if (req.path.startsWith('/auth')) return next()
   if (principal.usersEnabled()) return principal.requireUser(req, res, next)
   req.principal = { userId: principal.LOCAL_USER_ID }
   next()
@@ -108,6 +116,8 @@ app.use(knowledgeRouter) // /api/knowledge/* + /api/search/query
 app.use(docProcessorRouter) // /api/doc-processor/*
 app.use(resumeRouter) // /api/resume/*（简历解析，供简历分析智能体）
 app.use(chatRouter) // /api/chat
+app.use(agentsRouter) // /api/agents（前端智能体注册表数据源）
+app.use(filesRouter) // /api/files/*（v3 文件管理：文件树 / 切片目录 / 正文 / 原件下载）
 app.use('/api/management', rateLimiters.management, adminAuth, managementRouter) // 管理接口受管理员认证与限流保护
 // ---------- 404 兜底：未匹配路由返回 JSON ----------
 app.use((req, res) => {
@@ -263,6 +273,8 @@ async function bootstrap() {
     setTimeout(() => process.exit(1), 150).unref?.()
     return
   }
+  // P1：Agent Spec 注册（agents.db seed + 合并注册），失败内部已降级为内置直注册，不阻断启动
+  await initAgentRegistry()
   tryListen(BASE_PORT)
 }
 
