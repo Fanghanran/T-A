@@ -326,10 +326,13 @@ chatRouter.post('/api/chat', rateLimiters.chat, validateChatBody, async (req, re
       agentId: agentDef.id, memoryBlock, signal: upstreamAbort.signal,
       ownerId: req.principal.role === 'admin' ? '*' : req.principal.userId,
       req, res, pipeStream, dbg,
-      // L5+ 依赖（仅 doc-processor 需要，按需传入不影响其他 agent）
-      workflowRegistry: undefined, runDocAgent: undefined, runDocPlanAgent: undefined,
+      // L5+ 依赖（doc-processor/generic react 需要：workflowRegistry 全量注入，其余按需）
+      workflowRegistry,
       streamOpReport: undefined, buildDocContext: undefined, extractTaskIntents: undefined,
       DOC_WORKFLOW_NAME, DOC_PLAN_WORKFLOW_NAME,
+    }
+    if (agentDef.id === 'doc-processor' || agentDef.type === 'custom') {
+      ctx.runReactPlanner = runReactPlanner
     }
     if (agentDef.id === 'doc-processor') {
       ctx.workflowRegistry = workflowRegistry

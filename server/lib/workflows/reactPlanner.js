@@ -72,15 +72,23 @@ function withTimeout(promise, ms, label) {
 }
 
 /** System Prompt 的工具白名单块（只列 category='react' 且启用中的工具） */
-function buildToolListBlock() {
-  const tools = toolRegistry.listEnabled().filter((t) => t.category === 'react')
+/** 本次运行的 react 工具集：category='react' 且启用；toolFilter（自定义智能体挂工具）存在时取交集 */
+function reactTools(toolFilter) {
+  const base = toolRegistry.listEnabled().filter((t) => t.category === 'react')
+  if (!Array.isArray(toolFilter) || toolFilter.length === 0) return base
+  const want = new Set(toolFilter.map(String))
+  return base.filter((t) => want.has(t.name))
+}
+
+function buildToolListBlock(toolFilter) {
+  const tools = reactTools(toolFilter)
   if (!tools.length) return '（当前没有可用工具）'
   return tools.map((t) => `- ${t.name}：${t.description}。参数：${t.params || '无'}`).join('\n')
 }
 
 /** 白名单：ReAct 可用工具名集合（每次调用重算，管理端禁用即时生效） */
-function allowedTools() {
-  return new Set(toolRegistry.listEnabled().filter((t) => t.category === 'react').map((t) => t.name))
+function allowedTools(toolFilter) {
+  return new Set(reactTools(toolFilter).map((t) => t.name))
 }
 
 function reactStepAnnotation({ seq, tool, args, thought, observation, ms }) {
@@ -89,12 +97,12 @@ function reactStepAnnotation({ seq, tool, args, thought, observation, ms }) {
 
 /* ===================== System Prompt ===================== */
 
-function buildSystemPrompt() {
+function buildSystemPrompt(toolFilter) {
   return [
     '你是自主规划智能体（ReAct）。通过「思考 → 选工具 → 观察」循环完成用户目标。',
     '',
     '## 可用工具',
-    buildToolListBlock(),
+    buildToolListBlock(toolFilter),
     '',
     '## 输出格式（严格 JSON，不要输出任何其他文本）',
     '{"thought":"当前分析与下一步理由（简明）","action":"工具名 或 finish","args":{},"result":""}',
@@ -133,7 +141,7 @@ function buildStepPrompt({ goal, history, steps }) {
  * @param {{ query:string, history?:Array, signal?:AbortSignal, ownerId:string, sessionId?:string }} params
  * @returns {Promise<ReadableStream<Uint8Array>>} AI SDK data-stream 协议流
  */
-export async function runReactPlanner({ query, history = [], signal, ownerId, sessionId }) {
+export async function runReactPlanner({ query, history = [], signal, ownerId, sessionId, toolFilter, agentId = PLANNER_AGENT_ID } = {}) {
   return new ReadableStream({
     async start(controller) {
       const { emitText, emitAnnotation, emitDone } = createEmitters(controller)
@@ -150,7 +158,7 @@ export async function runReactPlanner({ query, history = [], signal, ownerId, se
 
       try {
         emitText(`收到，我来规划执行这个任务（最多 ${maxSteps} 步）。\n\n`)
-        const allowed = allowedTools()
+        const allowed = allowedTools(toolFilter)
 
         for (let i = 1; i <= maxSteps; i++) {
           // —— 熔断 3：总预算 ——
@@ -166,9 +174,9 @@ export async function runReactPlanner({ query, history = [], signal, ownerId, se
           try {
             const { text } = await withTimeout(
               generateText({
-                model: getChatModel({ role: PLANNER_ROLE, agentId: PLANNER_AGENT_ID }),
+                model: getChatModel({ role: PLANNER_ROLE, agentId }),
                 abortSignal: signal,
-                system: buildSystemPrompt(),
+                system: buildSystemPrompt(toolFilter),
                 prompt: buildStepPrompt({ goal: query, history, steps }),
               }),
               stepTimeoutMs,
@@ -248,7 +256,7 @@ export async function runReactPlanner({ query, history = [], signal, ownerId, se
           let summary = ''
           try {
             const { text } = await generateText({
-              model: getChatModel({ role: PLANNER_ROLE, agentId: PLANNER_AGENT_ID }),
+              model: getChatModel({ role: PLANNER_ROLE, agentId }),
               abortSignal: signal,
               system: '你根据已执行的部分步骤结果，用中文简要说明：已完成什么、得到哪些中间结论、因中止还剩什么没做。3 句以内，不编造。',
               prompt: `用户目标：${query}\n中止原因：${aborted}\n\n已执行步骤：\n${steps

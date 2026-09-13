@@ -2,6 +2,7 @@ import * as React from 'react'
 import { MessageList } from '@/components/chat/MessageList'
 import { ChatInput } from '@/components/chat/ChatInput'
 import { SessionSidebar } from '@/components/chat/SessionSidebar'
+import { SessionReportDialog } from '@/components/chat/SessionReportDialog'
 import { DocActionBar } from '@/components/chat/DocActionBar'
 import { DocPreviewDialog } from '@/components/chat/DocPreviewDialog'
 import { DocExportDialog } from '@/components/chat/DocExportDialog'
@@ -113,6 +114,9 @@ export function ChatPage({
 
   // 简历分析：解析出的简历正文（由 ChatInput 上传回调写入，提交时经 body.resumeText 下发）
   const [resumeText, setResumeText] = React.useState('')
+  // 会话复盘报告
+  const [reportSessionId, setReportSessionId] = React.useState('')
+  const reportOpen = Boolean(reportSessionId)
   React.useEffect(() => {
     setResumeText('')
   }, [agentName])
@@ -159,6 +163,7 @@ export function ChatPage({
           await list.deleteSession(id)
         }}
         onRename={list.renameSession}
+        onReport={setReportSessionId}
       />
 
       {/* 右：对话区 */}
@@ -226,6 +231,13 @@ export function ChatPage({
           resumeText={isResume ? resumeText : undefined}
         />
 
+        <SessionReportDialog
+          sessionId={reportSessionId}
+          open={reportOpen}
+          onOpenChange={(o) => {
+            if (!o) setReportSessionId('')
+          }}
+        />
         <DocPreviewDialog
           open={dp.showPreviewDialog}
           onOpenChange={dp.setShowPreviewDialog}

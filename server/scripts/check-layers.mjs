@@ -64,7 +64,7 @@ const LAYERS = {
   'lib/workflows/docWorkflow.js': 7, 'lib/workflows/docPlanWorkflow.js': 7, 'lib/workflows/docWorkflowShared.js': 7, 'lib/workflows/reactPlanner.js': 7,
   // L8 HTTP
   'lib/management/manager.js': 8,
-  'routes/shared.js': 8, 'routes/health.js': 8, 'routes/sessions.js': 8, 'routes/interview.js': 8, 'routes/agents.js': 8, 'routes/auth.js': 8, 'routes/stt.js': 8,
+  'routes/shared.js': 8, 'routes/health.js': 8, 'routes/sessions.js': 8, 'routes/interview.js': 8, 'routes/agents.js': 8, 'routes/auth.js': 8, 'routes/stt.js': 8, 'routes/favorites.js': 8, 'routes/study.js': 8,
   'routes/knowledge.js': 8, 'routes/docProcessor.js': 8, 'routes/chat.js': 8, 'routes/resume.js': 8,
   'routes/metrics.js': 8,
   'routes/files.js': 8,

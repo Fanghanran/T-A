@@ -1,8 +1,9 @@
 import * as React from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { Bot, User } from 'lucide-react'
+import { Bot, User, Star, Volume2, Square } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { request } from '@/lib/api'
 import { SearchProcessPanel } from './SearchProcessPanel'
 import { ChunkPreviewPanel } from './ChunkPreviewPanel'
 import { AgentWorkflowPanel } from './AgentWorkflowPanel'
@@ -48,6 +49,54 @@ export function StreamingMessage({
   onAdjust,
 }) {
   const isUser = message.role === 'user'
+  const [favState, setFavState] = React.useState('idle') // idle | saving | saved
+
+  // 语音播报（浏览器内置 SpeechSynthesis，零后端依赖；中文音库优先）
+  const [speaking, setSpeaking] = React.useState(false)
+  // 组件卸载时停止朗读，避免切会话后语音继续
+  React.useEffect(() => () => window.speechSynthesis?.cancel(), [])
+  const speakMessage = () => {
+    const synth = window.speechSynthesis
+    if (!synth) return
+    if (speaking) {
+      synth.cancel()
+      setSpeaking(false)
+      return
+    }
+    const plain = String(message.content ?? '')
+      .replace(/```[\s\S]*?```/g, '（代码块）')
+      .replace(/[#*`>|]/g, '')
+      .slice(0, 3000)
+    const utter = new SpeechSynthesisUtterance(plain)
+    const zhVoice = synth.getVoices().find((v) => v.lang?.toLowerCase().startsWith('zh'))
+    if (zhVoice) utter.voice = zhVoice
+    utter.onend = () => setSpeaking(false)
+    utter.onerror = () => setSpeaking(false)
+    synth.speak(utter)
+    setSpeaking(true)
+  }
+
+  // 收藏本条回答到错题本（跨会话个人复习集）
+  const saveFavorite = async () => {
+    if (favState !== 'idle' || isUser) return
+    setFavState('saving')
+    try {
+      await request('/api/favorites', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: chatId,
+          messageId: message.id,
+          title: (message.content || '').replace(/[#*`>\-]/g, '').trim().slice(0, 60) || '收藏的回答',
+          content: message.content || '',
+        }),
+      })
+      setFavState('saved')
+    } catch (err) {
+      setFavState('idle')
+      log.error('[favorite] 收藏失败', err)
+    }
+  }
 
   // ① useChat 可能会把 data-stream 中的 2: 行注入到 annotations；兼容 experimental_attachments
   // ② runtimeAnnotations 查到的（useChat 之外手动缓存的 search_results Recall 过程元数据）
@@ -158,7 +207,7 @@ export function StreamingMessage({
   return (
     <div
       className={cn(
-        'flex w-full gap-3 animate-fade-in',
+        'group/message flex w-full gap-3 animate-fade-in',
         isUser ? 'justify-end' : 'justify-start',
       )}
     >
@@ -220,6 +269,35 @@ export function StreamingMessage({
               {streaming && (
                 <span className="ml-0.5 inline-block h-4 w-[2px] translate-y-0.5 bg-current animate-pulse" />
               )}
+            </div>
+          )}
+          {!isUser && !streaming && message.content && (
+            <div className="mt-1 flex justify-end gap-1">
+              <button
+                type="button"
+                onClick={speakMessage}
+                title={speaking ? '停止朗读' : '朗读回答'}
+                className={cn(
+                  'rounded p-1 text-[10px] text-muted-foreground opacity-0 transition-opacity group-hover/message:opacity-100 hover:text-foreground',
+                  speaking && 'opacity-100 text-primary',
+                )}
+              >
+                {speaking ? <Square className="h-3 w-3" /> : <Volume2 className="h-3.5 w-3.5" />}
+              </button>
+              <button
+                type="button"
+                onClick={saveFavorite}
+                disabled={favState === 'saving'}
+                title={favState === 'saved' ? '已收藏到错题本' : '收藏到错题本'}
+                className={cn(
+                  'rounded p-1 text-[10px] text-muted-foreground opacity-0 transition-opacity group-hover/message:opacity-100 hover:text-foreground',
+                  favState === 'saved' && 'opacity-100 text-amber-500',
+                )}
+              >
+                <Star
+                  className={cn('h-3.5 w-3.5', favState !== 'idle' && 'fill-current')}
+                />
+              </button>
             </div>
           )}
         </div>

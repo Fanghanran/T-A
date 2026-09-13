@@ -64,3 +64,17 @@ export async function renameSession(id, title) {
 export async function deleteSession(id) {
   return _request(`${BASE}/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
+
+/** 生成会话复盘报告（LLM 聚合，一次一存覆盖式） */
+export function generateSessionReport(id) {
+  return _request(`${BASE}/${encodeURIComponent(id)}/report`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  })
+}
+
+/** 读取已生成的复盘报告（无则 404） */
+export function getSessionReport(id) {
+  return _request(`${BASE}/${encodeURIComponent(id)}/report`)
+}

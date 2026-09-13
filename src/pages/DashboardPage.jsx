@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { useDocumentStats } from '@/hooks/useDocumentStats'
 import { KbStatsPanel } from '@/components/knowledge/KbStatsPanel'
+import { StudyPanel } from '@/components/dashboard/StudyPanel'
 
 /**
  * DashboardPage —— 仪表盘（独立菜单视图）
@@ -70,6 +71,7 @@ export function DashboardPage({ onLoadingChange }) {
       {/* 主体：统计面板（居中限宽，避免宽屏拉伸条形图过窄难比较） */}
       <div className="flex-1 overflow-auto scrollbar-thin">
         <div className="mx-auto max-w-5xl animate-page-in px-4 py-6 md:px-6">
+          <StudyPanel />
           <KbStatsPanel stats={statsState.stats} loading={loading} />
         </div>
       </div>

@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { Menu, Moon, Sun, CircleUserRound, LogOut, UserRoundCog } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { AGENT_STATUS, AGENT_STATUS_LABEL } from '@/lib/constants'
+import { Star } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTheme } from '@/hooks/useTheme'
 import { useAuth } from '@/hooks/useAuth'
@@ -110,7 +111,7 @@ function UserMenu() {
  * @param {string} props.status       连接状态（取自 AGENT_STATUS）
  * @param {() => void} [props.onOpenSidebar] 打开移动端抽屉
  */
-export function Header({ agent, status, onOpenSidebar }) {
+export function Header({ agent, status, onOpenSidebar, onOpenFavorites }) {
   const { theme, toggleTheme } = useTheme()
   const statusColor = {
     [AGENT_STATUS.ONLINE]: 'bg-emerald-500',
@@ -159,6 +160,18 @@ export function Header({ agent, status, onOpenSidebar }) {
       )}
 
       <div className="ml-auto flex items-center gap-1">
+        {onOpenFavorites && (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onOpenFavorites}
+            aria-label="我的收藏"
+            title="我的收藏（错题本）"
+            className="h-8 w-8 text-muted-foreground hover:text-foreground"
+          >
+            <Star className="h-4 w-4" />
+          </Button>
+        )}
         <UserMenu />
         <Button
           variant="ghost"

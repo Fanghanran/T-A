@@ -855,6 +855,7 @@ router.post('/agents', (req, res) => {
       greeting: req.body?.greeting,
       suggestions: req.body?.suggestions,
       sortOrder: req.body?.sortOrder,
+      tools: req.body?.tools,
     })
     appendAudit('agent.create', { target: spec.id, ownerId: me ?? spec.id })
     res.json({ ok: true, spec })
@@ -882,6 +883,41 @@ router.delete('/agents/:id', (req, res) => {
     const r = agentStore.deleteSpec(String(req.params.id ?? ''))
     appendAudit('agent.delete', { target: req.params.id, mode: r.mode, ownerId: me ?? req.params.id })
     res.json({ ok: true, ...r })
+  } catch (err) {
+    res.status(authErrStatus(err)).json({ error: err.message })
+  }
+})
+
+/** 导出 Agent Spec：GET /api/management/agents/:id/export（spec 本身无密钥，直接下发） */
+router.get('/agents/:id/export', (req, res) => {
+  try {
+    const spec = agentStore.findSpec(String(req.params.id ?? ''))
+    if (!spec) return res.status(404).json({ error: '智能体不存在' })
+    appendAudit('agent.export', { target: spec.id })
+    res.json({ version: agentStore.version(), exportedAt: new Date().toISOString(), spec })
+  } catch (err) {
+    res.status(503).json({ error: err.message })
+  }
+})
+
+/** 导入 Agent Spec：POST /api/management/agents/import  body: {spec, overwrite?}
+ *  overwrite=false（默认）：id 已存在时报 409；true：覆盖同 id 的自定义智能体（内置仍拒绝） */
+router.post('/agents/import', (req, res) => {
+  const me = currentActor()?.userId
+  try {
+    const spec = req.body?.spec
+    if (!spec || typeof spec !== 'object' || !spec.id) {
+      return res.status(400).json({ error: '缺少 spec（含 id）' })
+    }
+    const exists = agentStore.findSpec(String(spec.id))
+    if (exists && req.body?.overwrite !== true) {
+      return res.status(409).json({ error: `智能体 ${spec.id} 已存在；如需覆盖请携带 overwrite: true` })
+    }
+    const saved = exists
+      ? agentStore.updateSpec(String(spec.id), { ...spec, id: String(spec.id) })
+      : agentStore.createSpec({ ...spec })
+    appendAudit('agent.import', { target: saved.id, overwrite: Boolean(exists), ownerId: me ?? saved.id })
+    res.json({ ok: true, spec: saved, overwritten: Boolean(exists) })
   } catch (err) {
     res.status(authErrStatus(err)).json({ error: err.message })
   }

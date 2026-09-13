@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import * as sessionStore from '../lib/sessionStore.js'
+import { generateSessionReport } from '../lib/llm.js'
 import { jsonLimits } from './shared.js'
 
 /**
@@ -61,4 +62,28 @@ sessionsRouter.delete('/api/sessions/:id', (req, res) => {
   const ok = sessionStore.deleteSession(req.params.id, req.principal.userId)
   if (!ok) return res.status(404).json({ message: '会话不存在' })
   res.status(204).end()
+})
+
+// 生成会话复盘报告（LLM 聚合会话消息 + 逐题评分；一次一存覆盖式）
+sessionsRouter.post('/api/sessions/:id/report', jsonLimits.small, async (req, res) => {
+  const ownerId = req.principal.userId
+  const id = req.params.id
+  if (!sessionStore.getSession(id, ownerId)) return res.status(404).json({ message: '会话不存在' })
+  try {
+    const messages = sessionStore.getMessages(id, ownerId)
+    const reflections = sessionStore.listReflectionsBySession(id, ownerId)
+    const agentName = sessionStore.getSession(id, ownerId)?.agentName ?? ''
+    const report = await generateSessionReport({ messages, reflections, agentName })
+    sessionStore.saveSessionReport(id, ownerId, JSON.stringify(report))
+    res.json({ report, createdAt: new Date().toISOString() })
+  } catch (err) {
+    res.status(502).json({ message: `复盘生成失败：${err.message}` })
+  }
+})
+
+// 读取已生成的复盘报告（无则 404，前端可引导生成）
+sessionsRouter.get('/api/sessions/:id/report', (req, res) => {
+  const r = sessionStore.getSessionReport(req.params.id, req.principal.userId)
+  if (!r) return res.status(404).json({ message: '尚未生成复盘报告' })
+  res.json({ report: r.content, createdAt: r.createdAt })
 })

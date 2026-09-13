@@ -4,6 +4,7 @@ import {
   Trash2,
   MessageSquare,
   Pencil,
+  ClipboardList,
   Check,
   X,
   Loader2,
@@ -32,6 +33,7 @@ import { cn } from '@/lib/utils'
  * @param {()=>Promise<any>} props.onCreate
  * @param {(id:string)=>Promise<any>} props.onDelete
  * @param {(id:string,title:string)=>Promise<any>} props.onRename
+ * @param {(id:string)=>void} [props.onReport] 打开会话复盘报告
  */
 export function SessionSidebar({
   sessions = [],
@@ -41,6 +43,7 @@ export function SessionSidebar({
   onCreate,
   onDelete,
   onRename,
+  onReport,
 }) {
   const [creating, setCreating] = React.useState(false)
   const [editingId, setEditingId] = React.useState('')
@@ -227,6 +230,17 @@ export function SessionSidebar({
                             title="重命名"
                           >
                             <Pencil className="h-3 w-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              onReport?.(sess.id)
+                            }}
+                            className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                            title="复盘报告"
+                          >
+                            <ClipboardList className="h-3 w-3" />
                           </button>
                           <button
                             type="button"

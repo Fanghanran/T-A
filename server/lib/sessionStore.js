@@ -188,6 +188,33 @@ if (db) {
     })
     tx()
   }
+  if (currentVersion < 4) {
+    // v4：收藏夹（错题本）——跨会话的个人复习集；session_id 冗余用于溯源跳转
+    db.exec(`CREATE TABLE IF NOT EXISTS favorites (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      owner_id TEXT NOT NULL,
+      session_id TEXT NOT NULL DEFAULT '',
+      message_id TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '',
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`)
+    db.exec('CREATE INDEX IF NOT EXISTS idx_favorites_owner ON favorites(owner_id, created_at)')
+    db.prepare('INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES(4, ?)')
+      .run(new Date().toISOString())
+    log.info('[sessionStore] schema v4：favorites 收藏夹表')
+  }
+  if (currentVersion < 3) {
+    db.exec(`CREATE TABLE IF NOT EXISTS session_reports (
+      session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+      owner_id TEXT NOT NULL,
+      content_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`)
+    db.prepare('INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES(3, ?)')
+      .run(new Date().toISOString())
+    log.info('[sessionStore] schema v3：session_reports 复盘报告表')
+  }
   if (currentVersion < 2) {
     // v2（隔离加固）：① owner 过滤 + 排序走复合索引；② session_memory / reflection_log
     // 重建并挂外键级联——旧表无外键，删除会话后靠应用层记得清理（漏删即孤儿）；
@@ -504,6 +531,75 @@ export function setMemoryState(sessionId, ownerId, { summary, summaryUntilSeq, e
   stmtUpsertMemoryState.run(sessionId, summary ?? '', summaryUntilSeq ?? 0, extractUntilSeq ?? 0, now)
 }
 
+/* ---------- 复盘报告（功能：会话复盘，一次一存覆盖式） ---------- */
+
+const stmtUpsertReport = prepare(`
+  INSERT INTO session_reports(session_id, owner_id, content_json, created_at)
+  VALUES(?, ?, ?, ?)
+  ON CONFLICT(session_id) DO UPDATE SET
+    content_json = excluded.content_json,
+    owner_id = excluded.owner_id,
+    created_at = excluded.created_at
+`)
+const stmtGetReport = prepare('SELECT content_json, created_at FROM session_reports WHERE session_id = ? AND owner_id = ?')
+
+/** 保存会话复盘报告（覆盖式；owner 校验由调用方先行完成） */
+export function saveSessionReport(sessionId, ownerId, contentJson, createdAt) {
+  requireWritable()
+  if (!getSession(sessionId, ownerId)) throw new Error('会话不存在或无权访问')
+  stmtUpsertReport.run(sessionId, ownerId, contentJson, createdAt ?? new Date().toISOString())
+}
+
+/** 读取会话复盘报告（无则 null） */
+export function getSessionReport(sessionId, ownerId) {
+  const r = stmtGetReport.get(sessionId, ownerId)
+  if (!r) return null
+  try { return { content: JSON.parse(r.content_json), createdAt: r.created_at } }
+  catch (err) {
+    log.warn(`[sessionStore] 复盘报告 JSON 解析失败：${err.message}`)
+    return null
+  }
+}
+
+/* ---------- 收藏夹（错题本） ---------- */
+
+const stmtAddFavorite = prepare(`
+  INSERT INTO favorites(owner_id, session_id, message_id, title, content, created_at)
+  VALUES(?, ?, ?, ?, ?, ?)
+`)
+const stmtListFavorites = prepare(`
+  SELECT id, session_id AS sessionId, message_id AS messageId, title, content, created_at AS createdAt
+  FROM favorites WHERE owner_id = ? ORDER BY id DESC LIMIT ?
+`)
+const stmtGetFavorite = prepare('SELECT id, owner_id FROM favorites WHERE id = ? AND owner_id = ?')
+const stmtDeleteFavorite = prepare('DELETE FROM favorites WHERE id = ? AND owner_id = ?')
+
+/** 收藏一条内容（幂等不做——同内容重复收藏属用户自由） */
+export function addFavorite(ownerId, { sessionId = '', messageId = '', title = '', content }) {
+  requireWritable()
+  const text = String(content ?? '')
+  if (!text.trim()) throw new Error('收藏内容不能为空')
+  const info = stmtAddFavorite.run(
+    ownerId, String(sessionId ?? ''), String(messageId ?? ''),
+    String(title ?? '').slice(0, 200), text.slice(0, 20000), new Date().toISOString(),
+  )
+  return { id: Number(info.lastInsertRowid) }
+}
+
+/** 收藏列表（按 owner，新→旧） */
+export function listFavorites(ownerId, limit = 200) {
+  return stmtListFavorites.all(ownerId, Math.max(1, Math.min(500, Number(limit) || 200)))
+}
+
+/** 删除收藏（仅本人；返回是否删除成功） */
+export function deleteFavorite(id, ownerId) {
+  requireWritable()
+  const r = stmtGetFavorite.get(Number(id), ownerId)
+  if (!r) return false
+  stmtDeleteFavorite.run(Number(id), ownerId)
+  return true
+}
+
 export function getMessages(id, ownerId) {
   if (!ownerId) throw new Error('getMessages 需要 ownerId（越权防护）')
   const rows = stmtGetMessages.all(id, ownerId)
@@ -685,6 +781,94 @@ const stmtAddReflection = prepare(`
  * @param {{sessionId?: string, question: string, score: number, action: string, issues?: string[],
  *          top1Score?: number|null, citations?: number, answerChars?: number}} r
  */
+/** 按会话读取反思评分记录（复盘报告用；owner 校验后调用） */
+const stmtReflectionsBySession = prepare(`
+  SELECT question, score, action, issues, top1_score AS top1Score, citations, answer_chars AS answerChars, created_at AS createdAt
+  FROM reflection_log WHERE session_id = ? ORDER BY created_at ASC
+`)
+export function listReflectionsBySession(sessionId, ownerId) {
+  if (!getSession(sessionId, ownerId)) return []
+  return stmtReflectionsBySession.all(sessionId).map((r) => ({
+    question: r.question,
+    score: r.score,
+    action: r.action,
+    issues: (() => { try { return JSON.parse(r.issues ?? '[]') } catch { return [] } })(),
+    top1Score: r.top1Score,
+    citations: r.citations,
+    answerChars: r.answerChars,
+    createdAt: r.createdAt,
+  }))
+}
+
+/** 学习统计聚合（功能：学习进度与薄弱项追踪；全部经 sessions JOIN 做 owner 隔离） */
+const stmtStudySessions = prepare('SELECT COUNT(*) AS c FROM sessions WHERE owner_id = ?')
+const stmtStudyMessages = prepare(`
+  SELECT COUNT(*) AS c FROM messages m JOIN sessions s ON s.id = m.session_id WHERE s.owner_id = ?
+`)
+const stmtStudyByAgent = prepare(`
+  SELECT s.agentName AS agentName, COUNT(DISTINCT s.id) AS sessions, COUNT(m.id) AS messages
+  FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
+  WHERE s.owner_id = ? GROUP BY s.agentName ORDER BY messages DESC
+`)
+const stmtStudyActivity = prepare(`
+  SELECT substr(m.created_at, 1, 10) AS day, COUNT(*) AS c
+  FROM messages m JOIN sessions s ON s.id = m.session_id
+  WHERE s.owner_id = ? AND m.role = 'user' AND m.created_at >= datetime('now', '-13 days')
+  GROUP BY day ORDER BY day ASC
+`)
+const stmtStudyReflections = prepare(`
+  SELECT r.question, r.score, r.issues
+  FROM reflection_log r JOIN sessions s ON s.id = r.session_id
+  WHERE s.owner_id = ? ORDER BY r.id DESC LIMIT 200
+`)
+const stmtStudyFavorites = prepare('SELECT COUNT(*) AS c FROM favorites WHERE owner_id = ?')
+const stmtStudyFirstDay = prepare(`
+  SELECT MIN(created_at) AS first FROM sessions WHERE owner_id = ?
+`)
+
+export function studyStats(ownerId) {
+  if (!ownerId) throw new Error('studyStats 需要 ownerId（越权防护）')
+  const sessions = stmtStudySessions.get(ownerId)?.c ?? 0
+  const messages = stmtStudyMessages.get(ownerId)?.c ?? 0
+  const byAgent = stmtStudyByAgent.all(ownerId).filter((r) => r.agentName)
+  const activity = stmtStudyActivity.all(ownerId).map((r) => ({ day: r.day, count: r.c }))
+  const refls = stmtStudyReflections.all(ownerId).map((r) => {
+    let issues = []
+    try { issues = JSON.parse(r.issues ?? '[]') } catch { /* 脏数据按空 */ }
+    return { question: r.question, score: r.score, issues }
+  })
+  const scored = refls.filter((r) => Number.isFinite(r.score))
+  const avgScore = scored.length
+    ? Math.round((scored.reduce((s, r) => s + r.score, 0) / scored.length) * 10) / 10
+    : null
+  // 薄弱项：issue 标签计数 Top 6 + 低分问题列表 Top 5
+  const issueCounts = new Map()
+  for (const r of scored) {
+    if (r.score >= 60) continue
+    for (const it of r.issues) issueCounts.set(it, (issueCounts.get(it) ?? 0) + 1)
+  }
+  const topIssues = [...issueCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([label, count]) => ({ label, count }))
+  const lowQuestions = scored
+    .filter((r) => r.score < 60)
+    .slice(0, 5)
+    .map((r) => ({ question: String(r.question ?? '').slice(0, 80), score: r.score }))
+  return {
+    sessions,
+    messages,
+    byAgent,
+    activity,
+    favorites: stmtStudyFavorites.get(ownerId)?.c ?? 0,
+    avgScore,
+    evaluatedCount: scored.length,
+    topIssues,
+    lowQuestions,
+    startedAt: stmtStudyFirstDay.get(ownerId)?.first ?? null,
+  }
+}
+
 export function addReflection(r) {
   const info = stmtAddReflection.run(
     r.sessionId ?? '',

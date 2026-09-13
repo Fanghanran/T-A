@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Bot, Loader2, Plus, Pencil, Trash2, Lock } from 'lucide-react'
+import { Bot, Loader2, Plus, Pencil, Trash2, Lock, Download, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
@@ -9,6 +9,8 @@ import {
   createAgentSpec,
   updateAgentSpec,
   deleteAgentSpec,
+  exportAgent,
+  importAgent,
 } from '@/lib/managementApi'
 import { ICON_MAP } from '@/lib/agentRegistry'
 
@@ -20,7 +22,7 @@ import { ICON_MAP } from '@/lib/agentRegistry'
  * 保存成功后广播 agents:changed → AppShell 重拉注册表，侧栏即时生效。
  */
 
-const RUNTIME_LABEL = { builtin: '内置', chat: '对话', rag: '检索增强' }
+const RUNTIME_LABEL = { builtin: '内置', chat: '对话', rag: '检索增强', react: '工具智能体' }
 
 /** 广播注册表变更（AppShell 监听重拉；跨标签经 localStorage 版本号） */
 function notifyAgentsChanged() {
@@ -42,7 +44,8 @@ function AgentEditDialog({ spec, onClose, onDone }) {
     description: spec?.description ?? '',
     icon: spec?.icon ?? 'bot',
     aliases: (spec?.aliases ?? []).join(', '),
-    runtime: spec?.runtime === 'rag' ? 'rag' : 'chat',
+    runtime: ['chat', 'rag', 'react'].includes(spec?.runtime) ? spec.runtime : 'chat',
+    tools: (spec?.tools ?? []).join(', '),
     systemPrompt: spec?.systemPrompt ?? '',
     structuredInput: spec?.structuredInput ?? false,
   })
@@ -57,6 +60,7 @@ function AgentEditDialog({ spec, onClose, onDone }) {
     setBusy(true)
     try {
       const aliases = form.aliases.split(/[,，]/).map((s) => s.trim()).filter(Boolean)
+      const tools = form.runtime === 'react' ? form.tools.split(/[,，]/).map((t) => t.trim()).filter(Boolean) : []
       if (isEdit) {
         // 内置仅展示层字段；自定义额外允许 runtime/systemPrompt/structuredInput
         const patch = builtIn
@@ -64,14 +68,14 @@ function AgentEditDialog({ spec, onClose, onDone }) {
           : {
               name: form.name, description: form.description, icon: form.icon, aliases,
               runtime: form.runtime, systemPrompt: form.systemPrompt,
-              structuredInput: form.structuredInput,
+              structuredInput: form.structuredInput, tools,
             }
         await updateAgentSpec(spec.id, patch)
       } else {
         await createAgentSpec({
           id: form.id.trim(), name: form.name, description: form.description,
           icon: form.icon, aliases, runtime: form.runtime,
-          systemPrompt: form.systemPrompt, structuredInput: form.structuredInput,
+          systemPrompt: form.systemPrompt, structuredInput: form.structuredInput, tools,
         })
       }
       notifyAgentsChanged()
@@ -148,6 +152,7 @@ function AgentEditDialog({ spec, onClose, onDone }) {
                 {[
                   { key: 'chat', label: '对话', desc: '直接按人设回答' },
                   { key: 'rag', label: '检索增强', desc: '先查知识库再回答' },
+                  { key: 'react', label: '工具智能体', desc: '自主规划：查资料/写记忆' },
                 ].map((r) => (
                   <button
                     key={r.key}
@@ -166,6 +171,19 @@ function AgentEditDialog({ spec, onClose, onDone }) {
                 ))}
               </div>
             </div>
+
+            {form.runtime === 'react' && (
+              <div className="mt-3">
+                <label className="mb-1 block text-xs text-muted-foreground">
+                  工具白名单（逗号分隔；留空 = 全部可用。kb.search 检索知识库 / kb.documentInfo 文档信息 / memory.write 写长期记忆）
+                </label>
+                <Input
+                  value={form.tools}
+                  onChange={(e) => setForm((f) => ({ ...f, tools: e.target.value }))}
+                  placeholder="如：kb.search, memory.write"
+                />
+              </div>
+            )}
 
             <div className="mt-3">
               <label className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
@@ -274,6 +292,52 @@ export function AgentsManagePage({ onLoadingChange }) {
     }
   }
 
+  // 导出：拉取 spec 下载为 JSON 文件（可跨实例导入分享）
+  const doExport = async (spec) => {
+    setBusyId(spec.id)
+    setNotice('')
+    try {
+      const r = await exportAgent(spec.id)
+      const blob = new Blob([JSON.stringify(r, null, 2)], { type: 'application/json' })
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = `agent-${spec.id}.json`
+      a.click()
+      URL.revokeObjectURL(a.href)
+      setNotice(`已导出 ${spec.name}`)
+    } catch (err) {
+      setNotice(err?.message || '导出失败')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  // 导入：选择 JSON 文件 → 解析 spec → 409 时询问覆盖；导入成功后广播刷新侧栏
+  const importFileRef = React.useRef(null)
+  const doImportFile = async (file) => {
+    if (!file) return
+    setNotice('')
+    try {
+      const text = await file.text()
+      const parsed = JSON.parse(text)
+      const spec = parsed?.spec ?? parsed // 兼容导出格式 {spec:{...}} 与裸 spec
+      if (!spec || typeof spec !== 'object' || !spec.id) throw new Error('文件不是有效的 Agent Spec JSON')
+      let r
+      try {
+        r = await importAgent(spec, false)
+      } catch (err) {
+        if (err?.status !== 409) throw err
+        if (!window.confirm(`智能体 ${spec.id} 已存在，覆盖它？`)) return
+        r = await importAgent(spec, true)
+      }
+      notifyAgentsChanged()
+      await reload()
+      setNotice(`已导入 ${r.spec?.name ?? spec.id}${r.overwritten ? '（覆盖）' : ''}`)
+    } catch (err) {
+      setNotice(err?.message || '导入失败')
+    }
+  }
+
   return (
     <div className="mx-auto w-full max-w-4xl px-4 py-6">
       <div className="mb-5 flex items-center justify-between">
@@ -283,10 +347,26 @@ export function AgentsManagePage({ onLoadingChange }) {
             Agent Spec 配置化：新建智能体无需写代码；改动保存后侧栏与路由实时生效
           </p>
         </div>
-        <Button size="sm" onClick={() => setEditing({})}>
-          <Plus className="mr-1 h-3.5 w-3.5" />
-          新建智能体
-        </Button>
+        <div className="flex gap-2">
+          <input
+            ref={importFileRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={(e) => {
+              doImportFile(e.target.files?.[0])
+              e.target.value = ''
+            }}
+          />
+          <Button size="sm" variant="outline" onClick={() => importFileRef.current?.click()}>
+            <Upload className="mr-1 h-3.5 w-3.5" />
+            导入
+          </Button>
+          <Button size="sm" onClick={() => setEditing({})}>
+            <Plus className="mr-1 h-3.5 w-3.5" />
+            新建智能体
+          </Button>
+        </div>
       </div>
 
       {notice && (
@@ -357,6 +437,10 @@ export function AgentsManagePage({ onLoadingChange }) {
                     <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => setEditing(spec)}>
                       <Pencil className="mr-1 h-3 w-3" />
                       编辑
+                    </Button>
+                    <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => doExport(spec)}>
+                      <Download className="mr-1 h-3 w-3" />
+                      导出
                     </Button>
                     {!spec.builtIn && (
                       <Button

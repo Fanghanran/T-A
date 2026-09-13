@@ -24,6 +24,8 @@ import { Header } from '@/components/layout/Header'
 import { Suspense } from 'react'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { AuthTokenDialog } from '@/components/layout/AuthTokenDialog'
+import { FavoritesDialog } from '@/components/chat/FavoritesDialog'
+import { Star } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { ShieldOff } from 'lucide-react'
 
@@ -190,6 +192,7 @@ function AppShellInner() {
   const location = useLocation()
   const registry = useChatRegistry()
   const [mobileSidebarOpen, setMobileSidebarOpen] = React.useState(false)
+  const [favoritesOpen, setFavoritesOpen] = React.useState(false)
   const [viewLoading, setViewLoading] = React.useState(false)
   // 桌面侧边栏折叠态（图标栏模式），localStorage 持久化
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(() => {
@@ -482,8 +485,10 @@ function AppShellInner() {
           agent={headerAgent}
           status={viewLoading ? 'thinking' : 'online'}
           onOpenSidebar={() => setMobileSidebarOpen(true)}
+          onOpenFavorites={() => setFavoritesOpen(true)}
         />
         <AuthTokenDialog />
+        <FavoritesDialog open={favoritesOpen} onOpenChange={setFavoritesOpen} />
         <Suspense fallback={<RouteLoadingFallback />}>
           <Routes>
             <Route

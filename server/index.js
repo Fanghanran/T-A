@@ -42,6 +42,8 @@ import { chatRouter, initAgentRegistry } from './routes/chat.js'
 import { agentsRouter } from './routes/agents.js'
 import { authRouter } from './routes/auth.js'
 import sttRouter from './routes/stt.js'
+import favoritesRouter from './routes/favorites.js'
+import studyRouter from './routes/study.js'
 import managementRouter from './lib/management/manager.js'
 
 // ── 工作流注册副作用导入：确保路由处理请求前，工具/工作流均已注册到管理注册表 ──
@@ -110,6 +112,8 @@ app.use('/api', (req, res, next) => {
 })
 // 会话接口默认开放给已识别用户（本地单机）；公开部署时设 PROTECT_SESSIONS=1 追加管理员认证
 const protectSessions = /^(1|true|on|yes)$/i.test(String(process.env.PROTECT_SESSIONS || ''))
+app.use(favoritesRouter) // /api/favorites（收藏夹/错题本：需 req.principal，挂在守卫后）
+app.use(studyRouter) // /api/study（学习统计：需 req.principal，挂在守卫后）
 app.use(...(protectSessions ? [adminAuth] : []), sessionsRouter) // /api/sessions/*
 app.use(interviewRouter) // /api/interview/*
 app.use(knowledgeRouter) // /api/knowledge/* + /api/search/query

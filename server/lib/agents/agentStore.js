@@ -30,7 +30,7 @@ export const ICON_KEYS = new Set([
   'pen-line', 'shield-check',
 ])
 
-const RUNTIMES = new Set(['chat', 'rag'])
+const RUNTIMES = new Set(['chat', 'rag', 'react'])
 
 mkdirSync(DATA_DIR, { recursive: true })
 const db = new Database(DB_FILE)
@@ -56,10 +56,16 @@ db.exec(`
     greeting      TEXT NOT NULL DEFAULT '',
     suggestions   TEXT NOT NULL DEFAULT '[]',
     sort_order    INTEGER NOT NULL DEFAULT 100,
+    tools         TEXT NOT NULL DEFAULT '[]',
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
   );
 `)
+// 幂等升级：旧 agents.db 无 tools 列（自定义智能体挂工具，功能 6）
+if (!db.pragma('table_info(agents)').some((c) => c.name === 'tools')) {
+  db.exec("ALTER TABLE agents ADD COLUMN tools TEXT NOT NULL DEFAULT '[]'")
+  log.info('[agentStore] schema：agents 表新增 tools 列')
+}
 
 /* ---------- 内置智能体 seed（幂等）---------- */
 
@@ -125,6 +131,7 @@ function rowToSpec(r) {
     structuredInput: !!r.structured_input,
     greeting: r.greeting,
     suggestions: JSON.parse(r.suggestions || '[]'),
+    tools: JSON.parse(r.tools || '[]'),
     sortOrder: r.sort_order,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -180,7 +187,7 @@ function assertAliasesFree(aliases, excludeId) {
 }
 
 /** 新建/更新共用的字段校验；返回规范化后的字段集 */
-function validateSpecFields({ name, description, icon, aliases, enabled, hidden, runtime, builtinRef, systemPrompt, modelRole, knowledge, structuredInput, greeting, suggestions, sortOrder }) {
+function validateSpecFields({ name, description, icon, aliases, enabled, hidden, runtime, builtinRef, systemPrompt, modelRole, knowledge, structuredInput, greeting, suggestions, sortOrder, tools }) {
   const out = {}
   if (name !== undefined) {
     const n = String(name ?? '').trim()
@@ -204,8 +211,17 @@ function validateSpecFields({ name, description, icon, aliases, enabled, hidden,
   }
   if (enabled !== undefined) out.enabled = enabled ? 1 : 0
   if (hidden !== undefined) out.hidden = hidden ? 1 : 0
+  if (tools !== undefined) {
+    if (!Array.isArray(tools)) throw new Error('tools 必须为数组')
+    const list = [...new Set(tools.map((t) => String(t ?? '').trim()).filter(Boolean))]
+    if (list.length > 8) throw new Error('工具白名单不超过 8 个')
+    for (const t of list) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/.test(t)) throw new Error(`工具名无效：${t}`)
+    }
+    out.tools = JSON.stringify(list)
+  }
   if (runtime !== undefined) {
-    if (!RUNTIMES.has(runtime)) throw new Error(`runtime 必须为 chat 或 rag`)
+    if (!RUNTIMES.has(runtime)) throw new Error('runtime 必须为 chat、rag 或 react')
     out.runtime = runtime
   }
   if (builtinRef !== undefined) out.builtin_ref = String(builtinRef ?? '')
@@ -260,7 +276,7 @@ function emitSpecChange(agentId) {
   }
 }
 
-export function createSpec({ id, name, description, icon, aliases, runtime, systemPrompt, modelRole, knowledge, structuredInput, greeting, suggestions, sortOrder }) {
+export function createSpec({ id, name, description, icon, aliases, runtime, systemPrompt, modelRole, knowledge, structuredInput, greeting, suggestions, sortOrder, tools }) {
   if (!AGENT_ID_RE.test(String(id ?? ''))) {
     throw new Error('智能体 ID 无效：仅允许字母数字下划线连字符，1~32 位，且以字母或数字开头')
   }
@@ -269,7 +285,7 @@ export function createSpec({ id, name, description, icon, aliases, runtime, syst
   const fields = validateSpecFields({
     name: name ?? '', description: '', icon: icon ?? 'bot', aliases: aliases ?? [],
     runtime: runtime ?? 'chat', systemPrompt: systemPrompt ?? '', modelRole: '',
-    knowledge: knowledge ?? {}, structuredInput: structuredInput ?? false,
+    knowledge: knowledge ?? {}, structuredInput: structuredInput ?? false, tools: tools ?? [],
     greeting: greeting ?? '', suggestions: suggestions ?? [], sortOrder,
   })
   assertAliasesFree(JSON.parse(fields.aliases), null)
@@ -278,12 +294,12 @@ export function createSpec({ id, name, description, icon, aliases, runtime, syst
     INSERT INTO agents
       (agent_id, name, description, icon, aliases, enabled, built_in, hidden, runtime, builtin_ref,
        system_prompt, model_role, knowledge, structured_input, greeting, suggestions, sort_order,
-       created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, 1, 0, 0, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       tools, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 1, 0, 0, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id, fields.name, fields.description, fields.icon, fields.aliases, fields.runtime,
     fields.system_prompt, fields.model_role, fields.knowledge, fields.structured_input,
-    fields.greeting, fields.suggestions, fields.sort_order ?? 100, now, now,
+    fields.greeting, fields.suggestions, fields.sort_order ?? 100, fields.tools ?? '[]', now, now,
   )
   log.info(`[agentStore] 新建智能体：${id}（runtime=${fields.runtime}）`)
   emitSpecChange(id)

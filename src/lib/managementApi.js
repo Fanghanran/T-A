@@ -421,3 +421,13 @@ export function updateAgentSpec(id, patch) {
 export function deleteAgentSpec(id) {
   return request('/api/management/agents/' + encodeURIComponent(id), { method: 'DELETE' })
 }
+
+/** Agent Spec 导出（spec JSON） */
+export function exportAgent(id) {
+  return get('/api/management/agents/' + encodeURIComponent(id) + '/export')
+}
+
+/** Agent Spec 导入（overwrite=true 覆盖同 id 自定义智能体） */
+export function importAgent(spec, overwrite = false) {
+  return postJson('/api/management/agents/import', { spec, overwrite })
+}

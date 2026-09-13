@@ -832,4 +832,52 @@ export async function summarizeWikiEntry({ name, aliases = [], contexts }, { bud
   return out.slice(0, budgetChars)
 }
 
+/**
+ * 会话复盘报告生成（LLM 聚合）：把整段会话消息 + 逐题质量评分聚合为备考复盘。
+ * 与 mock-interview 的评分卡互补：评分卡是"面试官视角当场打分"，复盘是"备考视角事后总结"。
+ * 失败向上抛（调用方转 5xx），不做静默兜底。
+ */
+export async function generateSessionReport({ messages, reflections, agentName }) {
+  const dialog = (Array.isArray(messages) ? messages : [])
+    .map((m) => `${m.role === 'assistant' ? '助手' : '用户'}：${String(m.content ?? '').slice(0, 600)}`)
+    .join('\\n')
+  const reflines = (Array.isArray(reflections) ? reflections : [])
+    .map((r) => `- 问：${String(r.question ?? '').slice(0, 80)}｜评分 ${r.score ?? '-'}｜${r.action ?? ''}${r.issues?.length ? `｜问题：${r.issues.join('、')}` : ''}`)
+    .join('\\n')
+  const system =
+    '你是面试备考教练。根据一段完整的会话记录与逐题质量评分，生成备考复盘报告。\n' +
+    '只输出 STRICT JSON 对象（无 markdown 围栏），结构：\n' +
+    '{"overall": "总体评价（2~3 句）", "topics": ["涉及的知识点"], "strengths": ["做得好的点"], ' +
+    '"weaknesses": ["薄弱点/反复出错的点"], "suggestions": ["具体可执行的改进建议"], ' +
+    '"perTurn": [{"question": "问题摘要", "grade": "好/一般/差", "note": "一句话点评"}]}\n' +
+    '规则：只依据会话内容与评分，不编造；weaknesses 优先从低分与兜底/拒答条目归纳；语言平实。'
+  const prompt =
+    `智能体类型：${agentName || '通用'}
+
+【会话记录】
+${dialog || '（空）'}
+
+【逐题质量评分】
+${reflines || '（无评分记录）'}`
+
+  const { text } = await generateText({
+    model: getChatModel({ role: 'chat.general' }),
+    temperature: 0,
+    prompt: system + '\n\n' + prompt,
+  })
+  const parsed = JSON.parse(stripToJson(text))
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.perTurn)) {
+    throw new ServiceUnavailableError('复盘报告生成失败：模型输出结构不完整（LLM_OUTPUT_INVALID）', 'LLM_OUTPUT_INVALID')
+  }
+  return {
+    overall: String(parsed.overall ?? ''),
+    topics: (parsed.topics ?? []).map(String).slice(0, 12),
+    strengths: (parsed.strengths ?? []).map(String).slice(0, 8),
+    weaknesses: (parsed.weaknesses ?? []).map(String).slice(0, 8),
+    suggestions: (parsed.suggestions ?? []).map(String).slice(0, 8),
+    perTurn: (parsed.perTurn ?? []).slice(0, 50),
+    agentName: agentName ?? '',
+  }
+}
+
 export { llmAvailable }
