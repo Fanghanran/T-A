@@ -1,6 +1,12 @@
-# Interview Agent UI + RAG 后端
+# Interview Agent
 
-Interview Agent 是一个前后端分离的 Node/React 知识库与面试助手：前端使用 React 18 + Vite，后端使用 Node.js + Express，向量检索使用 Milvus，LLM/Embedding 使用 OpenAI 兼容接口。
+面向面试备考场景的**本地私有**知识库 RAG 问答系统：多智能体协作（知识库检索 / 面试题检索 / 简历分析 / 模拟面试 / 文档处理）、文档上传与智能切片、双向量索引 + ES 关键词 + HyDE 混合检索、意图感知 Query 改写、LLM Wiki 词条网络、会话记忆与多用户隔离。回答有出处、可溯源，数据不出本机。
+
+- 前端：React 18 + Vite 5 + TailwindCSS + shadcn/ui + Vercel AI SDK（流式渲染）
+- 后端：Node.js + Express，10 层分层架构（check-layers 机器化守卫）
+- 存储：文件原件（事实源）+ SQLite（会话/锚点层）+ Milvus（向量）+ Elasticsearch（BM25 第三通道，可选）
+- LLM/Embedding：OpenAI 兼容接口（本地 Ollama 或任意兼容云）
+- 认证：JWT 登录 + RBAC 角色权限（也可 `AUTH_MODE=disabled` 单用户零配置运行）
 
 ## 架构概览
 
@@ -13,9 +19,12 @@ Interview Agent 是一个前后端分离的 Node/React 知识库与面试助手�
 
 ## 环境要求
 
-- Node.js 22+（后端依赖 `pdfjs-dist`/`utilium` 要求 Node 22；后端 `npm start` 使用 `--env-file-if-exists`）
+- **Node.js 24**（硬约束：`better-sqlite3` 原生模块按 Node 24 ABI 编译；用 Node 22 启动会报
+  `ERR_DLOPEN_FAILED ... NODE_MODULE_VERSION 137 vs 127`，且症状隐蔽——服务能起、检索正常，
+  但会话接口全部报 `SESSION_DB_UNAVAILABLE`。换 Node 版本后需 `npm rebuild better-sqlite3`）
 - npm 9+
-- Docker Desktop / Docker Compose（运行 Milvus）
+- Docker（Milvus standalone；可选：Elasticsearch BM25 通道、whisper 语音转写）
+- LLM/Embedding：本地 Ollama 或任意 OpenAI 兼容端点（`server/.env` 配置，模板见 `.env.example`）
 
 ## 本地启动
 
@@ -34,6 +43,11 @@ copy .env.example .env       # PowerShell 可用 Copy-Item
 npm install
 npm start                    # http://127.0.0.1:3000
 ```
+
+首次启动后编辑 `server/.env`（参考 `.env.example`）：
+- `AUTH_MODE`：`disabled`（单用户，零配置）/ `jwt`（登录 + 多用户数据隔离）/ `user-token` / `token`
+- `ES_ENABLED=on` 启用 BM25 关键词第三通道（需 `docker compose -f docker-compose.yml up -d elasticsearch`）
+- `STORAGE_MODE=v3` 切换三级存储（文件原件 + 锚点层 + 瘦向量；默认 v2）
 
 启动前端：
 

@@ -104,6 +104,19 @@ M0 工程地基 ─→ M0.5 落盘 ADR(006/007/008)
 | **M5a 核心隔离** | ✅ 已完成（2026-09-05）：principal 抽象 + user-token + owner_id 全量迁移/过滤 + 27/27 隔离矩阵；disabled 零回归 | 高（安全关键，需专测） | M1 + M4 |
 | **M5b** | 记忆存量 per-user 迁移工具、per-user 配额、审计带 userId、管理页用量视图 | 中 | M5a |
 
+### 3.4 近期增量（2026-09-05 后累积，2026-09-13 登记入册）
+
+- **用户模块 v2.3**：accounts/jwt/RBAC（role_perms）+ 登录页；`AUTH_MODE` 四档（disabled/user-token/jwt/token）；数据路由与管理路由两套主体字段（req.principal / req.adminUserId）
+- **存储 v3 三级架构**：fileStore（原件事实源）+ anchorStore（SQLite 锚点层）+ vectorIndexV3（瘦向量），`STORAGE_MODE` 门面切换，v2 保留回退；ES BM25 第三通道（esStore + unifiedSearch 融合）
+- **知识网络**：知识图谱 2D/3D 页、LLM Wiki 词条生成与图叠加（wikiBuilder/wikiStore）、graphCache
+- **检索增强**：意图感知 Query 改写（五类判定 + excludeTerms）、否定降权（4.52）、多 query 合并语义修复（累加→max+bonus，评测实锤累加语料扩大后崩盘）、v3 search 补 title
+- **多策略试切评测器**（chunkStrategyEval）：4 候选并行试切 + 纯文本指标择优 + 预切片；切片策略不再依赖单一规则
+- **思考链路卡片**：知识库/面试检索智能体把改写→多路检索→融合→排序以 agent_workflow 注解推前端复用工作流面板
+- **语音输入**：/api/stt 转发 OpenAI 兼容转写端点（STT_BASE_URL 未配置则功能关闭）；前端录音 hook
+- **schema v2**：owner 复合索引 + session_memory/reflection_log 外键级联 + 孤儿清理
+- **端点补全**：wiki 5 / es 2 / db 4（会话/记忆/基础/审计四库浏览）——前端在调但后端缺失的 404 缺口清零
+- **管理页拆分**：Audit/Models/Params/Registry/Agents/Roles/Db 独立管理页 + PageHeader
+
 ---
 
 ## 5. 关键约束与不做项
